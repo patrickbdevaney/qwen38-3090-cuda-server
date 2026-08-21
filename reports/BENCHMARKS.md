@@ -297,6 +297,53 @@ change that fixes it.
 
 ---
 
+## VRAM with the mandatory stack, and the ceiling it sets
+
+Every VRAM figure in this file and in reports/EXL3.md up to this point was
+**model plus KV in isolation**. DFlash2 is not optional on this server -- it is
+what turns 45.8 tok/s into 133 -- so those numbers understated the real
+footprint. Vision genuinely is optional (a launch flag), so it stays out.
+
+Measured by starting the server and reading `nvidia-smi`, AWQ INT4 + INT4 KV at
+262144 with the drafter loaded:
+
+| | |
+|---|---:|
+| body, lm_head, embed, GDN state | 14.39 GiB |
+| KV cache @ 262144, INT4 | 4.50 GiB |
+| DFlash2 drafter, W4A16 resident | 1.53 GiB |
+| **peak in use** | **21862 MiB** |
+
+against the 19749 MiB previously reported without the drafter.
+
+### The drafter's load peak was the real context ceiling
+
+With the drafter, 262144 loaded and 278528 did not -- despite the accounting
+showing 3.69 GiB free at 278528 against a drafter that ends up resident at 1.53.
+The cause was the load path, not the drafter: it uploaded **every** weight to
+the device in bf16 first and quantised in a second pass, so the peak was
+**3.70 GiB** to arrive at 1.53. Because the drafter loads *after* the KV cache
+is allocated, that 2.2 GiB of transient was what capped `--max-context`.
+
+Quantising each weight the moment it lands makes the peak (quantised-so-far plus
+one bf16 tensor). Same weights, same numerics -- gate_dflash and spec_lossless
+both still pass -- and the ceiling moves a long way:
+
+| | max context with DFlash2 loaded |
+|---|---:|
+| before | 262144 (278528 OOMs) |
+| **after** | **at least 360448**, peak 23584 MiB of 24576 |
+
+307200 now loads at 22656 MiB with room to spare. That covers the ~300K target
+for long-horizon agent state with the mandatory stack in place, on AWQ, today.
+
+**VRAM is no longer the binding constraint above 262144; RoPE is.**
+`max_position_embeddings` is 262144 and `rope_type` is `"default"`, so positions
+past it extrapolate rather than interpolate, and nothing here measures whether
+the output stays coherent up there. Allocatable is not the same as usable, and
+the YaRN-style extension item on the roadmap is now the thing standing between
+this server and a genuine 300K working context.
+
 ## Gates
 
 | gate | bar | measured | |

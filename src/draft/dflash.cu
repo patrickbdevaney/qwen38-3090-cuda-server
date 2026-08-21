@@ -442,7 +442,19 @@ void draft_load(DraftModel& d, const std::string& dir, const DraftLoadOptions& o
   SafeTensors st;
   st.open_dir(dir);
 
+  // Quantise as we go, not in a second pass. Uploading every weight in bf16
+  // first and then walking back over them costs a 3.70 GiB peak to reach a
+  // 1.53 GiB resident drafter, and since the drafter loads AFTER the KV cache
+  // that 2.2 GiB of transient is what caps --max-context: 262144 fits, 278528
+  // does not, and the difference is entirely this. Interleaving makes the peak
+  // (quantised-so-far + one bf16 tensor), roughly 1.8 GiB.
+  const int qg = opt.group_size;
+  auto quant_now = [&](__nv_bfloat16*& src, W4A16Weights& dst, int rows, int cols) {
+    if (d.quantized) quant_release(d, src, dst, rows, cols, qg);
+  };
+
   d.fc = upload(d, st, "fc.weight", int64_t(s.hidden) * s.n_taps * s.hidden);
+  quant_now(d.fc, d.fc_q, s.hidden, s.n_taps * s.hidden);
   d.hidden_norm = upload(d, st, "hidden_norm.weight", s.hidden);
   d.final_norm = upload(d, st, "norm.weight", s.hidden);
   d.pred_cb = upload(d, st, "candidate_selector.predecessor_codebook",
@@ -467,6 +479,12 @@ void draft_load(DraftModel& d, const std::string& dir, const DraftLoadOptions& o
                           int64_t(s.kproj_out()) * s.hidden);
     L.mlp_kproj = upload(d, st, p + "mlp_conv.kernel_projection.weight",
                          int64_t(s.kproj_out()) * s.hidden);
+    quant_now(L.qkv, L.qkv_q, s.qkv_dim(), s.hidden);
+    quant_now(L.o, L.o_q, s.hidden, s.q_dim());
+    quant_now(L.gate_up, L.gate_up_q, 2 * d.inter, s.hidden);
+    quant_now(L.down, L.down_q, s.hidden, d.inter);
+    quant_now(L.attn_kproj, L.attn_kproj_q, s.kproj_out(), s.hidden);
+    quant_now(L.mlp_kproj, L.mlp_kproj_q, s.kproj_out(), s.hidden);
     L.input_ln = upload(d, st, p + "input_layernorm.weight", s.hidden);
     L.post_ln = upload(d, st, p + "post_attention_layernorm.weight", s.hidden);
     L.q_norm = upload(d, st, p + "self_attn.q_norm.weight", s.head_dim);
@@ -480,17 +498,8 @@ void draft_load(DraftModel& d, const std::string& dir, const DraftLoadOptions& o
 
   if (d.quantized) {
     const int g = opt.group_size;
-    quant_release(d, d.fc, d.fc_q, s.hidden, s.n_taps * s.hidden, g);
-    for (int i = 0; i < s.n_layers; ++i) {
-      DraftLayer& L = d.layers[i];
-      quant_release(d, L.qkv, L.qkv_q, s.qkv_dim(), s.hidden, g);
-      quant_release(d, L.o, L.o_q, s.hidden, s.q_dim(), g);
-      quant_release(d, L.gate_up, L.gate_up_q, 2 * d.inter, s.hidden, g);
-      quant_release(d, L.down, L.down_q, s.hidden, d.inter, g);
-      quant_release(d, L.attn_kproj, L.attn_kproj_q, s.kproj_out(), s.hidden, g);
-      quant_release(d, L.mlp_kproj, L.mlp_kproj_q, s.kproj_out(), s.hidden, g);
-    }
-    // The GEMV/MMA path needs its own fp32 scratch.
+    // The weights were quantised inline above as each one landed; only the
+    // GEMV/MMA fp32 scratch is left.
     gemv_scratch_alloc(d.gemv, s.n_taps * s.hidden, 2 * d.inter, g, 16);
     d.owned.push_back(d.gemv.xf);
     d.owned.push_back(d.gemv.xgsum);
