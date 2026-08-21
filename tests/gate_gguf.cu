@@ -27,7 +27,7 @@
 
 int main(int argc, char** argv) {
   const std::string gguf = argc > 1 ? argv[1]
-      : "/home/patrickd/qwen38-weights/gguf/Qwen3.8-27B-UD-IQ4_XS.gguf";
+      : "/home/patrickd/qwen38-weights/gguf/Qwen3.8-27B-UD-Q3_K_XL.gguf";
   const std::string fx = argc > 2 ? argv[2] : "tests/fixtures/gguf";
 
   qwen::GgufFile f;
@@ -36,6 +36,33 @@ int main(int argc, char** argv) {
 
   std::ifstream man(fx + "/manifest.txt");
   if (!man) { printf("no manifest in %s\n", fx.c_str()); return 2; }
+
+  // The goldens are keyed by tensor NAME, so they are only meaningful against
+  // the file they were generated from -- point this at a different GGUF and
+  // every type compares our dequantisation of one tensor against ggml's
+  // dequantisation of a completely different one. That failure looks exactly
+  // like a broken kernel, so refuse rather than report it.
+  {
+    std::string first;
+    std::getline(man, first);
+    const std::string tag = "# source ";
+    if (first.rfind(tag, 0) == 0) {
+      const std::string want = first.substr(tag.size());
+      const size_t slash = gguf.find_last_of('/');
+      const std::string got = slash == std::string::npos ? gguf : gguf.substr(slash + 1);
+      if (got != want) {
+        printf("fixture mismatch: goldens in %s were generated from %s, "
+               "but this run was given %s.\n"
+               "The goldens are keyed by tensor name and are not portable "
+               "between GGUF files; regenerate with tools/dump_gguf_ref.sh.\n",
+               fx.c_str(), want.c_str(), got.c_str());
+        return 2;
+      }
+    } else {
+      man.clear();
+      man.seekg(0);   // old fixture without a source line
+    }
+  }
 
   printf("gate_gguf: %s\n", gguf.c_str());
   printf("%-10s %-40s %10s %12s %12s\n", "type", "tensor", "elems", "mismatch", "max|d|");

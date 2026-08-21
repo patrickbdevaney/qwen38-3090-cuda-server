@@ -68,10 +68,17 @@ template <> struct Deq<GgmlType::Q4_K> {
     uint8_t sc, m;
     scale_min_k4(2 * g + half, b->scales, sc, m);
     const float dl = d * sc, ml = dm * m;
-    const uint8_t* q = b->qs + g * 32 + l;
+    // One 64-bit load instead of eight 1-byte loads. This is safe without any
+    // repack because a Q4_K block is 144 bytes (a multiple of 16), qs sits at
+    // offset 16, and l is always a multiple of 8 -- see the alignment contract
+    // on gguf_gemv().
+    const uint2 qv = *reinterpret_cast<const uint2*>(b->qs + g * 32 + l);
+    const int lsh = half ? 4 : 0;
     #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = dl * float(half ? (q[i] >> 4) : (q[i] & 0xF)) - ml;
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t wq = (i < 4) ? qv.x : qv.y;
+      y[i] = dl * float((wq >> (8 * (i & 3) + lsh)) & 0xF) - ml;
+    }
   }
 };
 
@@ -84,13 +91,21 @@ template <> struct Deq<GgmlType::Q5_K> {
     uint8_t sc, m;
     scale_min_k4(2 * g + half, b->scales, sc, m);
     const float dl = d * sc, ml = dm * m;
-    const uint8_t* q = b->qs + g * 32 + l;
-    const uint8_t* qh = b->qh + l;
-    const uint8_t bit = uint8_t(1u << (2 * g + half));
+    // Same 64-bit trick as Q4_K, twice: a Q5_K block is 176 bytes with qs at
+    // offset 48 and qh at 16, both 8-aligned, and l is a multiple of 8. This is
+    // the tensor that matters most in Q3_K_XL -- output.weight is 834 MiB of
+    // Q5_K, more than every other tensor in the sweep put together.
+    const uint2 qv = *reinterpret_cast<const uint2*>(b->qs + g * 32 + l);
+    const uint2 hv = *reinterpret_cast<const uint2*>(b->qh + l);
+    const int lsh = half ? 4 : 0;
+    const uint32_t bit = 1u << (2 * g + half);
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const float lo = float(half ? (q[i] >> 4) : (q[i] & 0xF));
-      y[i] = dl * (lo + ((qh[i] & bit) ? 16.f : 0.f)) - ml;
+      const uint32_t wq = (i < 4) ? qv.x : qv.y;
+      const uint32_t wh = (i < 4) ? hv.x : hv.y;
+      const int sh = 8 * (i & 3);
+      const float lo = float((wq >> (sh + lsh)) & 0xF);
+      y[i] = dl * (lo + (((wh >> sh) & bit) ? 16.f : 0.f)) - ml;
     }
   }
 };
@@ -123,21 +138,28 @@ template <> struct Deq<GgmlType::Q3_K> {
   static constexpr int RUN_BYTES = 110;
   __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab&) {
     const BQ3K* b = reinterpret_cast<const BQ3K*>(p);
-    const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
-    uint32_t aux[4];
-    #pragma unroll
-    for (int t = 0; t < 3; ++t) aux[t] = le32(b->scales + 4 * t);
-    const uint32_t tmp = aux[2];
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
-
     const int n = o0 / 128, r = o0 % 128, j = r / 32, within = r % 32;
     const int half = within / 16, l = within % 16;
     const int is = 2 * (4 * n + j) + half;
-    const float dl = h2f(b->d) * float(scales[is] - 32);
+
+    // Only ONE of the 16 six-bit scales is needed here, so extract just that
+    // byte. ggml's reference unpacks all sixteen into a 4-word aux[] shuffle,
+    // and this kernel calls get8 once per lane per super-block -- so every lane
+    // in the warp was redoing the full unpack (~20 ALU ops) to read one byte of
+    // it. Decode is ALU bound in this kernel, not bandwidth bound (stubbing the
+    // dequant out measures 646 GB/s against 347 with it), so this is on the
+    // critical path.
+    //
+    // The layout, from the reference shuffle: with k = is & 3 and w = is >> 2,
+    // the low nibble comes from scales[k] or scales[4+k] (w odd picks the
+    // second group, w >= 2 picks the high nibble) and the top two bits come
+    // from scales[8+k] shifted by 2*w. Verified bit-exact against the
+    // full-block dequantiser by gate_gguf_gemv.
+    const int k = is & 3, w = is >> 2;
+    const uint8_t lo_src = b->scales[(w & 1) ? 4 + k : k];
+    const uint8_t lo = (w & 2) ? uint8_t(lo_src >> 4) : uint8_t(lo_src & 0xF);
+    const uint8_t sc6 = uint8_t(lo | (((b->scales[8 + k] >> (2 * w)) & 3) << 4));
+    const float dl = h2f(b->d) * float(int(sc6) - 32);
     const uint8_t m = uint8_t(1u << (4 * n + j));
     const int shift = 2 * j;
     const uint8_t* q = b->qs + n * 32 + 16 * half + l;
@@ -486,10 +508,22 @@ void gguf_deq8_dump(float* dst, const void* src, GgmlType type, int64_t n,
   DISPATCH(launch_dump, dst, src, n, st);
 }
 
+// The Q4_K and Q5_K paths issue 64-bit loads into the block, which is only
+// legal if the tensor base is 16-byte aligned (see gemv.cuh). A misaligned
+// load is an illegal memory access reported at some later, unrelated kernel, so
+// check it here where the message can name the cause.
+static void check_align(const GgufWeight& w, const char* who) {
+  if (reinterpret_cast<uintptr_t>(w.data) % 16) {
+    fprintf(stderr, "%s: weight data %p is not 16-byte aligned\n", who, w.data);
+    abort();
+  }
+}
+
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
                cudaStream_t st) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemv: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
+  check_align(w, "gguf_gemv");
   DISPATCH(launch, y, w, x, 1, st);
 }
 
@@ -497,6 +531,7 @@ void gguf_gemm_small(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16*
                      int M, cudaStream_t st) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemm: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
+  check_align(w, "gguf_gemm_small");
   DISPATCH(launch, y, w, x, M, st);
 }
 

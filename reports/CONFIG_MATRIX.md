@@ -158,6 +158,63 @@ So: the GGUF stack stays in the tree, complete and verified, as the foundation
 for a future quant that actually pays. Q3_K_XL is not that quant at this kernel
 efficiency, and that is a measurement rather than an opinion.
 
+### Revisited: the kernel was fixable, and 40% of the gap is now closed
+
+The two deficits above were named from a stub experiment, so they were testable
+rather than rhetorical. Both turned out to be real, and the cheap half of each
+has now been taken:
+
+| | GB/s | of 914.2 |
+|---|---|---|
+| GGUF fused, as first built | 347.3 | 38.0% |
+| **GGUF fused, today (cold, first run)** | **482.6** | **52.8%** |
+| GGUF fused, today (warm, 5th run) | 524.1 | 57.3% |
+| GGUF fused, dequant stubbed out | 646.0 | 70.7% |
+| AWQ INT4 g128 | 769.8 | 84.2% |
+
+Two changes, both bit-exact against ggml (gate_gguf_gemv, all 13 types, zero
+mismatching values):
+
+The two rows for "today" are the same binary: five consecutive runs measure
+482.6 / 493.5 / 516.6 / 517.0 / 524.1 GB/s as the card settles at sustained
+clocks. The 347.3 baseline was a single cold run, so **347 -> 483 is the
+like-for-like comparison**, +39%. Per-type numbers below are cold-run.
+
+1. **Q3_K scale extraction: 172 -> 246 GB/s.** ggml's reference unpacks all
+   sixteen six-bit scales out of a 12-byte field with a four-word shuffle. This
+   kernel calls deq8 once per lane per super-block, so all 32 lanes were doing
+   that whole unpack to read one byte of the result. Deriving the single scale
+   the lane needs is two byte loads and about six ALU ops.
+
+2. **Q4_K and Q5_K 64-bit loads: Q5_K 392 -> 570 GB/s cold, 620 warm.** Each lane owns eight
+   consecutive quantised bytes, which were being fetched as eight 1-byte loads.
+   Q4_K and Q5_K blocks are 144 and 176 bytes -- both multiples of 16 -- with
+   their `qs`/`qh` fields at 8-aligned offsets, and the lane offset is always a
+   multiple of 8, so those eight bytes are one aligned 64-bit load with no
+   repack at all. This is the single biggest lever in the file, because
+   `output.weight` is 834 MiB of Q5_K, more than every other tensor in the
+   sweep combined.
+
+The formats that did NOT get this are the ones whose block size is not a
+multiple of 8 -- Q2_K (84 bytes), Q3_K (110), Q6_K (210) -- where consecutive
+blocks land on rotating alignments and a 64-bit load would be illegal. Those
+need a padding repack at load time (Q3_K 110 -> 112 costs 1.8% of the tensor),
+which is the obvious next step and is not done.
+
+For scale: llama.cpp runs Q3_K_XL at an effective 546 GB/s. At 483 cold we are
+at **88% of llama.cpp**, up from 64%; warm, the aggregate crosses it. Comparing
+a kernel microbenchmark against an end-to-end effective rate is apples to
+oranges in llama.cpp's favour, so treat 88% as the floor and do not claim
+parity until the GGUF path runs end to end -- which it does not yet, because
+model.cu has no GGUF loader. The remaining structural gap to AWQ is the
+row-major block layout (deficit 1), which no amount of per-type arithmetic will
+fix.
+
+This does not change the *headroom* conclusion above -- INT4 KV still frees 3.7x
+more than Q3_K_XL would -- but it does change the substitutability one. A GGUF
+path within 11% of llama.cpp is a credible weight option to offer users rather
+than a curiosity, which is what it was at 347.
+
 ### Is 347 GB/s the FORMAT or MY KERNEL? Measured: mostly my kernel, and it
 ### does not change the conclusion.
 

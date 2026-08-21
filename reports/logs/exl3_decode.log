@@ -1,0 +1,18 @@
+# exllamav3 1.4.2, CUDA 12.8 conda toolkit, driver 570.133.07, RTX 3090, idle box
+# FP16 KV (default)
+# python tools/exl3_decode.py ~/qwen38-weights/exl3-3.00bpw 4096,16384,32768 128
+resident after load+cache: 14.54 GiB of 23.57  (cache sized for 33408 tokens)
+     ctx     decode tok/s    tokens
+    4096           47.51       127
+   16384           44.51       127
+   32768           40.61       127
+peak VRAM in use: 16354 MiB of 24133
+
+# 4-bit quantised KV (CacheLayer_quant, k_bits=4, v_bits=4)
+# python tools/exl3_decode_q.py ~/qwen38-weights/exl3-3.00bpw 4096,16384,32768 128
+resident after load+cache: 12.91 GiB of 23.57  (cache sized for 33408 tokens)
+     ctx     decode tok/s    tokens
+    4096           47.26       127
+   16384           44.79       127
+   32768           41.00       127
+peak VRAM in use: 14586 MiB of 24133

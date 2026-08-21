@@ -29,6 +29,15 @@ struct GgufWeight {
   size_t bytes = 0;
 };
 
+// ALIGNMENT CONTRACT: w.data must be at least 16-byte aligned. Every allocation
+// from cudaMalloc satisfies this, and it is what lets the Q4_K and Q5_K paths
+// read their eight quantised bytes as one 64-bit load instead of eight 1-byte
+// loads -- those two block formats are 144 and 176 bytes, both multiples of 16,
+// so if the tensor base is aligned then every block in it is. Formats whose
+// block size is not a multiple of 8 (Q2_K 84, Q3_K 110, Q6_K 210) cannot do
+// this without a repack and still use byte loads. gguf_gemv() checks the
+// pointer and aborts rather than issuing a misaligned load.
+//
 // y[out_f] = W @ x[in_f]. x and y are bf16.
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
                cudaStream_t stream = 0);

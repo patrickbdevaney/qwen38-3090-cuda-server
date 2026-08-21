@@ -170,7 +170,7 @@ endif()
 
 add_executable(gate_gguf tests/gate_gguf.cu)
 target_link_libraries(gate_gguf PRIVATE qwen_gguf_dequant)
-set(QWEN38_GGUF "${QWEN38_GGUF}" CACHE FILEPATH "UD-IQ4_XS GGUF checkpoint")
+set(QWEN38_GGUF "${QWEN38_GGUF}" CACHE FILEPATH "GGUF the tests/fixtures/gguf goldens were generated from (UD-Q3_K_XL)")
 if(QWEN38_GGUF)
   add_test(NAME gguf_dequant COMMAND gate_gguf ${QWEN38_GGUF}
            ${CMAKE_SOURCE_DIR}/tests/fixtures/gguf)
@@ -196,6 +196,11 @@ target_link_libraries(probe_chunk PRIVATE qwen_model)
 add_executable(gate_kvquant tests/gate_kvquant.cu)
 target_link_libraries(gate_kvquant PRIVATE qwen_model qwen_tokenizer)
 add_test(NAME kv_quant COMMAND gate_kvquant ${QWEN38_MODEL_DIR} 8192 24)
+
+# Teacher-forced logits dump for the BF16-vs-quantisation comparison. Not a
+# gate: it writes gigabytes and is run by hand, so it has no add_test().
+add_executable(quantcmp_dump tools/quantcmp_dump.cu)
+target_link_libraries(quantcmp_dump PRIVATE qwen_cache qwen_tokenizer)
 
 add_executable(gate_prefix tests/gate_prefix.cu)
 target_link_libraries(gate_prefix PRIVATE qwen_cache)

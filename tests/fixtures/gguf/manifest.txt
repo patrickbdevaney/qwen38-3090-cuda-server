@@ -1,3 +1,4 @@
+# source Qwen3.8-27B-UD-Q3_K_XL.gguf
 F32 blk.0.attn_norm.weight 5120
 IQ2_S blk.0.ffn_up.weight 262144
 IQ2_XS blk.0.ffn_gate.weight 262144
