@@ -27,6 +27,7 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -lineinfo")
 # Cache variables keep them once set.
 set(QWEN38_MODEL_DIR "${QWEN38_MODEL_DIR}" CACHE PATH "W4A16 checkpoint directory")
 set(QWEN38_BF16_DIR  "${QWEN38_BF16_DIR}"  CACHE PATH "BF16 reference checkpoint (gates only)")
+set(QWEN38_DRAFT_DIR "${QWEN38_DRAFT_DIR}" CACHE PATH "DFlash2 drafter checkpoint")
 if(NOT QWEN38_MODEL_DIR)
   message(WARNING "QWEN38_MODEL_DIR is unset; model-dependent gates will fail. "
                   "Configure with -DQWEN38_MODEL_DIR=/path/to/checkpoint")
@@ -151,6 +152,17 @@ target_link_libraries(bench_verify PRIVATE qwen_core qwen_kernels)
 
 add_executable(bench_spec bench/bench_spec.cu)
 target_link_libraries(bench_spec PRIVATE qwen_spec)
+
+# ---------------------------------------------------------------- drafter
+add_library(qwen_draft STATIC src/draft/dflash.cu)
+target_link_libraries(qwen_draft PUBLIC qwen_core qwen_kernels)
+
+add_executable(gate_dflash tests/gate_dflash.cu)
+target_link_libraries(gate_dflash PRIVATE qwen_draft)
+add_test(NAME dflash COMMAND gate_dflash
+         ${QWEN38_DRAFT_DIR}
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/dflash
+         ${QWEN38_BF16_DIR})
 
 # ---------------------------------------------------------------- server
 add_library(qwen_server STATIC

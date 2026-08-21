@@ -30,6 +30,7 @@ def main():
     ap.add_argument("drafter_dir"); ap.add_argument("target_dir")
     ap.add_argument("--out", default="tests/fixtures/dflash")
     ap.add_argument("--ctx", type=int, default=64)
+    ap.add_argument("--dtype", default="bfloat16")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     sys.path.insert(0, DFLASH_REPO)
@@ -37,7 +38,8 @@ def main():
     from dflash.model import DFlash2DraftModel, _draft_value
     from safetensors import safe_open
 
-    m = DFlash2DraftModel.from_pretrained(a.drafter_dir, dtype=torch.bfloat16)
+    DT = getattr(torch, a.dtype)
+    m = DFlash2DraftModel.from_pretrained(a.drafter_dir, dtype=DT)
     m.eval()
     cfg = m.config
     H = cfg.hidden_size
@@ -62,28 +64,52 @@ def main():
 
     torch.manual_seed(777)
     T = a.ctx
-    target_hidden = (torch.randn(1, T, NT * H) * 0.05).to(torch.bfloat16)
+    target_hidden = (torch.randn(1, T, NT * H) * 0.05).to(torch.bfloat16).to(DT)
     anchor = 1000
     block_ids = torch.tensor([[anchor] + [m.mask_token_id] * (BS - 1)], dtype=torch.long)
-    noise_embedding = torch.nn.functional.embedding(block_ids, embed) * emb_scale
+    noise_embedding = (torch.nn.functional.embedding(block_ids, embed) * emb_scale).to(DT)
     # positions span the context then the block, as the reference slices them
     position_ids = torch.arange(T + BS).view(1, -1)[:, -(T + BS):]
 
+    # Stage taps, so a mismatch says WHICH stage rather than just "wrong".
+    stage = {}
+    def cap(name):
+        def hook(_mod, _inp, out):
+            stage[name] = (out[0] if isinstance(out, tuple) else out).detach()
+        return hook
+    def cap_in(name):
+        def hook(_mod, inp):
+            stage[name] = inp[0].detach()
+        return hook
+    m.fc.register_forward_hook(cap("fc_out"))
+    m.hidden_norm.register_forward_hook(cap("ctx_norm"))
+    L0 = m.layers[0]
+    L0.input_layernorm.register_forward_hook(cap("l0_ln"))
+    L0.self_attn.q_proj.register_forward_pre_hook(cap_in("l0_conv_prepare"))
+    L0.self_attn.register_forward_hook(cap("l0_attn"))
+    L0.post_attention_layernorm.register_forward_hook(cap("l0_post_ln"))
+    L0.register_forward_hook(cap("l0_out"))
+
     with torch.no_grad():
         hidden = m(position_ids=position_ids,
-                   noise_embedding=noise_embedding.to(torch.bfloat16),
+                   noise_embedding=noise_embedding,
                    target_hidden=target_hidden,
                    past_key_values=None, use_cache=False)
         # the reference keeps the last BS-1 rows: slot 0 is the anchor
         draft_hidden = hidden[:, 1 - BS:, :]
-        logits = torch.nn.functional.linear(draft_hidden, lm_head)
+        logits = torch.nn.functional.linear(draft_hidden, lm_head.to(DT))
         path, candidates, qrows = m.propose(draft_hidden,
                                             block_ids[:, 0],
-                                            lambda h: torch.nn.functional.linear(h, lm_head),
+                                            lambda h: torch.nn.functional.linear(h, lm_head.to(DT)),
                                             0.0)
         # the selector's inputs, for stage-level checking
         unary, cand = torch.topk(logits, m.candidate_selector.top_k, dim=-1, sorted=False)
         hp = m.candidate_selector.hidden_projection(draft_hidden)
+
+    for k, v in stage.items():
+        t = v if v.dim() == 2 else v[0]
+        w(t).tofile(f"{a.out}/stage_{k}.bf16")
+        print(f"  stage {k}: {tuple(t.shape)}")
 
     w(target_hidden[0]).tofile(f"{a.out}/target_hidden.bf16")
     w(noise_embedding[0]).tofile(f"{a.out}/noise_embedding.bf16")

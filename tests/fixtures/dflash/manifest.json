@@ -1,0 +1,37 @@
+{
+  "hidden": 5120,
+  "block_size": 8,
+  "num_layers": 5,
+  "num_taps": 5,
+  "target_layer_ids": [
+    5,
+    19,
+    33,
+    47,
+    61
+  ],
+  "mask_token_id": 248070,
+  "ctx": 64,
+  "top_k": 16,
+  "rank": 256,
+  "input_embedding_scale": 1.0,
+  "sliding_window": 2048,
+  "num_q_heads": 32,
+  "num_kv_heads": 8,
+  "head_dim": 128,
+  "rms_eps": 1e-06,
+  "rope_theta": 10000000.0,
+  "conv_kernel_size": 2,
+  "conv_group_size": 16,
+  "path": [
+    95789,
+    286,
+    10891,
+    178831,
+    240552,
+    95790,
+    64781
+  ],
+  "hidden_absmax": 44.0,
+  "logits_absmax": 3.953125
+}
