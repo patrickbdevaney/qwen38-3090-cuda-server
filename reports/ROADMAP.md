@@ -41,7 +41,10 @@ KV and 262K would not be on the table.
 
 1. **Vision, toggleable.** 27-block SigLIP-style ViT, 0.858 GiB. Costs 28K
    tokens of context when enabled, which is why it is a launch flag.
-2. **A second quant backend on UD-IQ4_XS.** See below.
+2. **A lower GGUF quant, if the headroom is wanted.** The container and all 13
+   dequantisers are in and gated; what is missing is the fused GEMV that
+   consumes the blocks without a dequantised round trip. Only worth building
+   against a quant that actually frees memory -- UD-IQ4_XS does not.
 3. **RoPE extension past 262144.** The real prize of a smaller quant: more KV
    headroom is only useful if the positions above 262144 are usable, which needs
    YaRN-style extrapolation. Quality there has to be measured, not assumed.
@@ -52,9 +55,28 @@ KV and 262K would not be on the table.
 
 ## The quant decision, and the experiment that is deliberately deferred
 
-**Chosen: UD-IQ4_XS** (14.3 GB). It is the only step below our AWQ INT4 g128
-stack (15.30 GB) that stays in the same fidelity class, and the ~1 GB it frees is
-what vision + 262K needs. Everything below it trades measurably more error:
+**UD-IQ4_XS was chosen and then MEASURED, and the measurement killed it.** The
+published file sizes are misleading, because they include the embedding and the
+output head. Summing actual tensor bytes:
+
+| | GGUF UD-IQ4_XS | ours (AWQ INT4 g128) |
+|---|---|---|
+| body (what decode reads every token) | **11.941 GiB** | **11.859 GiB** |
+| output head | 0.814 GiB (Q5_K) | 1.203 GiB (INT8) |
+| token embedding | 0.509 GiB (Q3_K) | 0 -- host resident, bf16 |
+| resident total | 12.755 GiB | 13.062 GiB |
+
+**The IQ4_XS body is 0.08 GiB LARGER than ours.** IQ4_XS is 4.25 bits/weight and
+our AWQ INT4 g128 is 4.16, so they are the same bit budget; the file-size
+advantage was never in the body. The entire 0.31 GiB net saving comes from the
+head being Q5_K rather than INT8 -- about 10k tokens of context -- and we would
+get the same by quantising our own head lower, with no second backend at all.
+
+So UD-IQ4_XS is not worth adopting. The container and dequantisation work is NOT
+wasted: it is exactly what is needed to evaluate or adopt any GGUF, and it is
+committed and gated bit-exact against ggml.
+
+The real headroom is further down the ladder. Everything below it trades measurably more error:
 Unsloth's published KLD on the same size class is 0.024 for Q4_K_XL, 0.081 for
 Q3_K_XL (3.4x) and 0.221 for Q2_K_XL (9.2x).
 
