@@ -138,6 +138,46 @@ the argmax. Measured fallbacks on the same server:
 
 ---
 
+## KV cache quantisation
+
+```
+./build/bench_decode $MODEL 262144 8 1 2048 1 2      # last arg: 0=fp8 1=v4 2=int4
+./build/gate_kvquant $MODEL 8192 24
+```
+
+INT4 with a per-32-group symmetric fp16 scale, K and V independently
+selectable (`--kv-cache fp8 | v4 | int4`).
+
+| | FP8 e4m3 | INT4 |
+|---|---|---|
+| per token, all 16 attention layers | 32 KiB | **18 KiB** |
+| KV at 262144 | 8.0 GiB | **4.5 GiB** |
+| measured peak at 262144 | 23332 MiB | **19749 MiB** |
+| decode at 262144 | 24.4 tok/s | 24.5 tok/s |
+
+**3.58 GiB freed, and decode is unchanged.** The lack of a speedup is worth
+stating rather than glossing: halving KV traffic should have helped, but the
+decode attention kernel was already running at 444 GB/s against a load-only
+ceiling of 788, so it is latency and ALU bound rather than bandwidth bound, and
+the extra dequantisation exactly fills the bandwidth that was freed. **INT4 KV
+buys memory, not speed.**
+
+Quality, measured against the FP8 run on identical weights and prompts
+(`gate_kvquant`, 8179-token context, needle at the start, question at the end):
+
+| config | KL vs FP8 | tokens identical | needle |
+|---|---|---|---|
+| K fp8 / V int4 | 2.30e-05 | 6/6 | FOUND |
+| int4 / int4 | 9.20e-05 | 6/6 | FOUND |
+
+For scale, the INT4 **weights** already cost 6.99e-04 against the bf16
+reference, so full INT4 KV adds about a seventh of the error that is already
+there. V-only INT4 is 4x cleaner than both sides, which is the expected
+ordering: values are averaged over the attention distribution so their noise
+cancels, while keys decide *where* attention lands and theirs does not.
+
+---
+
 ## Prefix cache (multi-turn / agentic)
 
 ```

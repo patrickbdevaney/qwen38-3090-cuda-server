@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include "../src/model/model.h"
 #include "../src/tokenizer/bpe.h"
+#include "../src/tokenizer/chat_template.h"
 #include "../src/kernels/elementwise.cuh"
 
 #define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
@@ -121,19 +122,38 @@ int main(int argc, char** argv) {
 
   // A fact buried near the START of a long context, asked about at the END --
   // the longest possible distance, which is where quantised keys fail first.
+  //
+  // This MUST go through the chat template. A raw completion prompt makes an
+  // instruct model continue the filler pattern instead of answering, and then
+  // the baseline misses the needle for reasons that have nothing to do with the
+  // KV cache.
   const char* NEEDLE = "84731";
-  std::string prompt = "Project notes.\n\nThe access code for the staging server is ";
-  prompt += NEEDLE;
-  prompt += ".\n\n";
-  for (int i = 0; prompt.size() < size_t(target_ctx) * 3; ++i) {
-    prompt += "Module " + std::to_string(i) +
-              " handles subsystem " + std::to_string(i) +
-              " and depends on module " + std::to_string(i ? i - 1 : 0) + ".\n";
+  auto build = [&](int lines) {
+    std::string doc = "Project notes.\n\nThe access code for the staging server is ";
+    doc += NEEDLE;
+    doc += ".\n\n";
+    for (int i = 0; i < lines; ++i)
+      doc += "Module " + std::to_string(i) +
+             " handles subsystem " + std::to_string(i) +
+             " and depends on module " + std::to_string(i ? i - 1 : 0) + ".\n";
+    doc += "\nWhat is the access code for the staging server? Reply with only the number.";
+    qwen::ojson msgs = qwen::ojson::array();
+    msgs.push_back({{"role", "user"}, {"content", doc}});
+    qwen::ChatOptions copt;
+    copt.add_generation_prompt = true;
+    copt.enable_thinking = false;    // answer directly; this is a retrieval test
+    return tok.encode(qwen::render_chat(msgs, qwen::ojson(), copt));
+  };
+  // Size the FILLER to hit the target. Truncating the token list instead would
+  // cut off the question and the generation prompt, and the model would just
+  // continue the filler -- which is a broken test, not a KV result.
+  int lo = 0, hi = 1;
+  while (int(build(hi).size()) < target_ctx && hi < (1 << 20)) hi *= 2;
+  while (lo + 1 < hi) {
+    const int mid = (lo + hi) / 2;
+    if (int(build(mid).size()) <= target_ctx) lo = mid; else hi = mid;
   }
-  prompt += "\nQuestion: what is the access code for the staging server?\nAnswer: ";
-
-  std::vector<int32_t> ids = tok.encode(prompt);
-  if (int(ids.size()) > target_ctx) ids.resize(target_ctx);
+  std::vector<int32_t> ids = build(lo);
   printf("gate_kvquant: %zu prompt tokens, needle \"%s\" at the start\n",
          ids.size(), NEEDLE);
 
