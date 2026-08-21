@@ -276,7 +276,7 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.attn_ws  = static_cast<float*>(dalloc(m, attn_decode_workspace_bytes(m.attn, maxsp)));
   m.kv_deq   = static_cast<__nv_bfloat16*>(dalloc(m, size_t(2) * 2048 * S.num_key_value_heads * S.head_dim * 2));
   m.prefill_scores = static_cast<float*>(dalloc(m, attn_prefill_scratch_bytes(m.attn, 2048, 128)));
-  gemv_scratch_alloc(m.gemv, widest, std::max(S.vocab_size, widest), GROUP);
+  gemv_scratch_alloc(m.gemv, widest, std::max(S.vocab_size, widest), GROUP, 16);
   gemm_workspace_alloc(m.gemm, 256ull << 20);
   m.owned.push_back(m.gemm.wbuf);
 

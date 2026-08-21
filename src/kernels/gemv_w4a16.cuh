@@ -95,15 +95,32 @@ struct GemvScratch {
   float* xf     = nullptr;   // [in_f]
   float* xgsum  = nullptr;   // [num_groups]
   float* partial= nullptr;   // [max_splits][out_f]
-  int    max_in = 0, max_groups = 0, max_out = 0, max_splits = 0;
+  int    max_in = 0, max_groups = 0, max_out = 0, max_splits = 0, max_m = 1;
   size_t bytes() const {
-    return size_t(max_in) * 4 + size_t(max_groups) * 4 +
-           size_t(max_splits) * max_out * 4;
+    return (size_t(max_in) + size_t(max_groups) +
+            size_t(max_splits) * max_out) * size_t(max_m) * 4;
   }
 };
 
-void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group);
+void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group,
+                        int max_m = 1);
 void gemv_scratch_free(GemvScratch& s);
+
+// Skinny GEMM: Y[M, out] = X[M, in] @ W^T, for small M (the speculative block).
+//
+// THIS IS WHAT MAKES SPECULATION PAY. Verifying a block of 8 must read the
+// weights ONCE, not eight times and not via a dequantize-to-bf16 round trip.
+// The GEMV already reads each weight once and broadcasts the activation; the
+// only change is M accumulators per lane and M activation vectors, so the
+// weight stream is unchanged and the arithmetic goes up M-fold on a kernel that
+// was nowhere near compute bound. At M=8 the verification pass therefore costs
+// about what a single decode step costs, which is the entire premise of
+// speculative decoding on a bandwidth-bound model.
+//
+// X is [M, in] row-major; Y is [M, out] row-major.
+void gemm_small_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,
+                      int M, GemvScratch& s, cudaStream_t stream = 0);
+size_t gemv_scratch_bytes_for_m(const GemvScratch& s, int max_m);
 
 // y[out] = W @ x. y may be bf16 or fp32.
 void gemv_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,

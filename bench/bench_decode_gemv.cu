@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
   int max_in = 0, max_out = 0;
   for (auto& o : ops) { max_in = std::max(max_in, o.w.in_f); max_out = std::max(max_out, o.w.out_f); }
   qwen::GemvScratch S;
-  qwen::gemv_scratch_alloc(S, max_in, max_out, GROUP);
+  qwen::gemv_scratch_alloc(S, max_in, max_out, GROUP, 16);
 
   __nv_bfloat16 *d_x, *d_y;
   CK(cudaMalloc(&d_x, size_t(max_in) * 2));

@@ -7,6 +7,12 @@ namespace qwen {
 namespace {
 
 constexpr int WARP  = 32;
+#ifndef QWEN_GEMM_UNROLL
+#define QWEN_GEMM_UNROLL 4
+#endif
+// #pragma unroll does not macro-expand its argument; _Pragma does.
+#define QWEN_DO_PRAGMA(x) _Pragma(#x)
+#define QWEN_UNROLL(n) QWEN_DO_PRAGMA(unroll n)
 #ifndef QWEN_GEMV_WARPS
 #define QWEN_GEMV_WARPS 1
 #endif
@@ -138,6 +144,116 @@ __global__ __launch_bounds__(BLOCK) void k_gemv(
   partial[size_t(blockIdx.y) * out_f + o] = acc;
 }
 
+// M-row variant. Every lane keeps M accumulators; the weight tile it reads is
+// shared across all M rows, so the weight traffic is identical to M=1.
+template <int WORDS_PER_GROUP, int MROWS>
+__global__ __launch_bounds__(BLOCK) void k_gemm_small(
+    float* __restrict__ partial,
+    const uint32_t* __restrict__ qw,
+    const __nv_bfloat16* __restrict__ sc,
+    const uint8_t* __restrict__ zp,
+    const float* __restrict__ xf,       // [MROWS][in_f]
+    const float* __restrict__ xgsum,    // [MROWS][G]
+    int out_f, int words_per_row, int G, int groups_per_split, int group, int in_f) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int o = blockIdx.x * ROWS_PER_BLOCK + warp * WARP + lane;
+  if (o >= out_f) return;
+  const int b = o >> 5;
+  const int g0 = blockIdx.y * groups_per_split;
+  const int g1 = min(g0 + groups_per_split, G);
+
+  // The M activation vectors for a group are staged in SHARED memory. Reading
+  // them from L2 inside the inner loop measured M=8 at 5.1x M=1: each lane
+  // issued MROWS x 2 broadcast loads per weight word, and the issue cost of
+  // those, not the weight stream, became the kernel. Staging is coalesced,
+  // happens once per group, and the inner loop then reads warp-uniform shared
+  // addresses.
+  extern __shared__ float sx[];        // [MROWS][group]
+  float acc[MROWS];
+  #pragma unroll
+  for (int r = 0; r < MROWS; ++r) acc[r] = 0.f;
+
+  for (int g = g0; g < g1; ++g) {
+    for (int i = threadIdx.x; i < MROWS * group; i += BLOCK)
+      sx[i] = xf[size_t(i / group) * in_f + size_t(g) * group + (i % group)];
+    __syncthreads();
+
+    const float s = __bfloat162float(sc[(size_t(b) * G + g) * 32 + lane]);
+    const float C = 128.0f + float(zp[(size_t(b) * G + g) * 32 + lane]);
+    const uint32_t* wp = qw + (size_t(b) * words_per_row + size_t(g) * WORDS_PER_GROUP) * 32 + lane;
+
+    float pg[MROWS];
+    #pragma unroll
+    for (int r = 0; r < MROWS; ++r) pg[r] = 0.f;
+
+    // Unroll factor is a knob, not a maximum. Fully unrolling 16 words x MROWS
+    // rows put 152 registers per thread in flight, which caps occupancy at ~13
+    // warps per SM out of 48 and leaves the kernel issue-bound at 3x its
+    // instruction roofline. Swept.
+    QWEN_UNROLL(QWEN_GEMM_UNROLL)
+    for (int t = 0; t < WORDS_PER_GROUP; ++t) {
+      const uint32_t w = wp[size_t(t) * 32];
+      const float2 f0 = nib2(w, 0);
+      const float2 f1 = nib2(w, 4);
+      const float2 f2 = nib2(w, 8);
+      const float2 f3 = nib2(w, 12);
+      #pragma unroll
+      for (int r = 0; r < MROWS; ++r) {
+        const float* xp = sx + r * group + t * 8;
+        const float4 xa = *reinterpret_cast<const float4*>(xp);
+        const float4 xb = *reinterpret_cast<const float4*>(xp + 4);
+        pg[r] = fmaf(f0.x, xa.x, pg[r]);  pg[r] = fmaf(f1.x, xa.y, pg[r]);
+        pg[r] = fmaf(f2.x, xa.z, pg[r]);  pg[r] = fmaf(f3.x, xa.w, pg[r]);
+        pg[r] = fmaf(f0.y, xb.x, pg[r]);  pg[r] = fmaf(f1.y, xb.y, pg[r]);
+        pg[r] = fmaf(f2.y, xb.z, pg[r]);  pg[r] = fmaf(f3.y, xb.w, pg[r]);
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < MROWS; ++r)
+      acc[r] = fmaf(s, pg[r] - C * xgsum[size_t(r) * G + g], acc[r]);
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int r = 0; r < MROWS; ++r)
+    partial[(size_t(blockIdx.y) * MROWS + r) * out_f + o] = acc[r];
+}
+
+__global__ void k_reduce_bf16_m(__nv_bfloat16* __restrict__ y,
+                                const float* __restrict__ partial,
+                                int out_f, int splits, int M) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= out_f * M) return;
+  const int r = i / out_f, o = i % out_f;
+  float s = 0.f;
+  for (int k = 0; k < splits; ++k) s += partial[(size_t(k) * M + r) * out_f + o];
+  y[size_t(r) * out_f + o] = __float2bfloat16(s);
+}
+
+__global__ void k_prep_m(float* __restrict__ xf, float* __restrict__ xgsum,
+                         const __nv_bfloat16* __restrict__ x, int group, int in_f, int G) {
+  const int g = blockIdx.x % G, r = blockIdx.x / G;
+  const int base = g * group;
+  const __nv_bfloat16* xr = x + size_t(r) * in_f;
+  float* of = xf + size_t(r) * in_f;
+  float s = 0.f;
+  for (int k = threadIdx.x; k < group; k += blockDim.x) {
+    const float v = __bfloat162float(xr[base + k]);
+    of[base + k] = v;
+    s += v;
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+  __shared__ float part[8];
+  const int nw = blockDim.x >> 5;
+  if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float t = 0.f;
+    for (int i = 0; i < nw; ++i) t += part[i];
+    xgsum[size_t(r) * G + g] = t;
+  }
+}
+
 __global__ void k_reduce(float* __restrict__ y, const float* __restrict__ partial,
                          int out_f, int splits) {
   const int o = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,13 +328,13 @@ void awq_free(W4A16Weights& w) {
   w = W4A16Weights{};
 }
 
-void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group) {
-  s.max_in = max_in; s.max_out = max_out;
+void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group, int max_m) {
+  s.max_in = max_in; s.max_out = max_out; s.max_m = max_m;
   s.max_groups = max_in / min_group;
   s.max_splits = sm_count() * 16;
-  cudaMalloc(&s.xf, size_t(max_in) * 4);
-  cudaMalloc(&s.xgsum, size_t(s.max_groups) * 4);
-  cudaMalloc(&s.partial, size_t(s.max_splits) * max_out * 4);
+  cudaMalloc(&s.xf, size_t(max_in) * max_m * 4);
+  cudaMalloc(&s.xgsum, size_t(s.max_groups) * max_m * 4);
+  cudaMalloc(&s.partial, size_t(s.max_splits) * max_out * max_m * 4);
 }
 
 void gemv_scratch_free(GemvScratch& s) {
@@ -247,6 +363,41 @@ void run(const W4A16Weights& w, const __nv_bfloat16* x, GemvScratch& s,
   else { fprintf(stderr, "gemv: unsupported group_size %d\n", w.group_size); abort(); }
 }
 }  // namespace
+
+void gemm_small_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,
+                      int M, GemvScratch& s, cudaStream_t st) {
+  if (M == 1) { gemv_w4a16(y, w, x, s, st); return; }
+  const int G = w.num_groups, wpr = w.in_f / 8;
+  const int splits = gemv_choose_splits(w.out_f, G);
+  const int gps = G / splits;
+  k_prep_m<<<G * M, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size, w.in_f, G);
+  dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
+  const int wpg = w.group_size / 8;
+  const size_t sm = size_t(M) * w.group_size * sizeof(float);
+  #define LAUNCH(WPG, MR) k_gemm_small<WPG, MR><<<grid, BLOCK, sm, st>>>( \
+      s.partial, w.qweight, w.scale, w.zp, s.xf, s.xgsum, w.out_f, wpr, G, gps, \
+      w.group_size, w.in_f)
+  if (wpg == 16) {
+    switch (M) {
+      case 2:  LAUNCH(16, 2);  break;
+      case 4:  LAUNCH(16, 4);  break;
+      case 8:  LAUNCH(16, 8);  break;
+      case 16: LAUNCH(16, 16); break;
+      default: fprintf(stderr, "gemm_small: unsupported M %d\n", M); abort();
+    }
+  } else if (wpg == 4) {
+    switch (M) {
+      case 2:  LAUNCH(4, 2);  break;
+      case 4:  LAUNCH(4, 4);  break;
+      case 8:  LAUNCH(4, 8);  break;
+      case 16: LAUNCH(4, 16); break;
+      default: fprintf(stderr, "gemm_small: unsupported M %d\n", M); abort();
+    }
+  } else { fprintf(stderr, "gemm_small: unsupported group %d\n", w.group_size); abort(); }
+  #undef LAUNCH
+  const int n = w.out_f * M;
+  k_reduce_bf16_m<<<(n + 255) / 256, 256, 0, st>>>(y, s.partial, w.out_f, splits, M);
+}
 
 void gemv_w4a16_f32(float* y, const W4A16Weights& w, const __nv_bfloat16* x,
                     GemvScratch& s, cudaStream_t st) {

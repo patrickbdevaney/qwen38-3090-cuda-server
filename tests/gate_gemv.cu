@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     qwen::W4A16Weights W;
     qwen::awq_repack(W, d_qw, d_sc, d_zp, out_f, in_f, group);
     qwen::GemvScratch S;
-    qwen::gemv_scratch_alloc(S, in_f, out_f, group);
+    qwen::gemv_scratch_alloc(S, in_f, out_f, group, 16);
     CK(cudaDeviceSynchronize());
 
     qwen::gemv_w4a16_f32(d_y, W, d_x, S);
