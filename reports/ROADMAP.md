@@ -37,6 +37,29 @@ KV and 262K would not be on the table.
 | prefix cache, 2nd turn | 90.5x faster prefill |
 | gates | 16 / 16 |
 
+## The KV cache is the bigger lever, and it was hiding in plain sight
+
+At 262144 context the KV cache costs **8.0 GiB** -- more than half the memory
+pressure -- and it was at 8 bits while the weights were at 4.
+
+| KV format | per token | at 262144 | frees |
+|---|---|---|---|
+| FP8 e4m3 | 32 KiB | 8.0 GiB | -- |
+| K FP8 / V INT4 | 25 KiB | 6.3 GiB | 1.7 GiB |
+| INT4 / INT4 | 18 KiB | 4.5 GiB | **3.5 GiB** |
+
+That is ~3.7x what the best weight-quant step (Q3_K_XL, 0.95 GiB) would give,
+and it is a better trade for this workload for a reason worth stating plainly:
+
+> Weight quantisation degrades EVERYTHING -- world knowledge, tool-call
+> precision, code syntax. KV quantisation degrades ONE thing: long-range
+> retrieval fidelity.
+
+Keys decide *where* attention goes; values only *what it carries*. So K and V
+are configurable independently and `K FP8 / V INT4` is the conservative step.
+
+`--kv-cache fp8 | v4 | int4`.
+
 ## Left to do
 
 1. **Vision, toggleable.** 27-block SigLIP-style ViT, 0.858 GiB. Costs 28K

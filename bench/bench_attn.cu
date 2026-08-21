@@ -21,12 +21,12 @@ int main() {
     CK(cudaMalloc(&vc, size_t(ctx)*NKV*HD)); CK(cudaMemset(vc, 0x38, size_t(ctx)*NKV*HD));
     const int sp = qwen::attn_decode_splits(ctx);
     CK(cudaMalloc(&ws, qwen::attn_decode_workspace_bytes(D, sp)));
-    for (int i = 0; i < 5; ++i) qwen::attn_decode(o, q, kc, vc, ctx, ctx, D, ws, sp);
+    for (int i = 0; i < 5; ++i) qwen::attn_decode(o, q, kc, vc, nullptr, nullptr, ctx, ctx, D, ws, sp);
     CK(cudaDeviceSynchronize());
     cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
     const int IT = 30;
     cudaEventRecord(a);
-    for (int i = 0; i < IT; ++i) qwen::attn_decode(o, q, kc, vc, ctx, ctx, D, ws, sp);
+    for (int i = 0; i < IT; ++i) qwen::attn_decode(o, q, kc, vc, nullptr, nullptr, ctx, ctx, D, ws, sp);
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms=0; cudaEventElapsedTime(&ms,a,b); ms/=IT;
     const double bytes = 2.0*ctx*NKV*HD;

@@ -19,6 +19,10 @@ int main(int argc, char** argv) {
   qwen::Model m; qwen::LoadOptions o;
   o.max_ctx = max_ctx; o.max_batch = (argc > 5) ? atoi(argv[5]) : 4096;
   o.embed_host = (argc > 6) ? atoi(argv[6]) != 0 : false;
+  // argv[7]: 0 = fp8/fp8, 1 = K fp8 / V int4, 2 = int4/int4
+  { const int kv = (argc > 7) ? atoi(argv[7]) : 0;
+    o.kv_k = (kv == 2) ? qwen::KvFmt::INT4 : qwen::KvFmt::FP8;
+    o.kv_v = (kv >= 1) ? qwen::KvFmt::INT4 : qwen::KvFmt::FP8; }
   o.lm_head_bits = quant_lm; o.quantize_embed = true;
   qwen::model_load(m, md, o);
   printf("\nlm_head %d-bit, max_ctx %d\n", o.lm_head_bits, max_ctx);

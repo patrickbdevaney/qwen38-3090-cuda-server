@@ -220,6 +220,8 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   // --max-context auto (opt.max_ctx == 0): size the KV cache from whatever the
   // device has left once everything else is resident. Until then use the model's
   // trained maximum, so any scratch sized from max_ctx is an upper bound.
+  m.attn.k_fmt = opt.kv_k;
+  m.attn.v_fmt = opt.kv_v;
   const bool auto_ctx = (opt.max_ctx <= 0);
   m.max_ctx = auto_ctx ? S.max_position_embeddings : opt.max_ctx;
   m.max_batch = opt.max_batch;
@@ -378,13 +380,18 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.owned.push_back(m.gemm.wbuf);
 
   // ---- KV cache, sized against what is actually left --------------------
-  const size_t kv_per_token = size_t(S.num_attn_layers) * S.num_key_value_heads *
-                              S.head_dim;   // per side; k and v are separate
+  // Per side, per token, ACROSS ALL ATTENTION LAYERS -- quants only; the scale
+  // arrays are counted separately below.
+  const size_t kb = size_t(S.num_attn_layers) * m.attn.k_bytes_per_pos();
+  const size_t vb = size_t(S.num_attn_layers) * m.attn.v_bytes_per_pos();
+  const size_t kscale = size_t(S.num_attn_layers) * m.attn.k_scales_per_pos() * 2;
+  const size_t vscale = size_t(S.num_attn_layers) * m.attn.v_scales_per_pos() * 2;
+  const size_t kv_per_token_total = kb + vb + kscale + vscale;
   const size_t margin = 512ull << 20;
   CKM(cudaMemGetInfo(&free_b, &total_b));
   if (auto_ctx) {
     const size_t avail = free_b > margin ? free_b - margin : 0;
-    size_t fit = avail / (2 * kv_per_token);
+    size_t fit = avail / kv_per_token_total;
     fit = (fit / 256) * 256;                       // whole graph buckets
     if (fit > size_t(S.max_position_embeddings)) fit = S.max_position_embeddings;
     if (fit < 1024) {
@@ -395,12 +402,14 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
     m.max_ctx = int(fit);
     if (opt.verbose)
       printf("\n--max-context auto -> %d tokens (%.2f GiB of KV, %.0f MB margin)\n",
-             m.max_ctx, double(2 * kv_per_token * m.max_ctx) / (1 << 30),
+             m.max_ctx, double(kv_per_token_total * m.max_ctx) / (1 << 30),
              margin / 1048576.0);
   }
-  const size_t kv_bytes = kv_per_token * m.max_ctx;
-  m.k_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
-  m.v_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
+  m.k_cache = static_cast<uint8_t*>(dalloc(m, kb * m.max_ctx));
+  m.v_cache = static_cast<uint8_t*>(dalloc(m, vb * m.max_ctx));
+  if (kscale) m.k_scale = static_cast<uint16_t*>(dalloc(m, kscale * m.max_ctx));
+  if (vscale) m.v_scale = static_cast<uint16_t*>(dalloc(m, vscale * m.max_ctx));
+  const size_t kv_bytes = (kb + vb + kscale + vscale) * m.max_ctx / 2;
   // splits depend on the final context, and the eager and graph paths must agree
   m.graph_splits = attn_decode_splits(m.max_ctx);
 
@@ -417,8 +426,11 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
            human(opt.quantize_embed ? size_t(S.vocab_size) * (S.hidden_size + 4)
                                     : size_t(S.vocab_size) * S.hidden_size * 2, b1),
            opt.quantize_embed ? "(INT8 rowwise)" : "(BF16)");
-    printf("  KV cache @ %d ctx   %s (FP8, %lld KiB/token)\n", m.max_ctx,
-           human(2 * kv_bytes, b1), (long long)(S.kv_bytes_per_token(1) / 1024));
+    printf("  KV cache @ %d ctx   %s (K %s / V %s, %.1f KiB/token)\n", m.max_ctx,
+           human(kv_per_token_total * m.max_ctx, b1),
+           opt.kv_k == KvFmt::FP8 ? "FP8" : "INT4",
+           opt.kv_v == KvFmt::FP8 ? "FP8" : "INT4",
+           double(kv_per_token_total) / 1024.0);
     printf("  GDN state             %s\n", human(size_t(S.gdn_state_elems()) * 4, b1));
     printf("  free after load       %s\n", human(free_b, b1));
   }
@@ -504,22 +516,26 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
     const int qkv_w = int(m.attn.q_proj_out() + 2 * m.attn.kv_proj_out());
     linear(m, m.proj, L.attn_qkv, m.h2, T);
     dsync("attn_qkv", li);
-    uint8_t* kcw = m.k_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
-    uint8_t* vcw = m.v_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
+    uint8_t* kcw = m.k_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.k_bytes_per_pos();
+    uint8_t* vcw = m.v_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.v_bytes_per_pos();
+    uint16_t* ksw = m.k_scale ? m.k_scale + size_t(L.attn_slot) * m.max_ctx * m.attn.k_scales_per_pos() : nullptr;
+    uint16_t* vsw = m.v_scale ? m.v_scale + size_t(L.attn_slot) * m.max_ctx * m.attn.v_scales_per_pos() : nullptr;
     if (dev_pos)
-      attn_prepare_dev(m.q_buf, m.gate_buf, kcw, vcw, m.proj, L.q_norm, L.k_norm,
+      attn_prepare_dev(m.q_buf, m.gate_buf, kcw, vcw, ksw, vsw, m.proj, L.q_norm, L.k_norm,
                        m.cos_tab, m.sin_tab, m.d_step + 1, m.max_ctx, m.attn, m.stream);
     else
-      attn_prepare(m.q_buf, m.gate_buf, kcw, vcw, m.proj, L.q_norm, L.k_norm,
+      attn_prepare(m.q_buf, m.gate_buf, kcw, vcw, ksw, vsw, m.proj, L.q_norm, L.k_norm,
                    m.cos_tab, m.sin_tab, T, position, m.max_ctx, m.attn, m.stream);
     dsync("attn_prepare", li);
-    const uint8_t* kc = m.k_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
-    const uint8_t* vc = m.v_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
+    const uint8_t* kc = kcw;
+    const uint8_t* vc = vcw;
+    const uint16_t* ks = ksw;
+    const uint16_t* vs = vsw;
     if (prefill) {
-      attn_prefill(m.attn_out, m.q_buf, kc, vc, T, position + T, position, m.max_ctx,
+      attn_prefill(m.attn_out, m.q_buf, kc, vc, ks, vs, T, position + T, position, m.max_ctx,
                    m.attn, m.kv_deq, m.prefill_scores, m.cublas, m.stream);
     } else if (dev_pos) {
-      attn_decode_dev(m.attn_out, m.q_buf, kc, vc, m.d_step + 2, m.max_ctx, m.attn,
+      attn_decode_dev(m.attn_out, m.q_buf, kc, vc, ks, vs, m.d_step + 2, m.max_ctx, m.attn,
                       m.attn_ws, m.graph_splits, m.stream);
     } else {
       // Fixed split count, chosen from max_ctx rather than the current context.
@@ -528,7 +544,7 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
       // lengths AND makes the eager and graph paths disagree bit for bit. Empty
       // splits cost nothing: the kernel yields m=-FLT_MAX, l=0, which the
       // combine handles.
-      attn_decode(m.attn_out, m.q_buf, kc, vc, position + 1, m.max_ctx, m.attn,
+      attn_decode(m.attn_out, m.q_buf, kc, vc, ks, vs, position + 1, m.max_ctx, m.attn,
                   m.attn_ws, m.graph_splits, m.stream);
     }
     attn_output_gate(m.attn_out, m.gate_buf, T * int(m.attn.o_proj_in()), m.stream);

@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&d_cos, size_t(T)*HALF*4)); CK(cudaMalloc(&d_sin, size_t(T)*HALF*4));
 
     qwen::rope_tables(d_cos, d_sin, d_pos, d_pos, d_pos, T, D.rotary_dim, D.rope_theta);
-    qwen::attn_prepare(d_qo, d_gate, d_kc, d_vc, d_in, d_qn, d_kn, d_cos, d_sin,
+    qwen::attn_prepare(d_qo, d_gate, d_kc, d_vc, nullptr, nullptr, d_in, d_qn, d_kn, d_cos, d_sin,
                        T, 0, T, D);
     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
 
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
       __nv_bfloat16* kvs; float* ss;
       CK(cudaMalloc(&kvs, size_t(2)*2048*NKV*HD*2));
       CK(cudaMalloc(&ss, qwen::attn_prefill_scratch_bytes(D, 2048, 128)));
-      qwen::attn_prefill(d_out, d_qo, d_kc, d_vc, T, T, 0, T, D, kvs, ss, cb);
+      qwen::attn_prefill(d_out, d_qo, d_kc, d_vc, nullptr, nullptr, T, T, 0, T, D, kvs, ss, cb);
       CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
       rows.push_back({"prefill attn", cmp_b(fb(d_out, size_t(T)*NQ*HD), r_att), 3e-2});
       cudaFree(kvs); cudaFree(ss);
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
       const int splits = qwen::attn_decode_splits(T);
       float* ws; CK(cudaMalloc(&ws, qwen::attn_decode_workspace_bytes(D, splits)));
       __nv_bfloat16* dout; CK(cudaMalloc(&dout, size_t(NQ)*HD*2));
-      qwen::attn_decode(dout, d_qo + size_t(T-1)*NQ*HD, d_kc, d_vc, T, T, D, ws, splits);
+      qwen::attn_decode(dout, d_qo + size_t(T-1)*NQ*HD, d_kc, d_vc, nullptr, nullptr, T, T, D, ws, splits);
       CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
       std::vector<uint16_t> want(r_att.begin() + size_t(T-1)*NQ*HD, r_att.end());
       rows.push_back({"decode attn", cmp_b(fb(dout, size_t(NQ)*HD), want), 3e-2});

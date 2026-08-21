@@ -143,7 +143,64 @@ __global__ void k_prepare_q(__nv_bfloat16* __restrict__ q_out,
   q_out[size_t(t) * nq * D + size_t(h) * D + d] = __float2bfloat16(x);
 }
 
+// Store one dim of one (position, head) vector.
+//
+// For INT4 the group of 32 dims IS a warp: blockDim.x is head_dim and thread d
+// holds dim d, so the per-group absmax is a plain warp reduction and needs no
+// shared memory or second pass.
+template <KvFmt F>
+__device__ __forceinline__ void store_kv(uint8_t* __restrict__ c,
+                                         uint16_t* __restrict__ sc,
+                                         int pos, int h, int nkv, int D, int d, float x) {
+  if (F == KvFmt::FP8) {
+    c[(size_t(pos) * nkv + h) * D + d] = f32_to_e4m3(x);
+  } else {
+    float a = fabsf(x);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const float s1 = a > 0.f ? a / 7.0f : 1.0f;
+    int q = __float2int_rn(x / s1);
+    q = max(-7, min(7, q));
+    if ((d & 31) == 0)
+      sc[(size_t(pos) * nkv + h) * (D / 32) + (d >> 5)] = __half_as_ushort(__float2half(s1));
+    // two dims per byte; the even lane packs itself and its neighbour
+    const int qn = __shfl_down_sync(0xffffffffu, q, 1);
+    if ((d & 1) == 0)
+      c[(size_t(pos) * nkv + h) * (D / 2) + (d >> 1)] =
+          uint8_t((uint32_t(q) & 0xFu) | ((uint32_t(qn) & 0xFu) << 4));
+  }
+}
+
+// Load the 8 dims [d0, d0+8) of one (position, head) vector.
+template <KvFmt F>
+__device__ __forceinline__ void load_kv8(float* __restrict__ out,
+                                         const uint8_t* __restrict__ c,
+                                         const uint16_t* __restrict__ sc,
+                                         int p, int kvh, int nkv, int D, int d0,
+                                         const float* __restrict__ lut) {
+  if (F == KvFmt::FP8) {
+    const uint2 w = *reinterpret_cast<const uint2*>(c + (size_t(p) * nkv + kvh) * D + d0);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t b = (i < 4) ? w.x : w.y;
+      out[i] = lut[(b >> ((i & 3) * 8)) & 0xFFu];
+    }
+  } else {
+    // 4 bytes = 8 nibbles = 8 dims, and one scale covers all 8 because a group
+    // is 32 dims and d0 is a multiple of 8.
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(
+        c + (size_t(p) * nkv + kvh) * (D / 2) + (d0 >> 1));
+    const float s1 = __half2float(__ushort_as_half(
+        sc[(size_t(p) * nkv + kvh) * (D / 32) + (d0 >> 5)]));
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+      out[i] = s1 * float(kv_i4_decode((w >> (4 * i)) & 0xFu));
+  }
+}
+
+template <KvFmt KF, KvFmt VF>
 __global__ void k_prepare_kv(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
+                             uint16_t* __restrict__ ks, uint16_t* __restrict__ vs,
                              const __nv_bfloat16* __restrict__ qkv_in,
                              const __nv_bfloat16* __restrict__ kn_w,
                              const float* __restrict__ cosv, const float* __restrict__ sinv,
@@ -178,9 +235,8 @@ __global__ void k_prepare_kv(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
                    : (sh[d] * c + sh[d - half] * sn);
   }
   const int cp = dpos ? dpos[0] : cache_pos;
-  const size_t off = (size_t(cp + t) * nkv + h) * D + d;
-  kc[off] = f32_to_e4m3(x);
-  vc[off] = f32_to_e4m3(vv);
+  store_kv<KF>(kc, ks, cp + t, h, nkv, D, d, x);
+  store_kv<VF>(vc, vs, cp + t, h, nkv, D, d, vv);
 }
 
 // ---------------------------------------------------------------- decode
@@ -195,11 +251,12 @@ constexpr int DEC_WARPS = QWEN_ATTN_WARPS;
 constexpr int DEC_THREADS = DEC_WARPS * 32;
 constexpr int DPL = 8;              // head dims per lane: 32 lanes * 8 = 256
 
-template <int QPK>
+template <int QPK, KvFmt KF, KvFmt VF>
 __global__ __launch_bounds__(DEC_THREADS) void k_attn_decode(
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
     const __nv_bfloat16* __restrict__ q,
     const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+    const uint16_t* __restrict__ ks, const uint16_t* __restrict__ vs,
     int ctx_len, int nkv, int D, int nq, float scaling, int splits,
     const int32_t* __restrict__ d_ctx) {
   const int kvh = blockIdx.x, sp = blockIdx.y;
@@ -237,17 +294,9 @@ __global__ __launch_bounds__(DEC_THREADS) void k_attn_decode(
     // measured 308 GB/s of KV bandwidth; at 128K context that is 13.9 ms per
     // token against a 16.5 ms weight budget, i.e. it would have halved decode
     // speed at long context.
-    const uint2 kw = *reinterpret_cast<const uint2*>(kc + (size_t(p) * nkv + kvh) * D + d0);
-    const uint2 vw = *reinterpret_cast<const uint2*>(vc + (size_t(p) * nkv + kvh) * D + d0);
     float kv[DPL], vv[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) {
-      const uint32_t kb = (i < 4) ? kw.x : kw.y;
-      const uint32_t vb = (i < 4) ? vw.x : vw.y;
-      const int sh = (i & 3) * 8;
-      kv[i] = lut[(kb >> sh) & 0xFFu];
-      vv[i] = lut[(vb >> sh) & 0xFFu];
-    }
+    load_kv8<KF>(kv, kc, ks, p, kvh, nkv, D, d0, lut);
+    load_kv8<VF>(vv, vc, vs, p, kvh, nkv, D, d0, lut);
 
     #pragma unroll
     for (int j = 0; j < QPK; ++j) {
@@ -342,10 +391,21 @@ __global__ void k_fill(float* __restrict__ p, float v, int n) {
   if (i < n) p[i] = v;
 }
 
+// Dequantise a KV tile to bf16 for the prefill GEMMs. `n` counts ELEMENTS, so
+// the INT4 path reads n/2 bytes and n/32 scales.
+template <KvFmt F>
 __global__ void k_kv_deq(__nv_bfloat16* __restrict__ dst, const uint8_t* __restrict__ src,
-                         int n) {
+                         const uint16_t* __restrict__ sc, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dst[i] = __float2bfloat16(e4m3_to_f32(src[i]));
+  if (i >= n) return;
+  if (F == KvFmt::FP8) {
+    dst[i] = __float2bfloat16(e4m3_to_f32(src[i]));
+  } else {
+    const uint8_t b = src[i >> 1];
+    const uint32_t nib = (i & 1) ? (b >> 4) : (b & 0xF);
+    const float s1 = __half2float(__ushort_as_half(sc[i >> 5]));
+    dst[i] = __float2bfloat16(s1 * float(kv_i4_decode(nib)));
+  }
 }
 
 // Causal-masked online-softmax update over one KV tile.
@@ -437,7 +497,33 @@ void rope_tables(float* c, float* s, const int32_t* pt, const int32_t* ph,
   k_rope_tables<<<(T * half + 255) / 256, 256, 0, st>>>(c, s, pt, ph, pw, T, half, theta);
 }
 
+// Only three (K, V) combinations are worth instantiating: both FP8 (today),
+// K FP8 with V INT4 (the conservative step -- keys decide where attention goes,
+// values only what it carries), and both INT4.
+#define KV_DECODE(GRID, BLOCK, SH, ST, ...)                                      \
+  do {                                                                            \
+    if (d.k_fmt == KvFmt::FP8 && d.v_fmt == KvFmt::FP8)                            \
+      k_attn_decode<6, KvFmt::FP8, KvFmt::FP8><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__); \
+    else if (d.k_fmt == KvFmt::FP8 && d.v_fmt == KvFmt::INT4)                       \
+      k_attn_decode<6, KvFmt::FP8, KvFmt::INT4><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__); \
+    else if (d.k_fmt == KvFmt::INT4 && d.v_fmt == KvFmt::INT4)                      \
+      k_attn_decode<6, KvFmt::INT4, KvFmt::INT4><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__); \
+    else { fprintf(stderr, "attn: unsupported KV format pair\n"); abort(); }       \
+  } while (0)
+
+#define KV_LAUNCH(KERN, GRID, BLOCK, SH, ST, ...)                                 \
+  do {                                                                            \
+    if (d.k_fmt == KvFmt::FP8 && d.v_fmt == KvFmt::FP8)                            \
+      KERN<KvFmt::FP8, KvFmt::FP8><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__);          \
+    else if (d.k_fmt == KvFmt::FP8 && d.v_fmt == KvFmt::INT4)                       \
+      KERN<KvFmt::FP8, KvFmt::INT4><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__);         \
+    else if (d.k_fmt == KvFmt::INT4 && d.v_fmt == KvFmt::INT4)                      \
+      KERN<KvFmt::INT4, KvFmt::INT4><<<GRID, BLOCK, SH, ST>>>(__VA_ARGS__);        \
+    else { fprintf(stderr, "attn: unsupported KV format pair\n"); abort(); }       \
+  } while (0)
+
 void attn_prepare(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, uint8_t* vc,
+                  uint16_t* ks, uint16_t* vs,
                   const __nv_bfloat16* qkv_in, const __nv_bfloat16* qnw,
                   const __nv_bfloat16* knw, const float* cosv, const float* sinv,
                   int T, int cache_pos, int max_ctx, const AttnDims& d, cudaStream_t st) {
@@ -445,10 +531,10 @@ void attn_prepare(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, uint8_
   k_prepare_q<<<dim3(T, d.num_q_heads), d.head_dim, 0, st>>>(
       q_out, gate, qkv_in, qnw, cosv, sinv, T, d.num_q_heads, d.head_dim,
       d.rotary_dim, d.rms_eps, stride);
-  k_prepare_kv<<<dim3(T, d.num_kv_heads), d.head_dim, 0, st>>>(
-      kc, vc, qkv_in, knw, cosv, sinv, T, d.num_kv_heads, d.head_dim, d.rotary_dim,
-      d.rms_eps, stride, d.q_proj_out(), d.q_proj_out() + d.kv_proj_out(),
-      cache_pos, max_ctx, nullptr);
+  KV_LAUNCH(k_prepare_kv, dim3(T, d.num_kv_heads), d.head_dim, 0, st,
+            kc, vc, ks, vs, qkv_in, knw, cosv, sinv, T, d.num_kv_heads, d.head_dim,
+            d.rotary_dim, d.rms_eps, stride, d.q_proj_out(),
+            d.q_proj_out() + d.kv_proj_out(), cache_pos, max_ctx, nullptr);
 }
 
 int attn_decode_splits(int ctx_len) {
@@ -471,7 +557,8 @@ size_t attn_decode_workspace_bytes(const AttnDims& d, int max_splits) {
 }
 
 void attn_decode(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
-                 const uint8_t* vc, int ctx_len, int max_ctx, const AttnDims& d,
+                 const uint8_t* vc, const uint16_t* ks, const uint16_t* vs,
+                 int ctx_len, int max_ctx, const AttnDims& d,
                  float* ws, int splits, cudaStream_t st) {
   float* po = ws;
   float* pm = ws + size_t(splits) * d.num_q_heads * d.head_dim;
@@ -483,14 +570,21 @@ void attn_decode(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
     int optin = 0;
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
     cudaFuncAttributes fa{};
-    cudaFuncGetAttributes(&fa, k_attn_decode<6>);
-    cudaFuncSetAttribute(k_attn_decode<6>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         optin - int(fa.sharedSizeBytes));
+    // The opt-in ceiling covers static AND dynamic shared memory, and it must be
+    // set for every instantiation that can be launched.
+    cudaFuncGetAttributes(&fa, k_attn_decode<6, KvFmt::FP8, KvFmt::FP8>);
+    const int want = optin - int(fa.sharedSizeBytes);
+    cudaFuncSetAttribute(k_attn_decode<6, KvFmt::FP8, KvFmt::FP8>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+    cudaFuncSetAttribute(k_attn_decode<6, KvFmt::FP8, KvFmt::INT4>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+    cudaFuncSetAttribute(k_attn_decode<6, KvFmt::INT4, KvFmt::INT4>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, want);
     cfg = true;
   }
-  k_attn_decode<6><<<dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st>>>(
-      po, pm, pl, q, kc, vc, ctx_len, d.num_kv_heads, d.head_dim, d.num_q_heads,
-      d.scaling(), splits, nullptr);
+  KV_DECODE(dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st,
+            po, pm, pl, q, kc, vc, ks, vs, ctx_len, d.num_kv_heads, d.head_dim,
+            d.num_q_heads, d.scaling(), splits, nullptr);
   k_decode_combine<<<d.num_q_heads, d.head_dim, 0, st>>>(out, po, pm, pl,
                                                          d.num_q_heads, d.head_dim, splits);
 }
@@ -502,6 +596,7 @@ void rope_tables_dev(float* c, float* s, const int32_t* dpos, int rot, float the
 }
 
 void attn_prepare_dev(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, uint8_t* vc,
+                      uint16_t* ks, uint16_t* vs,
                       const __nv_bfloat16* qkv_in, const __nv_bfloat16* qnw,
                       const __nv_bfloat16* knw, const float* cosv, const float* sinv,
                       const int32_t* dpos, int max_ctx, const AttnDims& d,
@@ -510,23 +605,24 @@ void attn_prepare_dev(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, ui
   k_prepare_q<<<dim3(1, d.num_q_heads), d.head_dim, 0, st>>>(
       q_out, gate, qkv_in, qnw, cosv, sinv, 1, d.num_q_heads, d.head_dim,
       d.rotary_dim, d.rms_eps, stride);
-  k_prepare_kv<<<dim3(1, d.num_kv_heads), d.head_dim, 0, st>>>(
-      kc, vc, qkv_in, knw, cosv, sinv, 1, d.num_kv_heads, d.head_dim, d.rotary_dim,
-      d.rms_eps, stride, d.q_proj_out(), d.q_proj_out() + d.kv_proj_out(),
-      0, max_ctx, dpos);
+  KV_LAUNCH(k_prepare_kv, dim3(1, d.num_kv_heads), d.head_dim, 0, st,
+            kc, vc, ks, vs, qkv_in, knw, cosv, sinv, 1, d.num_kv_heads, d.head_dim,
+            d.rotary_dim, d.rms_eps, stride, d.q_proj_out(),
+            d.q_proj_out() + d.kv_proj_out(), 0, max_ctx, dpos);
 }
 
 void attn_decode_dev(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
-                     const uint8_t* vc, const int32_t* d_ctx, int max_ctx,
+                     const uint8_t* vc, const uint16_t* ks, const uint16_t* vs,
+                     const int32_t* d_ctx, int max_ctx,
                      const AttnDims& d, float* ws, int splits, cudaStream_t st) {
   float* po = ws;
   float* pm = ws + size_t(splits) * d.num_q_heads * d.head_dim;
   float* pl = pm + size_t(splits) * d.num_q_heads;
   const size_t sm = size_t(DEC_WARPS) * d.q_per_kv() * d.head_dim * sizeof(float) +
                     size_t(2 * DEC_WARPS) * d.q_per_kv() * sizeof(float);
-  k_attn_decode<6><<<dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st>>>(
-      po, pm, pl, q, kc, vc, 0, d.num_kv_heads, d.head_dim, d.num_q_heads,
-      d.scaling(), splits, d_ctx);
+  KV_DECODE(dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st,
+            po, pm, pl, q, kc, vc, ks, vs, 0, d.num_kv_heads, d.head_dim,
+            d.num_q_heads, d.scaling(), splits, d_ctx);
   k_decode_combine<<<d.num_q_heads, d.head_dim, 0, st>>>(out, po, pm, pl,
                                                          d.num_q_heads, d.head_dim, splits);
 }
@@ -540,7 +636,7 @@ size_t attn_prefill_scratch_bytes(const AttnDims& d, int kv_tile, int q_tile) {
 }
 
 void attn_prefill(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
-                  const uint8_t* vc, int T, int ctx_len, int q_offset, int max_ctx,
+                  const uint8_t* vc, const uint16_t* ks, const uint16_t* vs, int T, int ctx_len, int q_offset, int max_ctx,
                   const AttnDims& d, __nv_bfloat16* kv_scratch, float* score_scratch,
                   cublasHandle_t cublas, cudaStream_t st) {
   // Attention prefill runs as tiled cuBLAS GEMMs with an online softmax between
@@ -579,11 +675,21 @@ void attn_prefill(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
 
       // dequantize this KV tile once for all heads
       const size_t tile_elems = size_t(kvn) * nkvh * D;
-      k_kv_deq<<<(tile_elems + 255) / 256, 256, 0, st>>>(
-          kv_scratch, kc + size_t(kv0) * nkvh * D, int(tile_elems));
+      const size_t skip = size_t(kv0) * nkvh;   // positions x heads already passed
       __nv_bfloat16* vbuf = kv_scratch + tile_elems;
-      k_kv_deq<<<(tile_elems + 255) / 256, 256, 0, st>>>(
-          vbuf, vc + size_t(kv0) * nkvh * D, int(tile_elems));
+      const int GB = int((tile_elems + 255) / 256);
+      if (d.k_fmt == KvFmt::FP8)
+        k_kv_deq<KvFmt::FP8><<<GB, 256, 0, st>>>(kv_scratch, kc + skip * D, nullptr,
+                                                 int(tile_elems));
+      else
+        k_kv_deq<KvFmt::INT4><<<GB, 256, 0, st>>>(kv_scratch, kc + skip * (D / 2),
+                                                  ks + skip * (D / 32), int(tile_elems));
+      if (d.v_fmt == KvFmt::FP8)
+        k_kv_deq<KvFmt::FP8><<<GB, 256, 0, st>>>(vbuf, vc + skip * D, nullptr,
+                                                 int(tile_elems));
+      else
+        k_kv_deq<KvFmt::INT4><<<GB, 256, 0, st>>>(vbuf, vc + skip * (D / 2),
+                                                  vs + skip * (D / 32), int(tile_elems));
 
       // S[h] = Q[h] (qn x D) @ K[h]^T (D x kvn), one GEMM per query head so the
       // 6:1 GQA sharing costs no extra memory

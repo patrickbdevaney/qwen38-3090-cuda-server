@@ -11,6 +11,7 @@
 #include <cublas_v2.h>
 #include "../config/model_shape.h"
 #include "../kernels/gemv_w4a16.cuh"
+#include "../kernels/attn.cuh"
 #include "../kernels/gemm_w4a16.cuh"
 #include "../kernels/gdn.cuh"
 #include "../kernels/attn.cuh"
@@ -65,8 +66,11 @@ struct Model {
   W8A16Weights   lm_head_q8;               // --lm-head int8
 
   // state
-  uint8_t* k_cache = nullptr;        // [attn_layers][max_ctx][kv_heads][head_dim] e4m3
+  uint8_t* k_cache = nullptr;        // [attn_layers][max_ctx][kv_heads][bytes/head]
   uint8_t* v_cache = nullptr;
+  // Per-32-group fp16 scales, allocated only for a side that is INT4.
+  uint16_t* k_scale = nullptr;       // [attn_layers][max_ctx][kv_heads][head_dim/32]
+  uint16_t* v_scale = nullptr;
   float*   gdn_state = nullptr;      // [gdn_layers][v_heads][dk][dv] fp32
   float*   gdn_conv  = nullptr;      // [gdn_layers][conv_dim][conv_k-1] fp32
   int      max_ctx = 0;
@@ -161,6 +165,12 @@ struct LoadOptions {
   // between 128K and 262K context on a 24 GB card. Held in bf16, so unlike
   // INT8-on-device it costs no accuracy at all.
   bool embed_host = false;
+  // KV cache element format, per side. FP8 e4m3 costs 32 KiB/token across the
+  // 16 attention layers; INT4 with a per-32-group scale costs 18 KiB, which at
+  // 262144 context is 4.5 GiB instead of 8.0. K and V are independent because
+  // they are not equally sensitive: keys decide WHERE attention goes.
+  KvFmt kv_k = KvFmt::FP8;
+  KvFmt kv_v = KvFmt::FP8;
   bool verbose = true;
 };
 

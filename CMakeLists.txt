@@ -183,6 +183,10 @@ target_link_libraries(qwen_cache PUBLIC qwen_model)
 add_executable(probe_chunk tests/probe_chunk.cu)
 target_link_libraries(probe_chunk PRIVATE qwen_model)
 
+add_executable(gate_kvquant tests/gate_kvquant.cu)
+target_link_libraries(gate_kvquant PRIVATE qwen_model qwen_tokenizer)
+add_test(NAME kv_quant COMMAND gate_kvquant ${QWEN38_MODEL_DIR} 8192 24)
+
 add_executable(gate_prefix tests/gate_prefix.cu)
 target_link_libraries(gate_prefix PRIVATE qwen_cache)
 add_test(NAME prefix_cache COMMAND gate_prefix ${QWEN38_MODEL_DIR} 3000 24 24 512)

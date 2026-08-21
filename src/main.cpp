@@ -27,6 +27,12 @@ static void usage(const char* a0) {
 "  --lm-head-bits {16,8,4}  default 8. INT4 measured a KL of 1.8e-2 against\n"
 "                         7.8e-4 for INT8 and is not recommended.\n"
 "  --embed-bits {16,8}    default 8\n"
+"  --kv-cache FMT         KV cache format: fp8 (default), v4 (K fp8, V int4),\n"
+"                         int4 (both). FP8 is 32 KiB/token across the 16\n"
+"                         attention layers; int4 with a per-32-group scale is\n"
+"                         18 KiB, which at 262144 context is 4.5 GiB instead of\n"
+"                         8.0. Keys decide WHERE attention goes and values only\n"
+"                         what it carries, so v4 is the conservative step.\n"
 "  --embed-host           keep embed_tokens in HOST memory and DMA one row per\n"
 "                         token. Reclaims 1.185 GiB of device memory -- 38k\n"
 "                         tokens of FP8 KV -- at no accuracy cost, because the\n"
@@ -79,6 +85,13 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-chunk") opt.max_batch = atoi(next());
     else if (a == "--lm-head-bits") opt.lm_head_bits = atoi(next());
     else if (a == "--embed-bits") opt.quantize_embed = atoi(next()) == 8;
+    else if (a == "--kv-cache") {
+      const std::string v = next();
+      if (v == "fp8")       { opt.kv_k = qwen::KvFmt::FP8;  opt.kv_v = qwen::KvFmt::FP8; }
+      else if (v == "v4")   { opt.kv_k = qwen::KvFmt::FP8;  opt.kv_v = qwen::KvFmt::INT4; }
+      else if (v == "int4") { opt.kv_k = qwen::KvFmt::INT4; opt.kv_v = qwen::KvFmt::INT4; }
+      else { fprintf(stderr, "--kv-cache must be fp8, v4 or int4\n"); return 2; }
+    }
     else if (a == "--embed-host") opt.embed_host = true;
     else if (a == "--webui") cfg.webui_path = next();
     else if (a == "--draft") cfg.draft_dir = next();
