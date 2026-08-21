@@ -1,0 +1,11 @@
+M = 4096
+tensor                                           shape     rel err    TFLOPS     %peak
+layers.0.mlp.gate_proj                   4096x17408x5120    3.08e-03      63.6     77.9%
+layers.0.mlp.down_proj                   4096x5120x17408    2.58e-03      71.3     87.4%
+layers.3.self_attn.q_proj                4096x12288x5120    2.93e-03      70.7     86.7%
+layers.0.linear_attn.out_proj            4096x5120x6144    3.23e-03      73.0     89.5%
+
+gate_gemm
+  mean 69.7 TFLOPS (85% of 81.6 measured peak)
+  projected prefill at 8K: 1432 tok/s   (llama.cpp measured 1318)
+  RESULT: numerics PASS
