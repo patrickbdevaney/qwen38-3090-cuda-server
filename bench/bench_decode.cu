@@ -58,6 +58,15 @@ int main(int argc, char** argv) {
     printf("%8d %12.2f %12.2f %12.1f %9.0f%%\n", ctx, med, p95, 1000.0 / med,
            100.0 * (1000.0 / med) / base);
   }
+  {
+    // G7 is a PEAK number, not a post-load one: CUDA graph instantiation and
+    // cuBLAS workspaces land after the budget print.
+    size_t fb = 0, tb = 0;
+    cudaMemGetInfo(&fb, &tb);
+    printf("\npeak VRAM in use: %.0f MiB of %.0f (%.2f GB)   [G7 bar 22.5 GB at 128K]\n",
+           double(tb - fb) / (1 << 20), double(tb) / (1 << 20),
+           double(tb - fb) / 1e9);
+  }
   printf("\nG1 gate: 45 tok/s min at 4K (revised up from 35; llama.cpp measures 38.41)\n");
   printf("G2 gate: 64K decode >= 85%% of 4K\n");
   return 0;

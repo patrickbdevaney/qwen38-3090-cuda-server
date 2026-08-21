@@ -72,6 +72,15 @@ void dsync(const char* where, int li = -1) {
   g_dbg_last = t;
 }
 
+// dst[r][off .. off+H) = src[r][0 .. H)
+__global__ void k_tap(__nv_bfloat16* __restrict__ dst, const __nv_bfloat16* __restrict__ src,
+                      int T, int H, int dst_stride, int off) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= size_t(T) * H) return;
+  const int r = int(i / H), c = int(i % H);
+  dst[size_t(r) * dst_stride + off + c] = src[size_t(r) * H + c];
+}
+
 void* dalloc(Model& m, size_t bytes) {
   void* p = nullptr;
   CKM(cudaMalloc(&p, bytes));
@@ -155,8 +164,8 @@ __global__ void k_quant_i4(uint32_t* __restrict__ packed, __nv_bfloat16* __restr
   }
 }
 
-void quantize_to_w4a16(Model& m, W4A16Weights& dst, const __nv_bfloat16* src,
-                       int rows, int cols, int group) {
+void quantize_w4a16_raw(W4A16Weights& dst, const __nv_bfloat16* src,
+                        int rows, int cols, int group) {
   const int G = cols / group;
   uint32_t *tp, *tz; __nv_bfloat16* ts;
   CKM(cudaMalloc(&tp, size_t(rows) * cols / 8 * 4));
@@ -166,10 +175,15 @@ void quantize_to_w4a16(Model& m, W4A16Weights& dst, const __nv_bfloat16* src,
   k_quant_i4<<<rows, 128>>>(tp, ts, tz, src, cols, G, group);
   CKM(cudaDeviceSynchronize());
   awq_alloc_fused(dst, rows, cols, group);
-  m.owned.push_back(dst.qweight); m.owned.push_back(dst.scale); m.owned.push_back(dst.zp);
   awq_repack_into(dst, 0, tp, ts, tz, rows);
   CKM(cudaDeviceSynchronize());
   cudaFree(tp); cudaFree(ts); cudaFree(tz);
+}
+
+void quantize_to_w4a16(Model& m, W4A16Weights& dst, const __nv_bfloat16* src,
+                       int rows, int cols, int group) {
+  quantize_w4a16_raw(dst, src, rows, cols, group);
+  m.owned.push_back(dst.qweight); m.owned.push_back(dst.scale); m.owned.push_back(dst.zp);
 }
 
 const char* human(size_t b, char* buf) {
@@ -522,6 +536,14 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
   linear(m, m.h2, L.mlp_down, m.mlp_tmp, T);
   dsync("mlp_down", li);
   residual_add(m.h, m.h2, T * H, m.stream);
+  dsync("mlp_residual", li);
+
+  if (m.tap_enable && m.tap_of[li] >= 0) {
+    const int stride = m.n_taps * H;
+    const size_t n = size_t(T) * H;
+    k_tap<<<(n + 255) / 256, 256, 0, m.stream>>>(m.taps, m.h, T, H, stride,
+                                                 m.tap_of[li] * H);
+  }
 }
 
 void head(Model& m, int T) {
@@ -692,6 +714,49 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
   }
   return out;
 }
+
+// Public entry to the INT4 quantiser, for callers that own their own memory
+// (the drafter). Ownership of dst.{qweight,scale,zp} passes to the caller.
+void quantize_w4a16(W4A16Weights& dst, const __nv_bfloat16* src, int rows, int cols,
+                    int group) {
+  quantize_w4a16_raw(dst, src, rows, cols, group);
+}
+
+void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int T) {
+  const ModelShape& S = m.shape;
+  if (m.lm_head_bits == 4)      gemm_mma_w4a16(out, m.lm_head_q, x, T, m.gemv, m.stream);
+  else if (m.lm_head_bits == 8) gemm_small_w8a16(out, m.lm_head_q8, x, T, m.gemv, m.stream);
+  else {
+    const float one = 1.f, zero = 0.f;
+    cublasSetStream(m.cublas, m.stream);
+    CKM(cudaGetLastError());
+    cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N, S.vocab_size, T, S.hidden_size,
+                 &one, m.lm_head_bf16, CUDA_R_16BF, S.hidden_size, x, CUDA_R_16BF,
+                 S.hidden_size, &zero, out, CUDA_R_16BF, S.vocab_size,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+}
+
+void model_enable_taps(Model& m, const std::vector<int>& layer_ids) {
+  const ModelShape& S = m.shape;
+  m.tap_of.assign(S.num_hidden_layers, -1);
+  for (size_t i = 0; i < layer_ids.size(); ++i) {
+    const int li = layer_ids[i];
+    if (li < 0 || li >= S.num_hidden_layers) {
+      fprintf(stderr, "taps: layer %d out of range\n", li);
+      abort();
+    }
+    m.tap_of[li] = int(i);
+  }
+  m.n_taps = int(layer_ids.size());
+  if (!m.taps) {
+    const size_t bytes = size_t(m.max_batch) * m.n_taps * S.hidden_size * 2;
+    m.taps = static_cast<__nv_bfloat16*>(dalloc(m, bytes));
+  }
+  m.tap_enable = true;
+}
+
+void model_disable_taps(Model& m) { m.tap_enable = false; }
 
 void dbg_profile_report(const char* tag) {
   if (!g_dbg_n) return;

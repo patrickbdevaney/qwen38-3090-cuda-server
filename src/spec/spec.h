@@ -21,8 +21,10 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <deque>
 #include <cuda_bf16.h>
 #include "../model/model.h"
+#include "../draft/dflash.h"
 
 namespace qwen {
 
@@ -106,5 +108,32 @@ struct SpecStats {
 std::vector<int32_t> spec_generate(Model& m, SpecState& s,
                                    const std::vector<int32_t>& prompt,
                                    int max_new, int max_k, SpecStats& stats);
+
+// Stream the target's residual-stream taps into the drafter's context cache.
+// Rows whose absolute position is below `window_floor` are skipped: the drafter
+// masks them out anyway, and on a long prompt they are most of the prefill.
+void spec_push_taps(DraftModel& d, const __nv_bfloat16* taps, int n, int pos0,
+                    int window_floor);
+
+// One speculative round: take the free token from m.logits, draft a block,
+// verify it, and commit the accepted prefix. Appends the committed tokens to
+// `out`, advances `pos`, and returns how many were committed. Callers supply
+// the scratch so a server can hold it for the length of a request.
+//
+//   lg      [block][vocab]      target logits for the verified block
+//   dlg     [block-1][vocab]    target logits over the drafter's hidden rows
+//   hostlg  [block*vocab]       host mirror of lg
+//   nids    [block]             noise ids; slot 0 is overwritten each round
+int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
+               __nv_bfloat16* lg, __nv_bfloat16* dlg,
+               std::vector<uint16_t>& hostlg, std::vector<int32_t>& nids,
+               std::deque<int32_t>& out);
+
+// Greedy generation with the DFlash2 drafter. Same acceptance rule as
+// spec_generate -- lossless by construction -- but the block comes from the
+// drafter instead of a suffix match.
+std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
+                                          const std::vector<int32_t>& prompt,
+                                          int max_new, SpecStats& stats);
 
 }  // namespace qwen

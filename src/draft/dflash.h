@@ -122,7 +122,11 @@ struct DraftModel {
 };
 
 struct DraftLoadOptions {
-  bool quantize = false;     // W4A16 the big matmuls
+  // W4A16 by default. Measured: 1.25 GiB against 3.70, 2.32x end-to-end against
+  // 2.19x, and acceptance UNCHANGED (p1 went 3.94 -> 4.10, inside the noise).
+  // The drafter's weights only affect draft quality; every drafted token is
+  // verified by the target, so this cannot affect output correctness.
+  bool quantize = true;
   int group_size = 128;
   int ctx_chunk = 512;       // most context rows accepted in one push
   bool debug = false;        // allocate the stage taps gate_dflash reads
@@ -155,6 +159,13 @@ void draft_reset(DraftModel& d);
 const __nv_bfloat16* draft_forward(DraftModel& d, const __nv_bfloat16* target_hidden,
                                    int n_ctx, int ctx_pos0, int block_pos0,
                                    bool use_cache);
+
+// The two halves separately, which is what generation needs: prefill streams
+// context in chunk by chunk, then each round pushes only the newly committed
+// positions and runs one block.
+void draft_push(DraftModel& d, const __nv_bfloat16* target_hidden, int n_ctx,
+                int ctx_pos0);
+const __nv_bfloat16* draft_block(DraftModel& d, int block_pos0);
 
 // Candidate selection. `logits` is [block-1, vocab] from the TARGET head over
 // the drafter hidden rows. Fills d.path with block-1 token ids.

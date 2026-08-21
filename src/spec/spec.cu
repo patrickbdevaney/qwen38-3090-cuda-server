@@ -235,4 +235,170 @@ std::vector<int32_t> spec_generate(Model& m, SpecState& s,
   return out;
 }
 
+// ---------------------------------------------------------------- DFlash2
+void spec_push_taps(DraftModel& d, const __nv_bfloat16* taps, int n, int pos0,
+                    int window_floor) {
+  const int stride = d.sh.n_taps * d.sh.hidden;
+  int start = 0;
+  if (pos0 < window_floor) start = std::min(n, window_floor - pos0);
+  for (int i = start; i < n; ) {
+    const int chunk = std::min(d.max_rows, n - i);
+    draft_push(d, taps + size_t(i) * stride, chunk, pos0 + i);
+    i += chunk;
+  }
+}
+
+int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
+               __nv_bfloat16* lg, __nv_bfloat16* dlg,
+               std::vector<uint16_t>& hostlg, std::vector<int32_t>& nids,
+               std::deque<int32_t>& out) {
+  const int V = m.shape.vocab_size;
+  const int BS = d.sh.block_size, NP = BS - 1;
+
+  std::vector<uint16_t> l1(V);
+  CKS(cudaMemcpy(l1.data(), m.logits, size_t(V) * 2, cudaMemcpyDeviceToHost));
+  const int32_t t0 = argmax_host(l1, 0, V);
+  out.push_back(t0);
+  if (m.shape.is_stop_token(t0)) return 1;
+
+  // ---- draft ----
+  nids[0] = t0;
+  CKS(cudaMemcpy(d.ids_buf, nids.data(), size_t(BS) * 4, cudaMemcpyHostToDevice));
+  // The drafter has no embedding table: the noise comes from the TARGET's.
+  if (m.embed_quantized)
+    embed_int8(d.noise, m.embed_q, m.embed_scale, d.ids_buf, BS, m.shape.hidden_size, 0);
+  else
+    embed_bf16(d.noise, m.embed_bf, d.ids_buf, BS, m.shape.hidden_size, 0);
+  const __nv_bfloat16* dh = draft_block(d, pos);
+  model_apply_head(m, dlg, dh + size_t(1) * m.shape.hidden_size, NP);
+  draft_select(d, dh + size_t(1) * m.shape.hidden_size, dlg, NP, t0);
+
+  std::vector<int32_t> drafted(NP);
+  CKS(cudaMemcpy(drafted.data(), d.path, size_t(NP) * 4, cudaMemcpyDeviceToHost));
+
+  // ---- verify ----
+  std::vector<int32_t> block;
+  block.push_back(t0);
+  for (int32_t x : drafted) block.push_back(x);
+
+  spec_begin_block(s, m);
+  model_verify_block(m, block.data(), BS, pos, lg);
+  m.spec = nullptr; s.capturing = false;
+  CKS(cudaMemcpy(hostlg.data(), lg, size_t(BS) * V * 2, cudaMemcpyDeviceToHost));
+
+  std::vector<int32_t> targ(BS);
+  for (int i = 0; i < BS; ++i) targ[i] = argmax_host(hostlg, size_t(i) * V, V);
+
+  int32_t correction = 0;
+  const int a = accept_greedy(drafted, targ, correction);
+  for (int i = 0; i < a; ++i) out.push_back(drafted[i]);
+
+  // The verification forward wrote taps for all BS rows; the committed prefix
+  // is rows 0..a and becomes the drafter's next context.
+  spec_push_taps(d, m.taps, a + 1, pos, 0);
+
+  if (a + 1 < BS) spec_rollback(s, m, a + 1);
+  pos += a + 1;
+  CKS(cudaMemcpy(m.logits, lg + size_t(a) * V, size_t(V) * 2, cudaMemcpyDeviceToDevice));
+  return a + 1;
+}
+
+std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
+                                          const std::vector<int32_t>& prompt,
+                                          int max_new, SpecStats& stats) {
+  const int V = m.shape.vocab_size;
+  const int BS = d.sh.block_size;      // 8: the anchor plus 7 mask slots
+  const int NP = BS - 1;
+  std::vector<int32_t> out;
+
+  model_enable_taps(m, d.sh.target_layer_ids);
+  draft_reset(d);
+
+  __nv_bfloat16 *lg = nullptr, *dlg = nullptr;
+  CKS(cudaMalloc(&lg, size_t(BS) * V * 2));
+  CKS(cudaMalloc(&dlg, size_t(NP) * V * 2));
+  std::vector<uint16_t> host(size_t(BS) * V);
+
+  const int P = int(prompt.size());
+  // Everything before this is outside the drafter's sliding window by the time
+  // the first block runs, so it never contributes.
+  const int window_floor = d.sh.sliding_window > 0
+                               ? std::max(0, P - d.sh.sliding_window + 1) : 0;
+  {
+    int p = 0;
+    while (p < P) {
+      const int n = std::min(m.max_batch, P - p);
+      model_prefill(m, prompt.data() + p, n, p);
+      spec_push_taps(d, m.taps, n, p, window_floor);
+      p += n;
+    }
+  }
+
+  int pos = P;
+  stats.per_position.assign(BS, 0);
+
+  // noise ids: the anchor then BS-1 mask tokens. Only slot 0 ever changes.
+  std::vector<int32_t> nids(BS, d.sh.mask_token_id);
+
+  while (int(out.size()) < max_new) {
+    std::vector<uint16_t> l1(V);
+    CKS(cudaMemcpy(l1.data(), m.logits, size_t(V) * 2, cudaMemcpyDeviceToHost));
+    const int32_t t0 = argmax_host(l1, 0, V);
+    out.push_back(t0);
+    if (m.shape.is_stop_token(t0) || int(out.size()) >= max_new) break;
+
+    // ---- draft ----
+    nids[0] = t0;
+    CKS(cudaMemcpy(d.ids_buf, nids.data(), size_t(BS) * 4, cudaMemcpyHostToDevice));
+    // The drafter has no embedding table: the noise comes from the TARGET's.
+    if (m.embed_quantized)
+      embed_int8(d.noise, m.embed_q, m.embed_scale, d.ids_buf, BS, m.shape.hidden_size, 0);
+    else
+      embed_bf16(d.noise, m.embed_bf, d.ids_buf, BS, m.shape.hidden_size, 0);
+    const __nv_bfloat16* dh = draft_block(d, pos);
+    model_apply_head(m, dlg, dh + size_t(1) * m.shape.hidden_size, NP);
+    draft_select(d, dh + size_t(1) * m.shape.hidden_size, dlg, NP, t0);
+
+    std::vector<int32_t> drafted(NP);
+    CKS(cudaMemcpy(drafted.data(), d.path, size_t(NP) * 4, cudaMemcpyDeviceToHost));
+
+    // ---- verify ----
+    std::vector<int32_t> block;
+    block.push_back(t0);
+    for (int32_t x : drafted) block.push_back(x);
+
+    spec_begin_block(s, m);
+    model_verify_block(m, block.data(), BS, pos, lg);
+    m.spec = nullptr; s.capturing = false;
+    CKS(cudaMemcpy(host.data(), lg, size_t(BS) * V * 2, cudaMemcpyDeviceToHost));
+
+    std::vector<int32_t> targ(BS);
+    for (int i = 0; i < BS; ++i) targ[i] = argmax_host(host, size_t(i) * V, V);
+
+    int32_t correction = 0;
+    const int a = accept_greedy(drafted, targ, correction);
+
+    ++stats.rounds;
+    stats.drafted += NP;
+    stats.accepted += a;
+    stats.committed += a + 1;
+    if (a < int(stats.per_position.size())) stats.per_position[a]++;
+    for (int i = 0; i < a; ++i) out.push_back(drafted[i]);
+
+    // The verification forward wrote taps for all BS rows; the committed prefix
+    // is rows 0..a and becomes the drafter's next context.
+    spec_push_taps(d, m.taps, a + 1, pos, 0);
+
+    if (a + 1 < BS) spec_rollback(s, m, a + 1);
+    pos += a + 1;
+
+    CKS(cudaMemcpy(m.logits, lg + size_t(a) * V, size_t(V) * 2, cudaMemcpyDeviceToDevice));
+    if (m.shape.is_stop_token(correction)) { out.push_back(correction); break; }
+  }
+  cudaFree(lg);
+  cudaFree(dlg);
+  model_disable_taps(m);
+  return out;
+}
+
 }  // namespace qwen

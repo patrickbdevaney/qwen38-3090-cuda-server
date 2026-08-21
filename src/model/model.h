@@ -79,6 +79,13 @@ struct Model {
   float *prefill_scores = nullptr;
   __nv_bfloat16 *kv_deq = nullptr;
   int32_t *pos_buf = nullptr, *id_buf = nullptr, *argmax_scratch = nullptr;
+
+  // DFlash2 taps: [max_batch][n_taps * hidden], already concatenated the way
+  // the drafter's fc consumes it. tap_of[li] is the slot for layer li, or -1.
+  __nv_bfloat16* taps = nullptr;
+  std::vector<int> tap_of;
+  int n_taps = 0;
+  bool tap_enable = false;
   int max_batch = 0;
   int lm_head_bits = 16;   // 16 = bf16, 8 = INT8 g128, 4 = INT4
   // Debug: when set, the residual stream after every layer (plus the embedding
@@ -152,6 +159,23 @@ int  model_graph_bucket(const Model& m, int ctx);
 // Greedy generation; returns the generated ids.
 std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>& prompt,
                                            int max_new, int eos_id);
+
+// Residual-stream taps for the DFlash2 drafter. The drafter's keys and values
+// come from the TARGET's hidden states at a handful of layers, so those layers
+// have to publish h as they go. Layout is [row][tap][hidden], i.e. already
+// concatenated the way fc consumes it.
+void model_enable_taps(Model& m, const std::vector<int>& layer_ids);
+// The target's lm_head applied to arbitrary rows, WITHOUT the target's final
+// norm. The drafter's output is already normalised by its own `norm`, and the
+// reference calls _output_head(target) on it directly.
+void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int T);
+
+// INT4 group quantisation of an arbitrary [rows, cols] bf16 tensor into the
+// 32-row interleaved layout the GEMV and MMA kernels read. The caller owns
+// dst.{qweight,scale,zp}.
+void quantize_w4a16(W4A16Weights& dst, const __nv_bfloat16* src, int rows, int cols,
+                    int group);
+void model_disable_taps(Model& m);
 
 // QWEN_DEBUG_SYNC=2: print and reset the per-stage wall-clock profile.
 void dbg_profile_report(const char* tag);

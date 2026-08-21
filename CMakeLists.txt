@@ -136,26 +136,9 @@ target_link_libraries(bench_decode PRIVATE qwen_model)
 add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
-# ---------------------------------------------------------------- spec
-add_library(qwen_spec STATIC src/spec/spec.cu)
-target_link_libraries(qwen_spec PUBLIC qwen_model)
-
-add_executable(gate_spec tests/gate_spec.cu)
-target_link_libraries(gate_spec PRIVATE qwen_spec)
-add_test(NAME spec_lossless COMMAND gate_spec ${QWEN38_MODEL_DIR} 7 96)
-
-add_executable(bench_block bench/bench_block.cu)
-target_link_libraries(bench_block PRIVATE qwen_model)
-
-add_executable(bench_verify bench/bench_verify.cu)
-target_link_libraries(bench_verify PRIVATE qwen_core qwen_kernels)
-
-add_executable(bench_spec bench/bench_spec.cu)
-target_link_libraries(bench_spec PRIVATE qwen_spec)
-
 # ---------------------------------------------------------------- drafter
 add_library(qwen_draft STATIC src/draft/dflash.cu)
-target_link_libraries(qwen_draft PUBLIC qwen_core qwen_kernels)
+target_link_libraries(qwen_draft PUBLIC qwen_model)
 
 add_executable(gate_dflash tests/gate_dflash.cu)
 target_link_libraries(gate_dflash PRIVATE qwen_draft)
@@ -163,6 +146,26 @@ add_test(NAME dflash COMMAND gate_dflash
          ${QWEN38_DRAFT_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/dflash
          ${QWEN38_BF16_DIR})
+
+# ---------------------------------------------------------------- spec
+add_library(qwen_spec STATIC src/spec/spec.cu)
+target_link_libraries(qwen_spec PUBLIC qwen_model qwen_draft)
+
+add_executable(gate_spec tests/gate_spec.cu)
+target_link_libraries(gate_spec PRIVATE qwen_spec)
+add_test(NAME spec_lossless COMMAND gate_spec ${QWEN38_MODEL_DIR} 7 96 ${QWEN38_DRAFT_DIR})
+
+add_executable(bench_block bench/bench_block.cu)
+target_link_libraries(bench_block PRIVATE qwen_model)
+
+add_executable(bench_verify bench/bench_verify.cu)
+target_link_libraries(bench_verify PRIVATE qwen_core qwen_kernels)
+
+add_executable(bench_dflash bench/bench_dflash.cu)
+target_link_libraries(bench_dflash PRIVATE qwen_spec)
+
+add_executable(bench_spec bench/bench_spec.cu)
+target_link_libraries(bench_spec PRIVATE qwen_spec)
 
 # ---------------------------------------------------------------- server
 add_library(qwen_server STATIC

@@ -4,8 +4,27 @@ Pure CUDA/C++ single-node inference server for **Qwen3.8-27B** (AWQ INT4 W4A16) 
 **DFlash2 block-diffusion drafter**, targeting one specific card: **RTX 3090 (GA102, sm_86,
 24 GB GDDR6X)**. No Python in the serving path. No batching, no vision, single sequence.
 
-**Status: Phase 0 complete. Gate 0 passed. No kernels written yet.** See
-[`reports/PHASE_0.md`](reports/PHASE_0.md).
+**Status: running.** Autoregressive decode, DFlash2 speculative decode, FP8 KV cache, CUDA
+graphs, and an OpenAI-compatible server. Measured on this box, from committed binaries:
+
+| | measured |
+|---|---|
+| autoregressive decode, 4K ctx | **45.8 tok/s** |
+| llama.cpp Q4_K_M, same box, same prompts | 38.41 tok/s |
+| **DFlash2 speculative decode, mean of 3 prompts** | **100.1 tok/s (2.32x AR)** |
+| DFlash2 through the server, greedy request | **133.3 tok/s**, 7.54 accepted per round |
+| mean accepted tokens per block of 8 | 4.10 / 5.79 / 6.83 |
+| decode GEMV, traffic-weighted | 769.8 GB/s = 84.2% of measured DRAM |
+| prefill GEMM | 70.1 TFLOPS = 86% of measured BF16 peak |
+
+Full tables and every invocation: [`reports/BENCHMARKS.md`](reports/BENCHMARKS.md).
+Phase reports: [`PHASE_0`](reports/PHASE_0.md) .. [`PHASE_7`](reports/PHASE_7.md).
+
+Peak VRAM at 128K context is **21.47 GB** of 24, so the full 128K window fits with the model,
+the INT8 head and the INT8 embedding resident.
+
+Known misses, stated as misses: 64K decode is 82% of 4K against an 85% bar, prose speculation
+lands below its 120 tok/s bar, and the prefix cache (G8) was never started.
 
 ---
 
@@ -73,12 +92,17 @@ autoregressive ceiling.**
 |---|---|---|
 | llama.cpp Q4_K_M, autoregressive | **38.41** | 1318 (pp8192) |
 | llama.cpp Q4_K_M + MTP speculation | **51.30** median (82.94 math → 43.96 prose) | — |
-| vLLM W4A16 | not yet measured | — |
-| this project | not yet built | — |
+| vLLM W4A16 | not measured — see below | — |
+| **this project, autoregressive** | **45.8** | 1440 (projected from 70.1 TFLOPS at M=4096) |
+| **this project, DFlash2 speculative** | **100.1 mean, 122.4 best** | — |
 
 llama.cpp reaches **77% of measured DRAM bandwidth** — it is a strong baseline, not a soft one.
-Our expected advantage is mostly the smaller weight footprint (12.435 vs ~17.0 GiB/token), not
-kernel heroics.
+The advantage here is mostly the smaller weight footprint (12.435 vs ~17.0 GiB/token) plus the
+84.2% aggregate the decode GEMV reaches, not kernel heroics.
+
+vLLM was **not** benchmarked. It would have needed a from-source build on CUDA 12.8 to avoid a
+driver upgrade that has previously broken suspend on this desktop. Its absence is stated rather
+than filled in with an estimate.
 
 **llama.cpp cannot run the DFlash2 drafter.** It auto-detects `draft-dflash` but its arch
 definition is DFlash **1**: no two-tap dynamic convolution, no candidate selector, so it creates
@@ -96,16 +120,38 @@ definition is DFlash **1**: no two-tap dynamic convolution, no candidate selecto
 ## Layout
 
 ```
-bench/microbench.cu        Phase 0 hardware probe (DRAM BW, BF16 MMA, cp.async, smem ceiling)
-bench/bench_openai.py      benchmark harness, used identically for every server
-bench/prompt_suite.json    workload basket: math, code x2, prose, toolish
-tools/inspect_model.py     GATE 0 - derives every shape from the checkpoint, asserts the arch
-tools/vram_budget.py       the budget contract src/main.cpp must enforce at startup
-reports/                   PHASE_0, PRIOR_ART, QUANT_CHOICE, BASELINES + raw logs
-src/                       empty until Phase 1; kernels are forbidden before Gate 0 passes
+src/kernels/               gemv_w4a16 (decode + skinny GEMM + tensor-core W4A16), gdn,
+                           attn (FP8 KV, split softmax), elementwise, sampling
+src/model/                 loader, layer stack, CUDA graph capture, VRAM budget
+src/draft/                 DFlash2 block-diffusion drafter and its candidate selector
+src/spec/                  speculative loop, GDN state rollback, acceptance
+src/tokenizer/             BPE, NFC, Unicode tables, chat template
+src/server/                OpenAI-compatible endpoints, SSE, tool calls, reasoning parser
+tests/gate_*               one standalone executable each; `ctest` runs them all
+bench/                     microbench (Phase 0 probe) plus per-kernel and end-to-end benches
+tools/                     Python, ONE-TIME ONLY: reference dumps and checkpoint inspection
+reports/                   PHASE_0..7, BENCHMARKS, PRIOR_ART, QUANT_CHOICE, BASELINES + logs
 ```
 
-## Reproducing Phase 0
+## Building and running
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DQWEN38_MODEL_DIR=/path/to/Qwen3.8-27B-W4A16-AWQ \
+      -DQWEN38_DRAFT_DIR=/path/to/Qwen3.8-27B-DFlash2 \
+      -DQWEN38_BF16_DIR=/path/to/bf16-reference     # gates only
+cmake --build build -j
+ctest --test-dir build            # every gate
+
+./build/cuda_server  --model /path/to/Qwen3.8-27B-W4A16-AWQ --port 8080
+./build/bench_decode /path/to/Qwen3.8-27B-W4A16-AWQ 131072 8 1
+./build/bench_dflash /path/to/Qwen3.8-27B-W4A16-AWQ /path/to/Qwen3.8-27B-DFlash2 192 1
+```
+
+`QWEN_DEBUG_SYNC=1` synchronises after every stage of `run_layer` and aborts at the first
+faulting kernel; `=2` turns the same hooks into a per-stage wall-clock profile.
+
+### Reproducing Phase 0
 
 ```bash
 nvcc -O3 -arch=sm_86 -o bench/microbench bench/microbench.cu && ./bench/microbench
@@ -123,6 +169,14 @@ Model weights and the DFlash2 drafter are **not** in this repo. Fetch them from 
    invocation and a committed log. Projections are prefixed `PROJECTED:`.
 2. Numerics before speed. Every kernel lands with a reference comparison in the same commit.
 3. Phase gates are hard stops with a written report.
-4. Speculative decoding is **lossless**: greedy output with speculation on must be token-for-token
-   identical to speculation off. There is no `tau` in DFlash2 — the official reference has no
-   acceptance threshold of any kind.
+4. Speculative decoding is **lossless in its acceptance rule**: longest-prefix argmax equality
+   plus the target's correction emits exactly what the target would have emitted. There is no
+   `tau` in DFlash2 — the official reference has no acceptance threshold of any kind.
+
+   What batched verification does *not* give you is bit-identical arithmetic. Verifying eight
+   rows runs the tensor-core W4A16 path, the prefill attention kernel and the batched GDN scan;
+   decoding one row runs the GEMV, the split-softmax decode kernel and the single-step scan.
+   Both are valid and they do not agree to the last bit, so a near tie can flip. `gate_spec`
+   measures this rather than asserting it: over 4 prompts x 192 tokens one prompt diverges,
+   under **both** drafters, and at that position the two candidate logits differ by exactly one
+   bf16 ulp. The gate fails hard if a divergence ever has a real logit gap.

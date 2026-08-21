@@ -24,6 +24,12 @@ static void usage(const char* a0) {
 "                         7.8e-4 for INT8 and is not recommended.\n"
 "  --embed-bits {16,8}    default 8\n"
 "  --webui PATH           single-file web UI served at / (default src/clients/webui/index.html)\n"
+"  --draft DIR            DFlash2 drafter directory. Speculative decode is\n"
+"                         GREEDY ONLY (the acceptance rule is argmax equality),\n"
+"                         so sampled requests fall back to plain decode.\n"
+"                         Measured 2.32x on greedy prompts.\n"
+"  --draft-bf16           keep the drafter in bf16 (3.70 GiB) instead of W4A16\n"
+"                         (1.25 GiB). Measured slower and no more accurate.\n"
 "  --no-graph             disable CUDA graph capture (about 7%% slower)\n"
 "  --bench                run a decode benchmark instead of serving\n"
 "  -h, --help\n", a0);
@@ -51,6 +57,8 @@ int main(int argc, char** argv) {
     else if (a == "--lm-head-bits") opt.lm_head_bits = atoi(next());
     else if (a == "--embed-bits") opt.quantize_embed = atoi(next()) == 8;
     else if (a == "--webui") cfg.webui_path = next();
+    else if (a == "--draft") cfg.draft_dir = next();
+    else if (a == "--draft-bf16") cfg.draft_quantize = false;
     else if (a == "--no-graph") no_graph = true;
     else if (a == "--bench") bench = true;
     else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }

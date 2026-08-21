@@ -1,6 +1,7 @@
 #include "dflash.h"
 #include "../loader/safetensors.h"
 #include "../kernels/elementwise.cuh"
+#include "../model/model.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -339,6 +340,30 @@ __nv_bfloat16* upload_fused(DraftModel& d, const SafeTensors& st,
   return p;
 }
 
+// Quantise a bf16 tensor already on the device into W4A16 and release the bf16
+// copy. The drafter is 3.70 GiB in bf16 and 1.19 GiB at INT4, and the drafter's
+// weights only affect draft QUALITY -- every drafted token is verified by the
+// target -- so this trades a little acceptance for 2.5 GiB and a 3x cheaper
+// draft step.
+void quant_release(DraftModel& d, __nv_bfloat16*& src, W4A16Weights& dst,
+                   int rows, int cols, int group) {
+  if (rows % 32 || cols % group) {
+    fprintf(stderr, "dflash quant: %dx%d not compatible with group %d\n", rows, cols, group);
+    abort();
+  }
+  quantize_w4a16(dst, src, rows, cols, group);
+  d.owned.push_back(dst.qweight);
+  d.owned.push_back(dst.scale);
+  d.owned.push_back(dst.zp);
+  d.bytes += dst.total_bytes();
+  // drop the bf16 original from the owned list and free it
+  auto it = std::find(d.owned.begin(), d.owned.end(), static_cast<void*>(src));
+  if (it != d.owned.end()) d.owned.erase(it);
+  d.bytes -= size_t(rows) * cols * 2;
+  cudaFree(src);
+  src = nullptr;
+}
+
 }  // namespace
 
 // y[M, out] = x[M, in] @ W^T, W row-major [out, in].
@@ -453,6 +478,26 @@ void draft_load(DraftModel& d, const std::string& dir, const DraftLoadOptions& o
   }
   st.close();
 
+  if (d.quantized) {
+    const int g = opt.group_size;
+    quant_release(d, d.fc, d.fc_q, s.hidden, s.n_taps * s.hidden, g);
+    for (int i = 0; i < s.n_layers; ++i) {
+      DraftLayer& L = d.layers[i];
+      quant_release(d, L.qkv, L.qkv_q, s.qkv_dim(), s.hidden, g);
+      quant_release(d, L.o, L.o_q, s.hidden, s.q_dim(), g);
+      quant_release(d, L.gate_up, L.gate_up_q, 2 * d.inter, s.hidden, g);
+      quant_release(d, L.down, L.down_q, s.hidden, d.inter, g);
+      quant_release(d, L.attn_kproj, L.attn_kproj_q, s.kproj_out(), s.hidden, g);
+      quant_release(d, L.mlp_kproj, L.mlp_kproj_q, s.kproj_out(), s.hidden, g);
+    }
+    // The GEMV/MMA path needs its own fp32 scratch.
+    gemv_scratch_alloc(d.gemv, s.n_taps * s.hidden, 2 * d.inter, g, 16);
+    d.owned.push_back(d.gemv.xf);
+    d.owned.push_back(d.gemv.xgsum);
+    d.owned.push_back(d.gemv.partial);
+    d.bytes += d.gemv.bytes();
+  }
+
   // scratch
   const int R = std::max(opt.ctx_chunk, s.block_size);
   d.max_rows = R;
@@ -540,35 +585,36 @@ void dyn_conv(DraftModel& d, __nv_bfloat16* out, const __nv_bfloat16* in,
       s.conv_group, s.conv_k, s.conv_groups(), which);
 }
 
-// One decoder layer over the block of T noise rows.
-//
-// The context K/V are projected from the TARGET's residual stream (already
-// fc'd and hidden_norm'd by the caller), NOT from any token the drafter chose.
-// That is the structural difference from an ordinary draft model and the reason
-// the drafter needs no autoregressive inner loop.
-void draft_layer(DraftModel& d, int li, int T, int block_pos0,
-                 const __nv_bfloat16* ctx_norm, int n_ctx, bool use_cache) {
+// The context half of a layer: project K and V from the TARGET's residual
+// stream (already fc'd and hidden_norm'd) into the cache. No queries, no
+// attention -- context rows are never attended FROM, only TO.
+void draft_ctx_layer(DraftModel& d, int li, const __nv_bfloat16* ctx_norm,
+                     int n_ctx, int base) {
+  const DFlashShape& s = d.sh;
+  DraftLayer& L = d.layers[li];
+  const int H = s.hidden, HD = s.head_dim, KV = s.kv_dim(), Q = s.q_dim();
+  const int QKV = s.qkv_dim();
+  __nv_bfloat16* kc = d.k_cache + size_t(li) * d.cache_cap * KV;
+  __nv_bfloat16* vc = d.v_cache + size_t(li) * d.cache_cap * KV;
+
+  dlinear(d, d.proj, L.qkv, L.qkv_q, ctx_norm, QKV, H, n_ctx);
+  slice(d, kc + size_t(base) * KV, d.proj, n_ctx, KV, KV, QKV, Q);
+  slice(d, vc + size_t(base) * KV, d.proj, n_ctx, KV, KV, QKV, Q + KV);
+  k_head_norm<<<dim3(n_ctx, s.n_kv_heads), 128, 128 * sizeof(float), d.stream>>>(
+      kc + size_t(base) * KV, L.k_norm, s.n_kv_heads, HD, s.rms_eps);
+  k_rope_half<<<dim3(n_ctx, s.n_kv_heads), 128, 0, d.stream>>>(
+      kc + size_t(base) * KV, d.cos_tab, d.sin_tab, s.n_kv_heads, HD, HD / 2);
+}
+
+// The block half: T noise rows, bidirectional within the window.
+void draft_block_layer(DraftModel& d, int li, int T, int block_pos0, int nctx) {
   const DFlashShape& s = d.sh;
   DraftLayer& L = d.layers[li];
   const int H = s.hidden, HD = s.head_dim, KV = s.kv_dim(), Q = s.q_dim();
   const int QKV = s.qkv_dim(), half = HD / 2;
   __nv_bfloat16* kc = d.k_cache + size_t(li) * d.cache_cap * KV;
   __nv_bfloat16* vc = d.v_cache + size_t(li) * d.cache_cap * KV;
-  const int base = use_cache ? d.cache_len : 0;
 
-  // ---- context keys and values -----------------------------------------
-  if (n_ctx > 0) {
-    dlinear(d, d.proj, L.qkv, L.qkv_q, ctx_norm, QKV, H, n_ctx);
-    slice(d, kc + size_t(base) * KV, d.proj, n_ctx, KV, KV, QKV, Q);
-    slice(d, vc + size_t(base) * KV, d.proj, n_ctx, KV, KV, QKV, Q + KV);
-    k_head_norm<<<dim3(n_ctx, s.n_kv_heads), 128, 128 * sizeof(float), d.stream>>>(
-        kc + size_t(base) * KV, L.k_norm, s.n_kv_heads, HD, s.rms_eps);
-    k_rope_half<<<dim3(n_ctx, s.n_kv_heads), 128, 0, d.stream>>>(
-        kc + size_t(base) * KV, d.cos_tab, d.sin_tab, s.n_kv_heads, HD, half);
-  }
-  const int nctx_total = base + n_ctx;
-
-  // ---- block: norm, conv prepare, qkv ----------------------------------
   rmsnorm_plain(d, d.h2, d.h, L.input_ln, T, H);
   if (d.debug && li == 0) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_L0_LN], d.h2, size_t(T) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
   dlinear(d, d.dynbuf, L.attn_kproj, L.attn_kproj_q, d.h2, s.kproj_out(), H, T);
@@ -577,32 +623,27 @@ void draft_layer(DraftModel& d, int li, int T, int block_pos0,
   dlinear(d, d.proj, L.qkv, L.qkv_q, d.cbuf, QKV, H, T);
 
   slice(d, d.qbuf, d.proj, T, Q, Q, QKV, 0);
-  slice(d, kc + size_t(nctx_total) * KV, d.proj, T, KV, KV, QKV, Q);
-  slice(d, vc + size_t(nctx_total) * KV, d.proj, T, KV, KV, QKV, Q + KV);
+  slice(d, kc + size_t(nctx) * KV, d.proj, T, KV, KV, QKV, Q);
+  slice(d, vc + size_t(nctx) * KV, d.proj, T, KV, KV, QKV, Q + KV);
 
   k_head_norm<<<dim3(T, s.n_q_heads), 128, 128 * sizeof(float), d.stream>>>(
       d.qbuf, L.q_norm, s.n_q_heads, HD, s.rms_eps);
   k_head_norm<<<dim3(T, s.n_kv_heads), 128, 128 * sizeof(float), d.stream>>>(
-      kc + size_t(nctx_total) * KV, L.k_norm, s.n_kv_heads, HD, s.rms_eps);
+      kc + size_t(nctx) * KV, L.k_norm, s.n_kv_heads, HD, s.rms_eps);
   k_rope_half<<<dim3(T, s.n_q_heads), 128, 0, d.stream>>>(
-      d.qbuf, d.cos_tab + size_t(n_ctx) * half, d.sin_tab + size_t(n_ctx) * half,
-      s.n_q_heads, HD, half);
+      d.qbuf, d.cos_tab, d.sin_tab, s.n_q_heads, HD, half);
   k_rope_half<<<dim3(T, s.n_kv_heads), 128, 0, d.stream>>>(
-      kc + size_t(nctx_total) * KV, d.cos_tab + size_t(n_ctx) * half,
-      d.sin_tab + size_t(n_ctx) * half, s.n_kv_heads, HD, half);
+      kc + size_t(nctx) * KV, d.cos_tab, d.sin_tab, s.n_kv_heads, HD, half);
 
-  const int kv_len = nctx_total + T;
-  const int k_pos0 = block_pos0 - (nctx_total);
   k_attn_draft<<<s.n_q_heads, 32 * T, 0, d.stream>>>(
-      d.attn_out, d.qbuf, kc, vc, T, kv_len, s.n_q_heads, s.n_kv_heads, HD,
-      rsqrtf(float(HD)), s.sliding_window, block_pos0, k_pos0, s.is_causal);
+      d.attn_out, d.qbuf, kc, vc, T, nctx + T, s.n_q_heads, s.n_kv_heads, HD,
+      rsqrtf(float(HD)), s.sliding_window, block_pos0, d.cache_pos0, s.is_causal);
 
   dlinear(d, d.h2, L.o, L.o_q, d.attn_out, H, Q, T);
   if (d.debug && li == 0) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_L0_ATTN], d.h2, size_t(T) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
   dyn_conv(d, d.cbuf, d.h2, d.dynbuf, L.attn_base, T, 1);
   residual_add(d.h, d.cbuf, T * H, d.stream);
 
-  // ---- mlp, with its own conv pair -------------------------------------
   rmsnorm_plain(d, d.h2, d.h, L.post_ln, T, H);
   if (d.debug && li == 0) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_L0_POST_LN], d.h2, size_t(T) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
   dlinear(d, d.dynbuf, L.mlp_kproj, L.mlp_kproj_q, d.h2, s.kproj_out(), H, T);
@@ -615,78 +656,88 @@ void draft_layer(DraftModel& d, int li, int T, int block_pos0,
   if (d.debug && li == 0) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_L0_OUT], d.h, size_t(T) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
 }
 
+void rope_for(DraftModel& d, int pos0, int n) {
+  std::vector<int32_t> pos(n);
+  for (int i = 0; i < n; ++i) pos[i] = pos0 + i;
+  CKD(cudaMemcpyAsync(d.pos_buf, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice,
+                      d.stream));
+  const int half = d.sh.head_dim / 2;
+  const int total = n * half;
+  k_rope_tables<<<(total + 255) / 256, 256, 0, d.stream>>>(
+      d.cos_tab, d.sin_tab, d.pos_buf, n, half, d.sh.rope_theta);
+}
+
 }  // namespace
 
-const __nv_bfloat16* draft_forward(DraftModel& d, const __nv_bfloat16* target_hidden,
-                                   int n_ctx, int ctx_pos0, int block_pos0,
-                                   bool use_cache) {
+void draft_push(DraftModel& d, const __nv_bfloat16* target_hidden, int n_ctx,
+                int ctx_pos0) {
   const DFlashShape& s = d.sh;
-  const int T = s.block_size, H = s.hidden;
+  const int H = s.hidden, T = s.block_size;
+  if (n_ctx <= 0) return;
   if (n_ctx > d.max_rows) {
     fprintf(stderr, "dflash: %d context rows exceeds ctx_chunk %d\n", n_ctx, d.max_rows);
     abort();
   }
-  if (32 * T > 1024) { fprintf(stderr, "dflash: block %d too large\n", T); abort(); }
-  if (block_pos0 != ctx_pos0 + n_ctx) {
-    fprintf(stderr, "dflash: positions must be contiguous (ctx %d + %d != block %d)\n",
-            ctx_pos0, n_ctx, block_pos0);
+  if (d.cache_len == 0 && d.cache_pos0 != ctx_pos0) d.cache_pos0 = ctx_pos0;
+  if (d.cache_pos0 + d.cache_len != ctx_pos0) {
+    fprintf(stderr, "dflash: cache ends at %d but context starts at %d\n",
+            d.cache_pos0 + d.cache_len, ctx_pos0);
     abort();
   }
-
-  if (use_cache) {
-    if (d.cache_len + n_ctx + T > d.cache_cap) {
-      // Keep the last window-1 context slots and drop the rest. At 2*window
-      // capacity this memmove happens once per ~window committed tokens.
-      const int keep = std::min(d.cache_len, std::max(0, s.sliding_window - 1));
-      const int drop = d.cache_len - keep;
-      for (int li = 0; li < s.n_layers; ++li) {
-        __nv_bfloat16* kc = d.k_cache + size_t(li) * d.cache_cap * s.kv_dim();
-        __nv_bfloat16* vc = d.v_cache + size_t(li) * d.cache_cap * s.kv_dim();
-        CKD(cudaMemcpyAsync(kc, kc + size_t(drop) * s.kv_dim(),
-                            size_t(keep) * s.kv_dim() * 2, cudaMemcpyDeviceToDevice, d.stream));
-        CKD(cudaMemcpyAsync(vc, vc + size_t(drop) * s.kv_dim(),
-                            size_t(keep) * s.kv_dim() * 2, cudaMemcpyDeviceToDevice, d.stream));
-      }
-      d.cache_pos0 += drop;
-      d.cache_len = keep;
+  if (d.cache_len + n_ctx + T > d.cache_cap) {
+    // Keep the last window-1 slots and drop the rest. At 2*window capacity this
+    // memmove happens once per ~window committed tokens; anything older than
+    // the window is masked out anyway, so nothing is lost.
+    const int keep = std::min(d.cache_len, std::max(0, s.sliding_window - 1));
+    const int drop = d.cache_len - keep;
+    for (int li = 0; li < s.n_layers; ++li) {
+      __nv_bfloat16* kc = d.k_cache + size_t(li) * d.cache_cap * s.kv_dim();
+      __nv_bfloat16* vc = d.v_cache + size_t(li) * d.cache_cap * s.kv_dim();
+      CKD(cudaMemcpyAsync(kc, kc + size_t(drop) * s.kv_dim(),
+                          size_t(keep) * s.kv_dim() * 2, cudaMemcpyDeviceToDevice, d.stream));
+      CKD(cudaMemcpyAsync(vc, vc + size_t(drop) * s.kv_dim(),
+                          size_t(keep) * s.kv_dim() * 2, cudaMemcpyDeviceToDevice, d.stream));
     }
-    if (d.cache_pos0 + d.cache_len != ctx_pos0) {
-      fprintf(stderr, "dflash: cache ends at %d but context starts at %d\n",
-              d.cache_pos0 + d.cache_len, ctx_pos0);
-      abort();
-    }
-  } else {
-    d.cache_pos0 = ctx_pos0;
-    d.cache_len = 0;
+    d.cache_pos0 += drop;
+    d.cache_len = keep;
   }
 
-  // The reference does hidden_norm(fc(target_hidden)) ONCE, outside the layer
-  // loop; every layer reads the same context tensor.
-  if (n_ctx > 0) {
-    dlinear(d, d.ctx_h, d.fc, d.fc_q, target_hidden, H, s.n_taps * H, n_ctx);
-    rmsnorm_plain(d, d.ctx_h, d.ctx_h, d.hidden_norm, n_ctx, H);
-    if (d.debug) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_CTX_NORM], d.ctx_h, size_t(n_ctx) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
-  }
+  // The reference does hidden_norm(fc(target_hidden)) once; every layer reads
+  // the same context tensor.
+  dlinear(d, d.ctx_h, d.fc, d.fc_q, target_hidden, H, s.n_taps * H, n_ctx);
+  rmsnorm_plain(d, d.ctx_h, d.ctx_h, d.hidden_norm, n_ctx, H);
+  if (d.debug) CKD(cudaMemcpyAsync(d.dbg[DraftModel::DBG_CTX_NORM], d.ctx_h,
+                                   size_t(n_ctx) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
+  rope_for(d, ctx_pos0, n_ctx);
+  for (int li = 0; li < s.n_layers; ++li)
+    draft_ctx_layer(d, li, d.ctx_h, n_ctx, d.cache_len);
+  d.cache_len += n_ctx;
+}
 
-  {
-    std::vector<int32_t> pos(size_t(n_ctx) + T);
-    for (int i = 0; i < n_ctx; ++i) pos[i] = ctx_pos0 + i;
-    for (int i = 0; i < T; ++i) pos[n_ctx + i] = block_pos0 + i;
-    CKD(cudaMemcpyAsync(d.pos_buf, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice,
-                        d.stream));
-    const int half = s.head_dim / 2;
-    const int n = int(pos.size()) * half;
-    k_rope_tables<<<(n + 255) / 256, 256, 0, d.stream>>>(
-        d.cos_tab, d.sin_tab, d.pos_buf, int(pos.size()), half, s.rope_theta);
+const __nv_bfloat16* draft_block(DraftModel& d, int block_pos0) {
+  const DFlashShape& s = d.sh;
+  const int T = s.block_size, H = s.hidden;
+  if (32 * T > 1024) { fprintf(stderr, "dflash: block %d too large\n", T); abort(); }
+  if (d.cache_pos0 + d.cache_len != block_pos0) {
+    fprintf(stderr, "dflash: cache ends at %d but block starts at %d\n",
+            d.cache_pos0 + d.cache_len, block_pos0);
+    abort();
   }
-
+  rope_for(d, block_pos0, T);
   CKD(cudaMemcpyAsync(d.h, d.noise, size_t(T) * H * 2, cudaMemcpyDeviceToDevice, d.stream));
   for (int li = 0; li < s.n_layers; ++li)
-    draft_layer(d, li, T, block_pos0, d.ctx_h, n_ctx, use_cache);
+    draft_block_layer(d, li, T, block_pos0, d.cache_len);
   rmsnorm_plain(d, d.h2, d.h, d.final_norm, T, H);
-
-  if (use_cache) d.cache_len += n_ctx;
   return d.h2;
+}
+
+const __nv_bfloat16* draft_forward(DraftModel& d, const __nv_bfloat16* target_hidden,
+                                   int n_ctx, int ctx_pos0, int block_pos0,
+                                   bool use_cache) {
+  if (!use_cache) draft_reset(d);
+  if (!use_cache) d.cache_pos0 = ctx_pos0;
+  draft_push(d, target_hidden, n_ctx, ctx_pos0);
+  return draft_block(d, block_pos0);
 }
 
 void draft_select(DraftModel& d, const __nv_bfloat16* draft_hidden,

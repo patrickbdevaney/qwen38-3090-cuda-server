@@ -18,11 +18,13 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <deque>
 #include <cuda_runtime.h>
 
 #include "../../third_party/httplib.h"
 #include "../../third_party/json.hpp"
 #include "../model/model.h"
+#include "../spec/spec.h"
 #include "../tokenizer/bpe.h"
 #include "../tokenizer/chat_template.h"
 #include "../kernels/sampling.cuh"
@@ -50,6 +52,8 @@ namespace {
 Model*        g_model = nullptr;
 Tokenizer*    g_tok = nullptr;
 SamplerState  g_sampler;
+DraftModel*   g_draft = nullptr;
+SpecState*    g_spec = nullptr;
 ServerConfig  g_cfg;
 Metrics       g_metrics;
 std::mutex    g_engine;
@@ -96,6 +100,7 @@ struct GenResult {
   std::vector<ToolCall> calls;
   int prompt_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
   double ttft_s = 0, decode_tok_s = 0, prefill_tok_s = 0;
+  int spec_rounds = 0, spec_committed = 0;
   std::string finish_reason = "stop";
 };
 
@@ -113,12 +118,35 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   cudaMemset(m.gdn_state, 0, size_t(m.shape.gdn_state_elems()) * 4);
   cudaMemset(m.gdn_conv, 0, size_t(m.shape.gdn_conv_state_elems()) * 4);
 
+  // Speculation is GREEDY ONLY: the acceptance rule is argmax equality, so it
+  // reproduces greedy decoding and nothing else. A sampled request quietly falls
+  // back to plain decode rather than silently changing its distribution.
+  // Penalties are part of the decision rule, not of the distribution's shape:
+  // they change which token is the argmax. The speculative path takes a raw
+  // argmax over the target's logits, so a request with any penalty active must
+  // NOT be speculated or it would silently produce different text from the same
+  // request with speculation off.
+  const bool greedy = (sp.temperature <= 0.f || sp.top_k == 1) &&
+                      sp.presence_penalty == 0.f && sp.frequency_penalty == 0.f &&
+                      sp.repetition_penalty == 1.0f;
+  const bool use_spec = g_draft && g_spec && greedy;
+  if (use_spec) {
+    model_enable_taps(m, g_draft->sh.target_layer_ids);
+    draft_reset(*g_draft);
+  }
+  // Everything below this is outside the drafter's sliding window by the time
+  // the first block runs, so it never contributes.
+  const int window_floor =
+      use_spec && g_draft->sh.sliding_window > 0
+          ? std::max<int>(0, int(ids.size()) - g_draft->sh.sliding_window + 1) : 0;
+
   // chunked prefill
   int pos = 0;
   const int chunk = m.max_batch;
   while (pos < int(ids.size())) {
     const int n = std::min<int>(chunk, int(ids.size()) - pos);
     model_prefill(m, ids.data() + pos, n, pos);
+    if (use_spec) spec_push_taps(*g_draft, m.taps, n, pos, window_floor);
     pos += n;
   }
   cudaDeviceSynchronize();
@@ -135,10 +163,44 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   std::string all;
   int32_t* d_id = m.argmax_scratch + 512;
   bool first = true;
-  for (int i = 0; i < max_new; ++i) {
-    sample(d_id, m.logits, g_sampler, sp, g_step_counter++);
-    int32_t tok = 0;
-    cudaMemcpy(&tok, d_id, 4, cudaMemcpyDeviceToHost);
+
+  const int BS = use_spec ? g_draft->sh.block_size : 1;
+  const int V = m.shape.vocab_size;
+
+  // Committed-but-not-yet-emitted tokens. A speculative round commits up to BS
+  // of them at once; the emit path below is identical either way, so streaming,
+  // stop strings and the reasoning splitter see exactly the same sequence.
+  std::deque<int32_t> pending;
+  std::vector<int32_t> nids;
+  __nv_bfloat16 *lg = nullptr, *dlg = nullptr;
+  std::vector<uint16_t> hostlg;
+  if (use_spec) {
+    cudaMalloc(&lg, size_t(BS) * V * 2);
+    cudaMalloc(&dlg, size_t(BS - 1) * V * 2);
+    hostlg.resize(size_t(BS) * V);
+    nids.assign(BS, g_draft->sh.mask_token_id);
+  }
+
+  int i = 0;
+  while (i < max_new) {
+    if (pending.empty()) {
+      if (!use_spec) {
+        sample(d_id, m.logits, g_sampler, sp, g_step_counter++);
+        int32_t tok = 0;
+        cudaMemcpy(&tok, d_id, 4, cudaMemcpyDeviceToHost);
+        pending.push_back(tok);
+      } else {
+        int spos = pos;
+        const int committed = spec_round(m, *g_spec, *g_draft, spos, lg, dlg, hostlg,
+                                         nids, pending);
+        pos = spos;
+        r.spec_rounds += 1;
+        r.spec_committed += committed;
+      }
+    }
+    const int32_t tok = pending.front();
+    pending.pop_front();
+
     if (first) {
       r.ttft_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       first = false;
@@ -158,16 +220,24 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     }
 
     bool stopped = false;
-    for (const auto& s : stops)
-      if (!s.empty() && r.content.size() >= s.size() &&
-          r.content.compare(r.content.size() - s.size(), s.size(), s) == 0) {
-        r.content.erase(r.content.size() - s.size());
+    for (const auto& st : stops)
+      if (!st.empty() && r.content.size() >= st.size() &&
+          r.content.compare(r.content.size() - st.size(), st.size(), st) == 0) {
+        r.content.erase(r.content.size() - st.size());
         stopped = true; break;
       }
     if (stopped) { r.finish_reason = "stop"; break; }
-    if (i + 1 == max_new) r.finish_reason = "length";
-    model_decode(m, tok, pos + i);
+    ++i;
+    if (i == max_new) { r.finish_reason = "length"; break; }
+    // The speculative path already advanced the model past every committed
+    // token; only the plain path steps here.
+    if (!use_spec) model_decode(m, tok, pos + i - 1);
   }
+  if (use_spec) {
+    cudaFree(lg); cudaFree(dlg);
+    model_disable_taps(m);
+  }
+
   std::string c, th;
   sp_split.feed("", true, c, th);
   r.content += c; r.reasoning += th;
@@ -191,10 +261,18 @@ json usage_json(const GenResult& r, int cached) {
 // llama.cpp-shaped timings. local-agent-bootstrap's `agent bench` hard-exits
 // without this object, taking `agent code` and `agent status` with it.
 json timings_json(const GenResult& r) {
-  return json{{"prompt_n", r.prompt_tokens},
-              {"prompt_per_second", r.prefill_tok_s},
-              {"predicted_n", r.completion_tokens},
-              {"predicted_per_second", r.decode_tok_s}};
+  json t{{"prompt_n", r.prompt_tokens},
+         {"prompt_per_second", r.prefill_tok_s},
+         {"predicted_n", r.completion_tokens},
+         {"predicted_per_second", r.decode_tok_s}};
+  // Only present when the request actually ran speculatively, so a client can
+  // tell "speculation off" from "speculation on and not accepting".
+  if (r.spec_rounds > 0) {
+    t["draft_n"] = r.spec_committed;
+    t["draft_accepted_per_round"] = double(r.spec_committed) / double(r.spec_rounds);
+    t["draft_rounds"] = r.spec_rounds;
+  }
+  return t;
 }
 
 json tool_calls_json(const std::vector<ToolCall>& calls) {
@@ -213,6 +291,20 @@ json tool_calls_json(const std::vector<ToolCall>& calls) {
 int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
   g_model = &model; g_tok = &tok; g_cfg = cfg;
   sampler_alloc(g_sampler, model.shape.vocab_size);
+
+  static DraftModel draft;
+  static SpecState spec;
+  if (!cfg.draft_dir.empty()) {
+    DraftLoadOptions po;
+    po.quantize = cfg.draft_quantize;
+    po.ctx_chunk = std::max(512, model.max_batch);
+    draft_load(draft, cfg.draft_dir, po);
+    spec_alloc(spec, model, draft.sh.block_size);
+    g_draft = &draft;
+    g_spec = &spec;
+    printf("speculative decode: DFlash2, block %d, greedy requests only\n",
+           draft.sh.block_size);
+  }
 
   httplib::Server srv;
   srv.set_payload_max_length(64ull << 20);
