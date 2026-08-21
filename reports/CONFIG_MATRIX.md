@@ -99,9 +99,16 @@ Recording this in advance so it can be checked rather than rationalised:
 ## The decode-speed axis
 
 Decode is bandwidth bound, so speed follows bytes read per token almost exactly
--- our AWQ measurement (13.06 GiB/token -> 45.8 tok/s) is the calibration. At
-long context the KV is part of that traffic, which is why INT4 KV should make
-262144 decode *faster*, not just smaller.
+-- our AWQ measurement (13.06 GiB/token -> 45.8 tok/s) is the calibration.
+
+**PREDICTED WRONG.** I expected INT4 KV to make 262144 decode faster as well as
+smaller, since it halves KV traffic. Measured: 24.4 -> 24.5 tok/s, i.e.
+unchanged. The decode attention kernel was already running at 444 GB/s against a
+load-only ceiling of 788 GB/s, so it is latency and ALU bound rather than
+bandwidth bound, and the extra dequantisation exactly consumes the bandwidth
+that was freed. **KV quantisation buys memory, not speed** -- which also means
+the attention kernel has ~340 GB/s of headroom still on the table for whoever
+fixes it.
 
 | config | weights+head | KV @ 262144 |
 |---|---|---|
