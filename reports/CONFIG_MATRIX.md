@@ -158,149 +158,87 @@ So: the GGUF stack stays in the tree, complete and verified, as the foundation
 for a future quant that actually pays. Q3_K_XL is not that quant at this kernel
 efficiency, and that is a measurement rather than an opinion.
 
-### Revisited: the kernel was fixable, and 40% of the gap is now closed
+### Revisited: the kernel was fixable, and a correction to how it is measured
 
 The two deficits above were named from a stub experiment, so they were testable
-rather than rhetorical. Both turned out to be real, and the cheap half of each
-has now been taken:
+rather than rhetorical. Both were real, and the cheap half of each has been
+taken. But first, a correction, because the obvious way to score this kernel
+flatters it badly.
 
-| | GB/s | of 914.2 |
-|---|---|---|
-| GGUF fused, as first built | 347.3 | 38.0% |
-| **GGUF fused, today (cold, first run)** | **482.6** | **52.8%** |
-| GGUF fused, today (warm, 5th run) | 524.1 | 57.3% |
-| GGUF fused, dequant stubbed out | 646.0 | 70.7% |
-| AWQ INT4 g128 | 769.8 | 84.2% |
+**The "aggregate" line bench_gguf used to print is not the decode rate.** It
+samples one tensor per quant type and pools them by bytes -- and `output.weight`
+alone is 834 of the ~995 MiB sampled, so the number was very nearly a
+measurement of Q5_K. Q5_K is 8.9% of this model. Weighting each type by the
+bytes it actually occupies in the file gives a completely different picture:
 
-Two changes, both bit-exact against ggml (gate_gguf_gemv, all 13 types, zero
+| type | share of UD-Q3_K_XL bytes |
+|---|---:|
+| IQ4_XS | **37.9%** |
+| IQ3_S | **26.9%** |
+| Q5_K | 8.9% |
+| IQ3_XXS | 6.9% |
+| Q3_K | 6.6% |
+| Q4_K | 4.9% |
+| Q6_K | 2.6% |
+| everything else | 5.3% |
+
+Two thirds of this model is IQ4_XS and IQ3_S. bench_gguf now prints a
+composition-weighted rate alongside the sampled one, and that is the number
+quoted below.
+
+Measured warm on an idle card, baseline = commit 460ff67's `gemv.cu` through
+the identical bench:
+
+| | baseline | now | |
+|---|---:|---:|---:|
+| Q5_K | 408.4 | 620.1 | +52% |
+| Q3_K | 194.3 | 278.1 | +43% |
+| IQ4_XS | 326.5 | 405.1 | +24% |
+| IQ2_S | 229.6 | 267.8 | +17% |
+| IQ3_S | 252.0 | 292.8 | +16% |
+| IQ4_NL (untouched) | 363.6 | 363.2 | -- |
+| sampled aggregate | 372.8 | 534.3 | +43% |
+| **composition-weighted** | **285.8** | **354.8** | **+24%** |
+
+Three changes, all bit-exact against ggml (gate_gguf_gemv, 13 types, zero
 mismatching values):
 
-The two rows for "today" are the same binary: five consecutive runs measure
-482.6 / 493.5 / 516.6 / 517.0 / 524.1 GB/s as the card settles at sustained
-clocks. The 347.3 baseline was a single cold run, so **347 -> 483 is the
-like-for-like comparison**, +39%. Per-type numbers below are cold-run.
+1. **Q3_K scale extraction.** ggml's reference unpacks all sixteen six-bit
+   scales out of a 12-byte field with a four-word shuffle. deq8 runs once per
+   lane per super-block, so all 32 lanes were doing that whole unpack to read
+   one byte of it. Deriving the single scale the lane needs is two byte loads
+   and about six ALU ops.
 
-1. **Q3_K scale extraction: 172 -> 246 GB/s.** ggml's reference unpacks all
-   sixteen six-bit scales out of a 12-byte field with a four-word shuffle. This
-   kernel calls deq8 once per lane per super-block, so all 32 lanes were doing
-   that whole unpack to read one byte of the result. Deriving the single scale
-   the lane needs is two byte loads and about six ALU ops.
+2. **64-bit loads for Q4_K, Q5_K and IQ4_XS.** Each lane owns eight consecutive
+   quantised bytes, fetched as eight 1-byte loads. Those three block formats are
+   144, 176 and 136 bytes -- all multiples of 8 -- with their `qs`/`qh` fields at
+   8-aligned offsets, and the lane offset is always a multiple of 8, so the eight
+   bytes are one aligned 64-bit load with no repack. IQ4_XS is the important one:
+   it is 38% of the file.
 
-2. **Q4_K and Q5_K 64-bit loads: Q5_K 392 -> 570 GB/s cold, 620 warm.** Each lane owns eight
-   consecutive quantised bytes, which were being fetched as eight 1-byte loads.
-   Q4_K and Q5_K blocks are 144 and 176 bytes -- both multiples of 16 -- with
-   their `qs`/`qh` fields at 8-aligned offsets, and the lane offset is always a
-   multiple of 8, so those eight bytes are one aligned 64-bit load with no
-   repack at all. This is the single biggest lever in the file, because
-   `output.weight` is 834 MiB of Q5_K, more than every other tensor in the
-   sweep combined.
+3. **`kmask_iq2xs` is powers of two.** Every i-quant path read `t.kmask[i]` from
+   global memory eight times per deq8 to test a sign bit. Under `#pragma unroll`
+   the index is a constant, so `1u << i` replaces a load with nothing.
 
-The formats that did NOT get this are the ones whose block size is not a
-multiple of 8 -- Q2_K (84 bytes), Q3_K (110), Q6_K (210) -- where consecutive
-blocks land on rotating alignments and a 64-bit load would be illegal. Those
-need a padding repack at load time (Q3_K 110 -> 112 costs 1.8% of the tensor),
-which is the obvious next step and is not done.
+The formats that did NOT get (2) are the ones whose block size is not a multiple
+of 8 -- Q2_K (84), Q3_K (110), Q6_K (210) -- where consecutive blocks land on
+rotating alignments and a 64-bit load would be illegal. Those need a padding
+repack at load time (Q3_K 110 -> 112 costs 1.8% of the tensor), which is not done.
 
-For scale: llama.cpp runs Q3_K_XL at an effective 546 GB/s. At 483 cold we are
-at **88% of llama.cpp**, up from 64%; warm, the aggregate crosses it. Comparing
-a kernel microbenchmark against an end-to-end effective rate is apples to
-oranges in llama.cpp's favour, so treat 88% as the floor and do not claim
-parity until the GGUF path runs end to end -- which it does not yet, because
-model.cu has no GGUF loader. The remaining structural gap to AWQ is the
-row-major block layout (deficit 1), which no amount of per-type arithmetic will
-fix.
+### Honest standing against llama.cpp
+
+llama.cpp decodes UD-Q3_K_XL at 44.63 tok/s on this box. At 13.1 GB of weights
+that is roughly **585 GB/s effective**, so at a composition-weighted 355 we are
+at about **61% of llama.cpp**, up from 49%.
+
+An earlier draft of this section claimed 88%, from the sampled aggregate. That
+was wrong in our favour and is the reason the weighted metric now exists. The
+remaining gap is dominated by the two i-quant types: IQ4_XS at 405 and IQ3_S at
+293 against Q5_K's 620, and their grid/codebook lookups still go to global
+memory rather than shared. That is the next lever, and it is untried.
 
 This does not change the *headroom* conclusion above -- INT4 KV still frees 3.7x
-more than Q3_K_XL would -- but it does change the substitutability one. A GGUF
-path within 11% of llama.cpp is a credible weight option to offer users rather
-than a curiosity, which is what it was at 347.
-
-### Is 347 GB/s the FORMAT or MY KERNEL? Measured: mostly my kernel, and it
-### does not change the conclusion.
-
-Two checks rather than an assumption.
-
-**Speculation amortises the dequantisation, as predicted.** At M rows the weight
-stream is read once and the per-block header work is shared, so an ALU-bound
-kernel should improve with M. On blk.1.ffn_up (Q3_K):
-
-| M | ms | per-token ms |
-|---|---|---|
-| 1 | 0.208 | 0.2079 |
-| 8 | 0.724 | **0.0905** |
-
-2.3x better per token. So yes -- with DFlash2 running blocks of 8, the gap
-narrows substantially.
-
-**llama.cpp's mature K-quant kernels on this box, same file:**
-
-| | size | tok/s | effective GB/s |
-|---|---|---|---|
-| llama.cpp Q4_K_M | 17.67 GiB | 38.41 | 679 |
-| llama.cpp **UD-Q3_K_XL** | 12.23 GiB | **44.63** | 546 |
-| **ours, AWQ INT4 g128** | 13.06 GiB/token | **45.8** | 598 |
-
-So a *mature* Q3_K_XL implementation reaches 44.63 tok/s -- still slightly below
-our AWQ at 45.8, despite reading 1.34 GiB less per token. The 3-bit dequant
-costs llama.cpp 20% of its bandwidth efficiency (679 -> 546), which eats the
-size advantage there too.
-
-My kernel at 347 GB/s is therefore genuinely immature relative to llama.cpp's
-~546, and closing that is a real (if unrewarding) engineering task. But the
-conclusion is unchanged and now rests on someone else's mature kernels rather
-than mine: **Q3_K_XL does not buy decode speed on this card.** It buys 0.95 GiB,
-and INT4 KV already bought 3.58.
-
-### Attempt at llama.cpp parity, and why it failed
-
-The obvious fix for the 46% dequantisation overhead is to give each lane a whole
-32-element sub-block instead of 8 elements, so the block header (and for Q3_K a
-12-byte unpack into sixteen 6-bit scales) is computed once per 32 rather than
-once per 8. Implemented, and it stayed bit-exact on all 13 types.
-
-**It made things 2.6x WORSE: 347 -> 132 GB/s.**
-
-Not register spilling -- ptxas reports 0 bytes spilled. The cause is the
-ACTIVATION reads. In the 8-element layout, one load instruction has the 32 lanes
-touching addresses 16 bytes apart, spanning 512 bytes -- 8 cache lines. With 32
-consecutive elements per lane they are 64 bytes apart, spanning 2048 bytes -- 32
-cache lines, one transaction per lane. Improving the weight access made the `x`
-access four times worse, and `x` is read for every element while a weight byte is
-read once.
-
-The remaining route is per-type vectorised byte loads: our AWQ kernel gets its
-speed partly by loading 4 bytes at a time and shifting out nibbles, instead of
-eight single-byte loads. That is blocked here by alignment -- a Q5_K block is 176
-bytes but its `qs` array starts at byte 46, so a lane's 8 bytes are not 4-byte
-aligned. Fixing it needs a format-preserving repack at load time that pads
-blocks and reorders fields to align the quant arrays, at a few percent size cost.
-
-So llama.cpp parity is reachable but it is a per-type engineering project --
-which is, fairly, what llama.cpp's K-quant kernels ARE. Recorded rather than
-hand-waved: the current kernel is 347 GB/s, the mechanism of the gap is
-understood and measured, and the next step is specified.
-
-## The Ampere constraint that applies to every format
-
-sm_86 has **no hardware for sub-8-bit types**. Every 4-bit format pays a
-software dequantisation, and the binding question is always ops-per-byte, not
-bits-per-weight:
-
-* our AWQ path is ~2.5 ops/weight using the bf16 magic-number trick -- about as
-  cheap as this arithmetic gets, which is why it holds 84.2% of DRAM,
-* K-quants cost more (six-bit sub-block scales, mins, high-bit merges) and
-  llama.cpp lands at 546-679 GB/s,
-* going *lower* in bits raises ops-per-byte, because the same header work is
-  spread over fewer bytes.
-
-That is the mechanism behind every measurement in this file, and it is why
-"smaller quant" has not once translated into "faster decode" on this card.
-
-## Why this matters beyond the numbers
-
-The point of the headroom is **RoPE-extended context**. 262144 is the trained
-maximum; going past it needs YaRN-style extrapolation, and extrapolation quality
-degrades with distance -- so it is only worth attempting from a config that has
-memory to spare AND has been shown not to lose retrieval at the trained length.
-A config that already misses needles at 262144 will not survive being stretched
-to 512K.
+more than Q3_K_XL would. It does mean the GGUF path is no longer embarrassing,
+but "AWQ and GGUF are viable substitutes" is not yet true and should not be
+claimed: the kernel is at 61% of the reference implementation, and `model.cu`
+still has no GGUF loader, so nothing runs end to end.

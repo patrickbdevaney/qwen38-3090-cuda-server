@@ -28,6 +28,8 @@ int main(int argc, char** argv) {
   printf("%-26s %-8s %10s %10s %10s %10s\n", "tensor", "type", "MiB", "ms", "GB/s",
          "%% of 914");
   double tot_bytes = 0, tot_ms = 0;
+  // Per-type rate, so the composition-weighted projection below can use it.
+  std::vector<std::pair<qwen::GgmlType, double>> rate;
   for (const auto& n : want) {
     const qwen::GgufTensor* t = f.find(n);
     if (!t) continue;
@@ -58,6 +60,7 @@ int main(int argc, char** argv) {
            qwen::ggml_type_name(t->type), double(nb) / (1 << 20), ms, gbs,
            100.0 * gbs / 914.2);
     tot_bytes += double(nb); tot_ms += ms;
+    rate.emplace_back(t->type, gbs);
     cudaFree(d_w); cudaFree(d_x); cudaFree(d_y);
   }
   // Does speculation compress the gap? At M rows the weight stream is read ONCE
@@ -97,9 +100,45 @@ int main(int argc, char** argv) {
   }
 
   if (tot_ms > 0)
-    printf("\naggregate %.1f GB/s (%.1f%% of the 914.2 GB/s measured DRAM read)\n",
+    printf("\nsampled aggregate %.1f GB/s (%.1f%% of the 914.2 GB/s measured DRAM read)\n",
            tot_bytes / (tot_ms * 1e-3) / 1e9,
            100.0 * (tot_bytes / (tot_ms * 1e-3) / 1e9) / 914.2);
-  printf("AWQ INT4 g128 reference: 769.8 GB/s aggregate = 84.2%%\n");
+
+  // THE NUMBER THAT PREDICTS DECODE.
+  //
+  // The line above is one tensor per type, and output.weight alone is 834 of
+  // the ~995 MiB sampled -- so it is very nearly a measurement of Q5_K, which
+  // is 9% of this model. Weighting each type by the bytes it actually occupies
+  // in the file gives the rate a decode step would see. On UD-Q3_K_XL that
+  // composition is 38% IQ4_XS and 27% IQ3_S; Q3_K and Q5_K together are 16%.
+  {
+    std::vector<std::pair<qwen::GgmlType, double>> bytes_of;   // type -> bytes
+    double model_bytes = 0;
+    for (const auto& kv : f.all()) {
+      const qwen::GgufTensor& t = kv.second;
+      const int in_f = int(t.row_len());
+      if (in_f % 256) continue;
+      const double nb = double(qwen::gguf_row_bytes(t.type, in_f)) * double(t.rows());
+      bool found = false;
+      for (auto& e : bytes_of) if (e.first == t.type) { e.second += nb; found = true; break; }
+      if (!found) bytes_of.emplace_back(t.type, nb);
+      model_bytes += nb;
+    }
+    double weighted_ms = 0, covered = 0;
+    printf("\n%-10s %10s %8s %10s\n", "type", "MiB", "share", "GB/s");
+    for (auto& e : bytes_of) {
+      double r = 0;
+      for (auto& m : rate) if (m.first == e.first) { r = m.second; break; }
+      printf("%-10s %10.1f %7.1f%% %10s\n", qwen::ggml_type_name(e.first),
+             e.second / (1 << 20), 100.0 * e.second / model_bytes,
+             r > 0 ? "" : "not sampled");
+      if (r > 0) { weighted_ms += e.second / (r * 1e9) * 1e3; covered += e.second; }
+    }
+    if (weighted_ms > 0)
+      printf("\ncomposition-weighted over the %.0f%% of model bytes whose type was "
+             "sampled: %.1f GB/s\n", 100.0 * covered / model_bytes,
+             covered / (weighted_ms * 1e-3) / 1e9);
+  }
+  printf("AWQ INT4 g128 reference: 769.8 GB/s sampled aggregate = 84.2%%\n");
   return 0;
 }

@@ -1,18 +1,18 @@
-# bench_gguf on UD-Q3_K_XL, idle RTX 3090, 3 runs
+# BASELINE (commit 460ff67 gemv.cu), same bench, idle GPU, 3 runs
 tensor                     type            MiB         ms       GB/s  %% of 914
-blk.1.ffn_up.weight        Q3_K           36.5      0.173      220.8      24.2%
-blk.1.ffn_down.weight      IQ3_S          36.5      0.147      259.8      28.4%
-blk.1.ffn_gate.weight      IQ2_S          27.2      0.138      207.1      22.6%
-blk.0.attn_qkv.weight      IQ4_XS         26.6      0.077      361.5      39.5%
-blk.3.attn_q.weight        IQ4_NL         33.8      0.110      320.4      35.1%
-output.weight              Q5_K          833.6      1.492      586.0      64.1%
+blk.1.ffn_up.weight        Q3_K           36.5      0.222      172.4      18.9%
+blk.1.ffn_down.weight      IQ3_S          36.5      0.166      230.2      25.2%
+blk.1.ffn_gate.weight      IQ2_S          27.2      0.122      234.1      25.6%
+blk.0.attn_qkv.weight      IQ4_XS         26.6      0.097      287.1      31.4%
+blk.3.attn_q.weight        IQ4_NL         33.8      0.110      320.9      35.1%
+output.weight              Q5_K          833.6      2.235      391.1      42.8%
 M sweep on blk.1.ffn_up.weight (Q3_K) -- speculation reads the weights once for M rows
      M         ms         GB/s   per-token ms
-     1      0.175        218.5         0.1753
-     2      0.261        146.5         0.1307
-     4      0.465         82.3         0.1164
-     8      0.832         46.0         0.1040
-sampled aggregate 487.6 GB/s (53.3% of the 914.2 GB/s measured DRAM read)
+     1      0.222        172.4         0.2222
+     2      0.292        130.9         0.1462
+     4      0.454         84.3         0.1136
+     8      0.797         48.0         0.0997
+sampled aggregate 353.1 GB/s (38.6% of the 914.2 GB/s measured DRAM read)
 type              MiB    share       GB/s
 F32               2.7     0.0% not sampled
 Q6_K            328.1     2.6% not sampled
@@ -28,23 +28,55 @@ Q2_K             59.1     0.5% not sampled
 IQ2_XS           98.3     0.8% not sampled
 IQ2_XXS          43.8     0.4% not sampled
 IQ4_NL           36.6     0.3%           
-composition-weighted over the 84% of model bytes whose type was sampled: 310.7 GB/s
+composition-weighted over the 84% of model bytes whose type was sampled: 258.3 GB/s
 AWQ INT4 g128 reference: 769.8 GB/s sampled aggregate = 84.2%
 
 tensor                     type            MiB         ms       GB/s  %% of 914
-blk.1.ffn_up.weight        Q3_K           36.5      0.138      278.2      30.4%
-blk.1.ffn_down.weight      IQ3_S          36.5      0.131      292.9      32.0%
-blk.1.ffn_gate.weight      IQ2_S          27.2      0.153      186.4      20.4%
-blk.0.attn_qkv.weight      IQ4_XS         26.6      0.069      405.1      44.3%
+blk.1.ffn_up.weight        Q3_K           36.5      0.197      194.6      21.3%
+blk.1.ffn_down.weight      IQ3_S          36.5      0.170      225.0      24.6%
+blk.1.ffn_gate.weight      IQ2_S          27.2      0.108      264.5      28.9%
+blk.0.attn_qkv.weight      IQ4_XS         26.6      0.085      327.3      35.8%
+blk.3.attn_q.weight        IQ4_NL         33.8      0.097      364.6      39.9%
+output.weight              Q5_K          833.6      2.177      401.5      43.9%
+M sweep on blk.1.ffn_up.weight (Q3_K) -- speculation reads the weights once for M rows
+     M         ms         GB/s   per-token ms
+     1      0.217        176.9         0.2165
+     2      0.285        134.3         0.1425
+     4      0.420         91.3         0.1049
+     8      0.755         50.7         0.0944
+sampled aggregate 367.8 GB/s (40.2% of the 914.2 GB/s measured DRAM read)
+type              MiB    share       GB/s
+F32               2.7     0.0% not sampled
+Q6_K            328.1     2.6% not sampled
+Q5_K           1118.9     8.9%           
+IQ4_XS         4741.4    37.9%           
+Q4_K            613.1     4.9% not sampled
+Q8_0             34.5     0.3% not sampled
+IQ3_S          3364.5    26.9%           
+IQ3_XXS         859.4     6.9% not sampled
+Q3_K            828.2     6.6%           
+IQ2_S           390.8     3.1%           
+Q2_K             59.1     0.5% not sampled
+IQ2_XS           98.3     0.8% not sampled
+IQ2_XXS          43.8     0.4% not sampled
+IQ4_NL           36.6     0.3%           
+composition-weighted over the 84% of model bytes whose type was sampled: 275.4 GB/s
+AWQ INT4 g128 reference: 769.8 GB/s sampled aggregate = 84.2%
+
+tensor                     type            MiB         ms       GB/s  %% of 914
+blk.1.ffn_up.weight        Q3_K           36.5      0.197      194.3      21.3%
+blk.1.ffn_down.weight      IQ3_S          36.5      0.152      252.0      27.6%
+blk.1.ffn_gate.weight      IQ2_S          27.2      0.124      229.6      25.1%
+blk.0.attn_qkv.weight      IQ4_XS         26.6      0.085      326.5      35.7%
 blk.3.attn_q.weight        IQ4_NL         33.8      0.097      363.6      39.8%
-output.weight              Q5_K          833.6      1.447      604.1      66.1%
+output.weight              Q5_K          833.6      2.140      408.4      44.7%
 M sweep on blk.1.ffn_up.weight (Q3_K) -- speculation reads the weights once for M rows
      M         ms         GB/s   per-token ms
-     1      0.174        220.7         0.1735
-     2      0.259        147.9         0.1295
-     4      0.450         85.1         0.1125
-     8      0.704         54.4         0.0880
-sampled aggregate 512.3 GB/s (56.0% of the 914.2 GB/s measured DRAM read)
+     1      0.215        178.3         0.2148
+     2      0.300        127.5         0.1501
+     4      0.426         89.8         0.1066
+     8      0.759         50.4         0.0949
+sampled aggregate 372.8 GB/s (40.8% of the 914.2 GB/s measured DRAM read)
 type              MiB    share       GB/s
 F32               2.7     0.0% not sampled
 Q6_K            328.1     2.6% not sampled
@@ -60,38 +92,6 @@ Q2_K             59.1     0.5% not sampled
 IQ2_XS           98.3     0.8% not sampled
 IQ2_XXS          43.8     0.4% not sampled
 IQ4_NL           36.6     0.3%           
-composition-weighted over the 84% of model bytes whose type was sampled: 346.8 GB/s
-AWQ INT4 g128 reference: 769.8 GB/s sampled aggregate = 84.2%
-
-tensor                     type            MiB         ms       GB/s  %% of 914
-blk.1.ffn_up.weight        Q3_K           36.5      0.138      278.1      30.4%
-blk.1.ffn_down.weight      IQ3_S          36.5      0.131      292.8      32.0%
-blk.1.ffn_gate.weight      IQ2_S          27.2      0.107      267.8      29.3%
-blk.0.attn_qkv.weight      IQ4_XS         26.6      0.069      405.1      44.3%
-blk.3.attn_q.weight        IQ4_NL         33.8      0.097      363.2      39.7%
-output.weight              Q5_K          833.6      1.410      620.1      67.8%
-M sweep on blk.1.ffn_up.weight (Q3_K) -- speculation reads the weights once for M rows
-     M         ms         GB/s   per-token ms
-     1      0.158        241.8         0.1584
-     2      0.236        162.3         0.1180
-     4      0.397         96.4         0.0994
-     8      0.692         55.4         0.0864
-sampled aggregate 534.3 GB/s (58.4% of the 914.2 GB/s measured DRAM read)
-type              MiB    share       GB/s
-F32               2.7     0.0% not sampled
-Q6_K            328.1     2.6% not sampled
-Q5_K           1118.9     8.9%           
-IQ4_XS         4741.4    37.9%           
-Q4_K            613.1     4.9% not sampled
-Q8_0             34.5     0.3% not sampled
-IQ3_S          3364.5    26.9%           
-IQ3_XXS         859.4     6.9% not sampled
-Q3_K            828.2     6.6%           
-IQ2_S           390.8     3.1%           
-Q2_K             59.1     0.5% not sampled
-IQ2_XS           98.3     0.8% not sampled
-IQ2_XXS          43.8     0.4% not sampled
-IQ4_NL           36.6     0.3%           
-composition-weighted over the 84% of model bytes whose type was sampled: 354.8 GB/s
+composition-weighted over the 84% of model bytes whose type was sampled: 285.8 GB/s
 AWQ INT4 g128 reference: 769.8 GB/s sampled aggregate = 84.2%
 

@@ -194,11 +194,17 @@ template <> struct Deq<GgmlType::IQ4_XS> {
     const int ls = ((b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
                    (((b->scales_h >> (2 * ib)) & 3) << 4);
     const float dl = h2f(b->d) * float(ls - 32);
-    const uint8_t* q = b->qs + ib * 16 + (within % 16);
-    const bool hi = within >= 16;
+    // One 64-bit load rather than eight 1-byte loads: an IQ4_XS block is 136
+    // bytes (8 x 17) with qs at offset 8, and `within % 16` is 0 or 8, so the
+    // address is 8-aligned in every block. IQ4_XS is 38% of UD-Q3_K_XL by
+    // bytes -- the largest single share in the file.
+    const uint2 qv = *reinterpret_cast<const uint2*>(b->qs + ib * 16 + (within % 16));
+    const int lsh = (within >= 16) ? 4 : 0;
     #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = dl * float(t.kv4nl[hi ? (q[i] >> 4) : (q[i] & 0xF)]);
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t wq = (i < 4) ? qv.x : qv.y;
+      y[i] = dl * float(t.kv4nl[(wq >> (8 * (i & 3) + lsh)) & 0xF]);
+    }
   }
 };
 
@@ -215,7 +221,7 @@ template <> struct Deq<GgmlType::IQ2_XS> {
     const uint8_t sg = t.ksigns[qi >> 9];
     #pragma unroll
     for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & t.kmask[i]) ? -1.f : 1.f);
+      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
   }
 };
 
@@ -234,7 +240,7 @@ template <> struct Deq<GgmlType::IQ2_XXS> {
     const uint8_t sg = t.ksigns[(a1 >> (7 * l)) & 127];
     #pragma unroll
     for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & t.kmask[i]) ? -1.f : 1.f);
+      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
   }
 };
 
@@ -251,7 +257,7 @@ template <> struct Deq<GgmlType::IQ2_S> {
     const uint8_t sg = b->qs[32 + 4 * ib32 + l];
     #pragma unroll
     for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & t.kmask[i]) ? -1.f : 1.f);
+      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
   }
 };
 
@@ -269,8 +275,8 @@ template <> struct Deq<GgmlType::IQ3_XXS> {
     const uint8_t* p2 = reinterpret_cast<const uint8_t*>(&g2);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      y[i]     = db * float(p1[i]) * ((sg & t.kmask[i])     ? -1.f : 1.f);
-      y[i + 4] = db * float(p2[i]) * ((sg & t.kmask[i + 4]) ? -1.f : 1.f);
+      y[i]     = db * float(p1[i]) * ((sg & (1u << i))     ? -1.f : 1.f);
+      y[i + 4] = db * float(p2[i]) * ((sg & (1u << (i + 4))) ? -1.f : 1.f);
     }
   }
 };
@@ -292,8 +298,8 @@ template <> struct Deq<GgmlType::IQ3_S> {
     const uint8_t sg = b->signs[4 * s + l];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      y[i]     = db * float(p1[i]) * ((sg & t.kmask[i])     ? -1.f : 1.f);
-      y[i + 4] = db * float(p2[i]) * ((sg & t.kmask[i + 4]) ? -1.f : 1.f);
+      y[i]     = db * float(p1[i]) * ((sg & (1u << i))     ? -1.f : 1.f);
+      y[i + 4] = db * float(p2[i]) * ((sg & (1u << (i + 4))) ? -1.f : 1.f);
     }
   }
 };

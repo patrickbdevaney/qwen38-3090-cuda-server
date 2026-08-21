@@ -77,22 +77,57 @@ The standing condition on EXL3 was: *if exllama remains accurate and fastest,
 build a kernel server for it too*. All three tests are now in, and it fails all
 three:
 
-| | EXL3 3.00bpw | ours |
-|---|---|---|
-| decode @ 262144 | 22.59 tok/s | **24.5** |
-| peak VRAM @ 262144 | 19910 MiB | **19749 MiB** |
-| KL vs BF16 | 1.672e-01 | **1.495e-01** |
+| | EXL3 3.00bpw | EXL3 3.50bpw | ours |
+|---|---|---|---|
+| decode @ 262144 | 22.59 tok/s | 21.99 | **24.5** |
+| peak VRAM @ 262144 | 19910 MiB | 21481 MiB | **19749 MiB** |
+| KL vs BF16 | 1.672e-01 | **1.308e-01** | 1.495e-01 |
 
-So no EXL3 backend. That is a decision made on measurements, and the harness
-that produced them is committed, so it can be rerun against any future format.
+At 3.00bpw it loses on all three. At 3.50bpw it wins on accuracy and loses on
+both speed and VRAM. Neither configuration is the "accurate *and* fastest" the
+condition asked for, so **no EXL3 backend** — but the accuracy result is real
+and is recorded rather than buried. The harness is committed, so this can be
+rerun against any future format or a 3.25bpw split-the-difference build.
 
-**In fairness to the format**: EXL3 3.00bpw carries 25% fewer bits per weight
-than AWQ INT4 and lands within 12% on mean KL. Per bit, the trellis quantiser is
-clearly the better one. It loses here on deployment terms, not on quantiser
-quality — at the VRAM this box has, the extra bits are free and the format that
-uses them wins. The apples-to-apples test is EXL3 **3.50bpw**, whose 14.29 GiB
-matches our 14.25 GiB of body plus heads almost exactly; that comparison is
-queued and not yet run.
+## The fair fight: EXL3 3.50bpw, at matched VRAM
+
+3.00bpw is not an apples-to-apples comparison — it carries 25% fewer bits per
+weight than AWQ INT4, so of course it is less accurate. The matched test is
+**EXL3 3.50bpw at 14.285 GiB**, against our 14.25 GiB of body plus heads: the
+same weight budget, spent by a different quantiser. Run rather than argued:
+
+| | KL mean | KL median | KL p99 | top-1 | top-5 |
+|---|---:|---:|---:|---:|---:|
+| ours, AWQ INT4 + INT8 head | 1.495e-01 | 5.21e-05 | 4.263 | **98.56%** | 99.39% |
+| **EXL3 3.50bpw** | **1.308e-01** | **4.86e-05** | **3.493** | 98.51% | **99.43%** |
+
+**At equal VRAM the trellis quantiser is more accurate**, and by the margin that
+matters most: the p99 tail is 3.49 against 4.263, 18% lower. Top-1 is a tie.
+This is a real result and it goes against us; some of the gap is the 8-bit
+lm_head and FP8 KV that our column carries and EXL3's does not, but not all of
+it, and the honest reading is that EXL3 3.50bpw is the better-quantised model.
+
+Speed and footprint go the other way, and the gap widens with context:
+
+| ctx | ours | EXL3 3.50bpw + 4-bit KV | ours |
+|---:|---:|---:|---:|
+| 4096 | **45.5** tok/s | 44.62 | +2.0% |
+| 16384 | **42.8** | 42.54 | +0.6% |
+| 32768 | **40.2** | 38.94 | +3.2% |
+| 65536 | **37.2** | 35.12 | +5.9% |
+| 131072 | **31.8** | 29.63 | +7.3% |
+| 262144 | **24.5** | 21.99 | **+11.4%** |
+| peak VRAM @ 262144 | **19749 MiB** | 21481 MiB | 1.7 GiB lighter |
+
+So the matched comparison is a genuine trade rather than a sweep: **EXL3 3.50bpw
+buys about 13% lower mean KL and an 18% lower tail, and costs 11% of decode
+throughput at 262K plus 1.7 GiB of VRAM.**
+
+For this server's purpose that trade is the wrong way round. An agentic coding
+harness lives at long context, where the 11% is compounding and the accuracy
+difference is a tail effect on a distribution whose median is already 5e-05. But
+it is a defensible preference in the other direction, and it is the reason the
+harness that produced these numbers is committed rather than thrown away.
 
 ## Not covered
 

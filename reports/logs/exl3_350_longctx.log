@@ -1,0 +1,8 @@
+# EXL3 3.50bpw + 4-bit KV at long context, idle RTX 3090
+# python tools/exl3_decode_q.py ~/qwen38-weights/exl3-3.50bpw 65536,131072,262144 64
+resident after load+cache: 19.67 GiB of 23.57  (cache sized for 262720 tokens)
+     ctx     decode tok/s    tokens
+   65536           35.12        63
+  131072           29.63        63
+  262144           21.99        63
+peak VRAM in use: 21481 MiB of 24133
