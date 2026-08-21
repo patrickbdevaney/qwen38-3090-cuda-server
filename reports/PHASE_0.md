@@ -236,15 +236,18 @@ deepseek ever actually ran llama.cpp or vLLM; both closed their head-to-head gat
 published vendor numbers. **This is therefore new work.**
 
 State at the time of writing:
-- **llama.cpp**: cloned, building with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`. 62% done.
-- **GGUFs**: `ggml-org/Qwen3.8-27B-GGUF` Q4_K_M (18.97 GB) + `mtp-...-Q8_0` (3.16 GB) +
-  `z-lab/Qwen3.8-27B-DFlash2-GGUF` Q8_0 (2.06 GB) downloading. The MTP and DFlash2 GGUFs let us
-  measure llama.cpp **with and without speculation**, which the directive requires.
-- **vLLM**: 0.27.1 installing into an isolated venv. Whether it supports `qwen3_5` +
-  the `--speculative-config` DFlash2 path on this version is unverified and is a real risk.
-- **transformers 5.15.1 + compressed-tensors**: installing, for the P1 reference oracle.
+- **llama.cpp**: **measured.** 38.41 tok/s AR, 51.30 tok/s with MTP speculation, 1318 tok/s
+  prefill at 8K. It **cannot** run DFlash2 — its DFLASH arch is DFlash 1. Full numbers and the
+  tensor-level diagnosis in `reports/BASELINES.md`.
+- **GGUFs**: downloaded — Q4_K_M (18.97 GB), `mtp-...-Q8_0` (3.16 GB), DFlash2 BF16 and Q8_0.
+- **vLLM**: **blocked.** It *does* support `Qwen3_5ForConditionalGeneration`, `Qwen3_5MTP` and
+  `DFlashDraftModel` — but every release that does pins torch >= 2.11, whose wheels are CUDA 13,
+  and CUDA 13 needs driver >= 580. This box has 570.133.07 on an EOL Ubuntu 24.10 with no 580
+  package. See `reports/BASELINES.md` §2 for the three options; this needs an operator decision.
+- **transformers 5.15.1 + compressed-tensors 0.18.0**: installed and verified — parses the
+  config as `Qwen3_5Config`. Ready for the P1 reference oracle and the quant bake-off.
 
-`reports/BASELINES.md` is a stub with the protocol fixed (3 warmup, 10 measured, median + p95,
+`reports/BASELINES.md` has the llama.cpp numbers and the protocol fixed (3 warmup, 10 measured, median + p95,
 identical prompts and sampling params) and the numbers left empty. **No baseline number will be
 quoted anywhere until it comes from a committed log.**
 
@@ -287,7 +290,8 @@ quoted anywhere until it comes from a committed log.**
 | `reports/PRIOR_ART.md` | done |
 | `reports/PHASE_0.md` | this file |
 | `reports/QUANT_CHOICE.md` | **open** — bake-off not yet run |
-| `reports/BASELINES.md` | **open** — toolchains building |
+| `bench/bench_openai.py` + `bench/prompt_suite.json` | done |
+| `reports/BASELINES.md` | llama.cpp **measured**; vLLM **blocked on driver** |
 
 ---
 

@@ -86,17 +86,43 @@ So llama.cpp's best available speculative configuration on this box is the MTP h
 
 ---
 
-## 2. vLLM — NOT YET MEASURED
+## 2. vLLM — BLOCKED on the NVIDIA driver, not yet measured
 
-vLLM 0.27.1 installing into an isolated venv. Open questions, both real risks:
-- does this version support `model_type: qwen3_5` (the `Qwen3_5ForConditionalGeneration` hybrid)?
-- does its `--speculative-config` expose a DFlash2 method, or only MTP / ngram / EAGLE?
+**vLLM cannot run on this box as configured.** The constraint is exact and was verified, not
+guessed:
 
-Will be run against `philbert440/Qwen3.8-27B-W4A16-AWQ` (the compressed-tensors W4A16 checkpoint),
-with and without speculation, on the identical prompt suite. **No number will appear here until
-it comes from a committed log.**
+1. Support for this model (`Qwen3_5ForConditionalGeneration`) is present in vLLM 0.27.1, along
+   with `Qwen3_5MTP` and — notably — **`DFlashDraftModel`**. So vLLM *can* be a
+   with-and-without-DFlash2 baseline, which llama.cpp cannot (§1.4).
+2. Every vLLM release recent enough to have that support pins `torch==2.11.0` or newer, and the
+   PyPI wheels for those are built for **CUDA 13**:
+   ```
+   ImportError: libcudart.so.13: cannot open shared object file: No such file or directory
+   ```
+   Reproduced on both 0.27.1 and 0.26.0. Forcing `torch==2.11.0+cu128` fixes torch itself
+   (`torch 2.11.0+cu128 cuda 12.8 avail True, dev NVIDIA GeForce RTX 3090`) but not vLLM's own
+   compiled extension `vllm._C_stable_libtorch`, which is the wheel's CUDA-13 half.
+3. **CUDA 13 requires NVIDIA driver >= 580.** This box has **570.133.07** (CUDA 12.8).
+   GeForce parts have no CUDA forward-compatibility package, so there is no way around it.
+4. There is no CUDA-12 vLLM wheel index (`wheels.vllm.ai/cu128` → 404).
+5. Older vLLM releases that would run on CUDA 12 (0.16.0, torch 2.9.1) predate this model
+   architecture entirely.
 
----
+The host is **Ubuntu 24.10, which is EOL**, and its archive has no `nvidia-driver-580`
+(`apt-cache policy` shows 570.133.07 as both Installed and Candidate). Getting to 580 means the
+graphics-drivers PPA or NVIDIA's `.run` installer on an out-of-support release, on a machine
+reached over RustDesk — i.e. a real risk of losing the display and remote access.
+
+**This is a decision for the operator, not something to do unilaterally.** Three options:
+
+| option | cost | risk |
+|---|---|---|
+| (a) upgrade driver to 580+ | reboot | display/RustDesk loss on an EOL distro |
+| (b) build vLLM from source against CUDA 12.8 | ~1 h build, plus a CUDA 12.8 toolkit (local is 12.1) | moderate; no system change |
+| (c) defer vLLM to Phase 9 | none now | ship with only the llama.cpp comparison until then |
+
+Until one is chosen, **llama.cpp is the measured baseline and vLLM is an open item.** No vLLM
+number will be quoted anywhere, including as an estimate.
 
 ## 3. What this does to the gate targets
 
