@@ -1,0 +1,7 @@
+decode: KV read per token = 16 layers x 4 kvh x 256 x 2 = 32 KiB/token of ctx
+ctx    4096  layer   0.056 ms  x16 =    0.90 ms/token   KV BW  149.4 GB/s  splits 16
+ctx   32768  layer   0.206 ms  x16 =    3.30 ms/token   KV BW  325.8 GB/s  splits 128
+ctx   65536  layer   0.328 ms  x16 =    5.24 ms/token   KV BW  409.6 GB/s  splits 164
+ctx  131072  layer   0.649 ms  x16 =   10.39 ms/token   KV BW  413.5 GB/s  splits 164
+
+budget: weights 16.5 ms + GDN 0.76 ms per token (measured)

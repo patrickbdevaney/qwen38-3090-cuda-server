@@ -1,0 +1,83 @@
+case         stage              max|diff|         rel  verdict
+T128         fp8 agreement     exact 96.62% / 100.00% (K/V bytes)
+T128         rope cos           0.000e+00    0.00e+00       ok
+T128         rope sin           0.000e+00    0.00e+00       ok
+T128         q norm+rope        3.125e-02    4.83e-03       ok
+T128         gate split         0.000e+00    0.00e+00       ok
+T128         K fp8 cache        5.000e-01    9.09e-02       ok
+T128         V fp8 cache        0.000e+00    0.00e+00       ok
+T128         prefill attn       0.000e+00    0.00e+00       ok
+T128         decode attn        3.662e-04    9.43e-03       ok
+T128         output gate        1.221e-04    4.69e-03       ok
+T1_pos0      fp8 agreement     exact 94.73% / 100.00% (K/V bytes)
+T1_pos0      rope cos           0.000e+00    0.00e+00       ok
+T1_pos0      rope sin           0.000e+00    0.00e+00       ok
+T1_pos0      q norm+rope        0.000e+00    0.00e+00       ok
+T1_pos0      gate split         0.000e+00    0.00e+00       ok
+T1_pos0      K fp8 cache        2.500e-01    5.56e-02       ok
+T1_pos0      V fp8 cache        0.000e+00    0.00e+00       ok
+T1_pos0      prefill attn       0.000e+00    0.00e+00       ok
+T1_pos0      decode attn        0.000e+00    0.00e+00       ok
+T1_pos0      output gate        1.221e-04    5.13e-03       ok
+T1_pos1      fp8 agreement     exact 96.88% / 100.00% (K/V bytes)
+T1_pos1      rope cos           0.000e+00    0.00e+00       ok
+T1_pos1      rope sin           0.000e+00    0.00e+00       ok
+T1_pos1      q norm+rope        1.562e-02    3.45e-03       ok
+T1_pos1      gate split         0.000e+00    0.00e+00       ok
+T1_pos1      K fp8 cache        2.500e-01    6.25e-02       ok
+T1_pos1      V fp8 cache        0.000e+00    0.00e+00       ok
+T1_pos1      prefill attn       0.000e+00    0.00e+00       ok
+T1_pos1      decode attn        0.000e+00    0.00e+00       ok
+T1_pos1      output gate        1.221e-04    5.15e-03       ok
+T8           fp8 agreement     exact 96.52% / 100.00% (K/V bytes)
+T8           rope cos           0.000e+00    0.00e+00       ok
+T8           rope sin           0.000e+00    0.00e+00       ok
+T8           q norm+rope        1.562e-02    2.87e-03       ok
+T8           gate split         0.000e+00    0.00e+00       ok
+T8           K fp8 cache        2.500e-01    5.00e-02       ok
+T8           V fp8 cache        0.000e+00    0.00e+00       ok
+T8           prefill attn       0.000e+00    0.00e+00       ok
+T8           decode attn        8.545e-04    2.43e-02       ok
+T8           output gate        1.221e-04    5.13e-03       ok
+far_131071   fp8 agreement     exact 96.29% / 100.00% (K/V bytes)
+far_131071   rope cos           3.922e-03    3.92e-03       ok
+far_131071   rope sin           3.906e-03    3.91e-03       ok
+far_131071   q norm+rope        1.562e-02    3.21e-03       ok
+far_131071   gate split         0.000e+00    0.00e+00       ok
+far_131071   K fp8 cache        2.500e-01    6.25e-02       ok
+far_131071   V fp8 cache        0.000e+00    0.00e+00       ok
+far_131071   prefill attn       0.000e+00    0.00e+00       ok
+far_131071   decode attn        0.000e+00    0.00e+00       ok
+far_131071   output gate        1.221e-04    4.76e-03       ok
+far_32767    fp8 agreement     exact 97.46% / 100.00% (K/V bytes)
+far_32767    rope cos           1.953e-03    1.95e-03       ok
+far_32767    rope sin           0.000e+00    0.00e+00       ok
+far_32767    q norm+rope        1.562e-02    3.25e-03       ok
+far_32767    gate split         0.000e+00    0.00e+00       ok
+far_32767    K fp8 cache        2.500e-01    5.56e-02       ok
+far_32767    V fp8 cache        0.000e+00    0.00e+00       ok
+far_32767    prefill attn       0.000e+00    0.00e+00       ok
+far_32767    decode attn        0.000e+00    0.00e+00       ok
+far_32767    output gate        1.221e-04    4.39e-03       ok
+far_4095     fp8 agreement     exact 96.00% / 100.00% (K/V bytes)
+far_4095     rope cos           0.000e+00    0.00e+00       ok
+far_4095     rope sin           1.221e-04    1.23e-04       ok
+far_4095     q norm+rope        1.562e-02    3.47e-03       ok
+far_4095     gate split         0.000e+00    0.00e+00       ok
+far_4095     K fp8 cache        2.500e-01    5.00e-02       ok
+far_4095     V fp8 cache        0.000e+00    0.00e+00       ok
+far_4095     prefill attn       0.000e+00    0.00e+00       ok
+far_4095     decode attn        0.000e+00    0.00e+00       ok
+far_4095     output gate        1.221e-04    5.15e-03       ok
+span_far     fp8 agreement     exact 96.33% / 100.00% (K/V bytes)
+span_far     rope cos           3.906e-03    3.91e-03       ok
+span_far     rope sin           0.000e+00    0.00e+00       ok
+span_far     q norm+rope        3.125e-02    5.99e-03       ok
+span_far     gate split         0.000e+00    0.00e+00       ok
+span_far     K fp8 cache        2.500e-01    5.00e-02       ok
+span_far     V fp8 cache        0.000e+00    0.00e+00       ok
+span_far     prefill attn       0.000e+00    0.00e+00       ok
+span_far     decode attn        6.714e-04    1.50e-02       ok
+span_far     output gate        1.221e-04    4.22e-03       ok
+
+gate_attn: 0 failures -> PASS

@@ -72,7 +72,7 @@ add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/dequant)
 
 add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu
-                                src/kernels/gdn.cu)
+                                src/kernels/gdn.cu src/kernels/attn.cu)
 target_include_directories(qwen_kernels PUBLIC src third_party)
 target_link_libraries(qwen_kernels PUBLIC CUDA::cublas)
 set_target_properties(qwen_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -92,6 +92,14 @@ add_test(NAME gdn COMMAND gate_gdn ${CMAKE_SOURCE_DIR}/tests/fixtures/gdn
 
 add_executable(bench_gdn bench/bench_gdn.cu)
 target_link_libraries(bench_gdn PRIVATE qwen_kernels)
+
+add_executable(gate_attn tests/gate_attn.cu)
+target_link_libraries(gate_attn PRIVATE qwen_core qwen_kernels)
+add_test(NAME attn COMMAND gate_attn ${CMAKE_SOURCE_DIR}/tests/fixtures/attn
+         $ENV{QWEN38_BF16_DIR})
+
+add_executable(bench_attn bench/bench_attn.cu)
+target_link_libraries(bench_attn PRIVATE qwen_kernels)
 
 add_executable(bench_decode_gemv bench/bench_decode_gemv.cu)
 target_link_libraries(bench_decode_gemv PRIVATE qwen_core qwen_kernels)
