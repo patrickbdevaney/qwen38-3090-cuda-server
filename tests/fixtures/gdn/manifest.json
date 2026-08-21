@@ -1,0 +1,50 @@
+{
+  "hidden": 5120,
+  "num_v_heads": 48,
+  "num_k_heads": 16,
+  "head_k": 128,
+  "head_v": 128,
+  "conv_k": 4,
+  "rms_eps": 1e-06,
+  "key_dim": 2048,
+  "val_dim": 6144,
+  "conv_dim": 10240,
+  "layer": 0,
+  "cases": {
+    "T1_fresh": {
+      "T": 1,
+      "seeded_state": false,
+      "core_absmax": 4.100799560546875e-05,
+      "state_out_absmax": 0.003965690732002258,
+      "out_absmax": 0.00159454345703125
+    },
+    "T1_warm": {
+      "T": 1,
+      "seeded_state": true,
+      "core_absmax": 0.005828857421875,
+      "state_out_absmax": 0.0955645740032196,
+      "out_absmax": 0.09130859375
+    },
+    "T8": {
+      "T": 8,
+      "seeded_state": false,
+      "core_absmax": 0.000560760498046875,
+      "state_out_absmax": 0.025340598076581955,
+      "out_absmax": 0.0498046875
+    },
+    "T64": {
+      "T": 64,
+      "seeded_state": true,
+      "core_absmax": 0.007537841796875,
+      "state_out_absmax": 0.0874996930360794,
+      "out_absmax": 0.73828125
+    },
+    "T512": {
+      "T": 512,
+      "seeded_state": false,
+      "core_absmax": 0.007659912109375,
+      "state_out_absmax": 0.12357183545827866,
+      "out_absmax": 3.28125
+    }
+  }
+}

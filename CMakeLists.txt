@@ -8,7 +8,10 @@ project(qwen38_3090_cuda_server LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
+# CUDA host code stays at C++17: nlohmann/json 3.12's std::ranges specialisation
+# does not compile under nvcc with -std=c++20, and nothing in the kernels needs
+# C++20. Host-only translation units still build as C++20.
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES 86)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -68,7 +71,8 @@ target_link_libraries(gate_dequant PRIVATE qwen_core)
 add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/dequant)
 
-add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu)
+add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu
+                                src/kernels/gdn.cu)
 target_include_directories(qwen_kernels PUBLIC src third_party)
 target_link_libraries(qwen_kernels PUBLIC CUDA::cublas)
 set_target_properties(qwen_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -80,6 +84,14 @@ add_test(NAME gemv_numerics COMMAND gate_gemv $ENV{QWEN38_MODEL_DIR})
 add_executable(gate_gemm tests/gate_gemm.cu)
 target_link_libraries(gate_gemm PRIVATE qwen_core qwen_kernels)
 add_test(NAME gemm_prefill COMMAND gate_gemm $ENV{QWEN38_MODEL_DIR})
+
+add_executable(gate_gdn tests/gate_gdn.cu)
+target_link_libraries(gate_gdn PRIVATE qwen_core qwen_kernels)
+add_test(NAME gdn COMMAND gate_gdn ${CMAKE_SOURCE_DIR}/tests/fixtures/gdn
+         $ENV{QWEN38_BF16_DIR})
+
+add_executable(bench_gdn bench/bench_gdn.cu)
+target_link_libraries(bench_gdn PRIVATE qwen_kernels)
 
 add_executable(bench_decode_gemv bench/bench_decode_gemv.cu)
 target_link_libraries(bench_decode_gemv PRIVATE qwen_core qwen_kernels)

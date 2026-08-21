@@ -1,0 +1,6 @@
+T=1      layer   0.016 ms (scan   0.010)  x48 layers =     0.76 ms   scan state BW  644.5 GB/s
+T=8      layer   0.052 ms (scan   0.041)  x48 layers =     2.49 ms   scan state BW  152.3 GB/s
+T=512    layer   1.692 ms (scan   1.612)  x48 layers =    81.23 ms   scan state BW    3.9 GB/s
+T=4096   layer  12.390 ms (scan  11.127)  x48 layers =   594.74 ms   scan state BW    0.6 GB/s
+
+budget context: decode weight traffic is 16.5 ms/token measured (Phase 2)

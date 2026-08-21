@@ -1,0 +1,38 @@
+case       stage                max|diff|         rel     verdict
+T1_fresh   conv+silu            6.104e-05    2.02e-03          ok
+T1_fresh   conv_state           0.000e+00    0.00e+00          ok
+T1_fresh   g                    1.192e-07    2.39e-08          ok
+T1_fresh   beta                 0.000e+00    0.00e+00          ok
+T1_fresh   scan out             2.384e-07    5.81e-03          ok
+T1_fresh   state out            2.208e-05    5.57e-03          ok
+T1_fresh   norm+gate            1.907e-06    4.98e-03          ok
+T1_warm    conv+silu            1.221e-04    4.00e-03          ok
+T1_warm    conv_state           4.872e-04    2.26e-03          ok
+T1_warm    g                    1.192e-07    2.37e-08          ok
+T1_warm    beta                 0.000e+00    0.00e+00          ok
+T1_warm    scan out             6.104e-05    1.05e-02          ok
+T1_warm    state out            2.456e-04    2.57e-03          ok
+T1_warm    norm+gate            9.766e-04    7.14e-03          ok
+T512       conv+silu            4.883e-04    3.27e-03          ok
+T512       conv_state           0.000e+00    0.00e+00          ok
+T512       g                    4.768e-07    9.37e-08          ok
+T512       beta                 0.000e+00    0.00e+00          ok
+T512       scan out             6.104e-05    7.97e-03          ok
+T512       state out            2.472e-04    2.00e-03          ok
+T512       norm+gate            3.906e-03    8.03e-03          ok
+T64        conv+silu            4.883e-04    4.85e-03          ok
+T64        conv_state           0.000e+00    0.00e+00          ok
+T64        g                    4.768e-07    9.43e-08          ok
+T64        beta                 0.000e+00    0.00e+00          ok
+T64        scan out             6.104e-05    8.10e-03          ok
+T64        state out            2.660e-04    3.04e-03          ok
+T64        norm+gate            1.465e-03    8.47e-03          ok
+T8         conv+silu            2.441e-04    3.98e-03          ok
+T8         conv_state           0.000e+00    0.00e+00          ok
+T8         g                    2.384e-07    4.73e-08          ok
+T8         beta                 0.000e+00    0.00e+00          ok
+T8         scan out             3.815e-06    6.80e-03          ok
+T8         state out            1.485e-04    5.86e-03          ok
+T8         norm+gate            1.221e-04    7.46e-03          ok
+
+gate_gdn: 0 stage failures -> PASS
