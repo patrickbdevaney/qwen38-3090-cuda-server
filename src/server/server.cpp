@@ -19,6 +19,9 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <fstream>
+#include <memory>
+#include <functional>
 #include <cuda_runtime.h>
 
 #include "../../third_party/httplib.h"
@@ -26,6 +29,9 @@
 #include "../model/model.h"
 #include "../spec/spec.h"
 #include "../cache/prefix.h"
+#include "../vision/vit.h"
+#include "../vision/image.h"
+#include "../vision/mm.h"
 #include "../tokenizer/bpe.h"
 #include "../tokenizer/chat_template.h"
 #include "../kernels/sampling.cuh"
@@ -55,6 +61,56 @@ Tokenizer*    g_tok = nullptr;
 SamplerState  g_sampler;
 DraftModel*   g_draft = nullptr;
 PrefixCache*  g_prefix = nullptr;
+VisionTower*  g_vision = nullptr;
+}  // namespace
+std::string g_model_dir;
+namespace {
+
+// One request's images, already encoded by the tower.
+struct MMInput {
+  std::vector<ImageSpan> spans;
+  __nv_bfloat16* embeds = nullptr;   // device [total image tokens, hidden]
+  ~MMInput() { if (embeds) cudaFree(embeds); }
+};
+
+// Pull every image part out of the messages, in the order the template will
+// render them, and decode it. Accepts data: URLs and local paths; a remote URL
+// would mean the server making outbound requests, which it does not do.
+std::vector<std::vector<uint8_t>> collect_images(const ojson& msgs) {
+  std::vector<std::vector<uint8_t>> out;
+  for (const auto& m : msgs) {
+    if (!m.contains("content") || !m["content"].is_array()) continue;
+    for (const auto& item : m["content"]) {
+      if (!item.is_object()) continue;
+      const std::string type = item.value("type", "");
+      std::string url;
+      if (item.contains("image_url")) {
+        const auto& iu = item["image_url"];
+        url = iu.is_object() ? iu.value("url", "") : iu.get<std::string>();
+      } else if (item.contains("image")) {
+        url = item["image"].is_string() ? item["image"].get<std::string>() : "";
+      } else if (type == "image") {
+        url = item.value("url", "");
+      } else {
+        continue;
+      }
+      if (url.empty()) throw UnsupportedContent("image part has no url");
+      std::vector<uint8_t> bytes;
+      if (url.compare(0, 5, "data:") == 0 || url.find("base64,") != std::string::npos) {
+        if (!base64_decode(url, bytes)) throw UnsupportedContent("image_url is not valid base64");
+      } else if (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0) {
+        throw UnsupportedContent("remote image URLs are not fetched; send a data: URL");
+      } else {
+        std::ifstream f(url, std::ios::binary);
+        if (!f) throw UnsupportedContent("cannot open image path: " + url);
+        bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+      }
+      if (bytes.empty()) throw UnsupportedContent("image decoded to zero bytes");
+      out.push_back(std::move(bytes));
+    }
+  }
+  return out;
+}
 SpecState*    g_spec = nullptr;
 ServerConfig  g_cfg;
 Metrics       g_metrics;
@@ -112,7 +168,9 @@ struct GenResult {
 GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
                    int max_new, const std::vector<std::string>& stops,
                    bool starts_in_think,
-                   const std::function<bool(const std::string&, const std::string&)>& on_delta) {
+                   const std::function<bool(const std::string&, const std::string&)>& on_delta,
+                   const MMInput* mm = nullptr,
+                   const std::vector<int32_t>* cache_key = nullptr) {
   GenResult r;
   Model& m = *g_model;
   const auto t0 = std::chrono::steady_clock::now();
@@ -148,8 +206,13 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   // Prefix reuse. The recurrent state cannot be truncated to an arbitrary
   // position, only restored at one that was snapshotted, so this either finds a
   // snapshot covering a prefix of this request or starts cold.
+  // <|image_pad|> tokens carry no image content, so two different images with
+  // the same grid tokenise identically. The cache key replaces each image span
+  // with a hash of the image bytes; without that the cache would happily serve
+  // one picture's KV for another.
+  const std::vector<int32_t>& key = cache_key ? *cache_key : ids;
   int reuse = 0, slot = -1;
-  if (g_prefix) reuse = prefix_lookup(*g_prefix, ids, &slot);
+  if (g_prefix) reuse = prefix_lookup(*g_prefix, key, &slot);
   if (reuse > 0) {
     prefix_restore(*g_prefix, m, slot);
     r.cached_tokens = reuse;
@@ -157,20 +220,49 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     prefix_cold(m);
   }
 
+  // mrope positions. Text-only is the identity on all three axes, which is what
+  // model_prefill does anyway; images make the axes diverge.
+  std::vector<int32_t> pt, ph, pw;
+  if (mm) {
+    mrope_positions(int(ids.size()), mm->spans, pt, ph, pw);
+    int mx = 0;
+    for (size_t i = 0; i < pt.size(); ++i)
+      mx = std::max({mx, pt[i], ph[i], pw[i]});
+    m.mrope_delta = (pt.empty() ? 0 : mx + 1 - int(ids.size()));
+  } else {
+    m.mrope_delta = 0;
+  }
+
   // chunked prefill
   int pos = reuse;
   const int chunk = m.max_batch;
   while (pos < int(ids.size())) {
     const int n = std::min<int>(chunk, int(ids.size()) - pos);
-    model_prefill(m, ids.data() + pos, n, pos);
+    if (mm) {
+      // Splice in whichever image tokens fall inside this chunk.
+      std::vector<EmbedSplice> sp;
+      size_t off = 0;
+      for (const ImageSpan& im : mm->spans) {
+        const int a = std::max(im.start, pos);
+        const int b = std::min(im.start + im.n_tokens, pos + n);
+        if (a < b)
+          sp.push_back({a - pos, b - a,
+                        mm->embeds + (off + size_t(a - im.start)) * m.shape.hidden_size});
+        off += size_t(im.n_tokens);
+      }
+      model_prefill_mm(m, ids.data() + pos, n, pos, pt.data() + pos, ph.data() + pos,
+                       pw.data() + pos, sp.data(), int(sp.size()));
+    } else {
+      model_prefill(m, ids.data() + pos, n, pos);
+    }
     if (use_spec) spec_push_taps(*g_draft, m.taps, n, pos, window_floor);
     pos += n;
   }
   if (g_prefix) {
-    prefix_set_kv(*g_prefix, ids);
+    prefix_set_kv(*g_prefix, key);
     // Snapshot at the end of prefill: this is the branch point for a prompt that
     // gets re-sent or extended without the assistant's reply.
-    prefix_store(*g_prefix, m, ids, int(ids.size()));
+    prefix_store(*g_prefix, m, key, int(key.size()));
   }
   cudaDeviceSynchronize();
   const auto t_prefill = std::chrono::steady_clock::now();
@@ -268,7 +360,7 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   // is that this single admission point is worth more than any amount of
   // periodic checkpointing, because conversations resume from the end.
   if (g_prefix) {
-    std::vector<int32_t> seen = ids;
+    std::vector<int32_t> seen = key;
     for (int32_t t : emitted) seen.push_back(t);
     // `pos` is the position of the next token to be written, i.e. exactly the
     // number of tokens the KV and the recurrent state cover.
@@ -333,6 +425,14 @@ json tool_calls_json(const std::vector<ToolCall>& calls) {
 int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
   g_model = &model; g_tok = &tok; g_cfg = cfg;
   sampler_alloc(g_sampler, model.shape.vocab_size);
+
+  static VisionTower vision;
+  if (cfg.vision) {
+    VisionLoadOptions vo;
+    vo.max_patches = cfg.vision_max_patches;
+    vision_load(vision, g_model_dir, vo);
+    g_vision = &vision;
+  }
 
   static PrefixCache prefix;
   if (cfg.prefix_cache && cfg.prefix_slots > 0) {
@@ -452,6 +552,11 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
 
     // ---- build the prompt ----
     std::vector<int32_t> ids;
+    std::vector<int32_t> cache_key;
+    // shared, not unique: the streaming provider below runs after this handler
+    // returns and captures by value, so the image embeddings have to outlive
+    // the request scope.
+    std::shared_ptr<MMInput> mm;
     bool thinking = true;
     try {
       if (chat) {
@@ -482,8 +587,77 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
           }
         }
         ojson tools = b.contains("tools") ? ojson::parse(b["tools"].dump()) : ojson();
+        opt.allow_vision = (g_vision != nullptr);
         const std::string prompt = render_chat(msgs, tools, opt);
         ids = g_tok->encode(prompt);
+
+        if (g_vision) {
+          auto raw = collect_images(msgs);
+          if (!raw.empty()) {
+            const VisionShape& vs = g_vision->sh;
+            ImageOptions io;
+            io.patch_size = vs.patch_size;
+            io.temporal_patch = vs.temporal_patch;
+            io.spatial_merge = vs.spatial_merge;
+
+            std::vector<PreprocessedImage> pre;
+            std::vector<ImageSpan> want;
+            size_t total_tokens = 0;
+            for (const auto& bytes : raw) {
+              PreprocessedImage pi = preprocess_image(bytes.data(), bytes.size(), io);
+              ImageSpan sp;
+              sp.t = pi.grid.t;
+              sp.h = pi.grid.h / vs.spatial_merge;
+              sp.w = pi.grid.w / vs.spatial_merge;
+              sp.n_tokens = sp.t * sp.h * sp.w;
+              total_tokens += size_t(sp.n_tokens);
+              want.push_back(sp);
+              pre.push_back(std::move(pi));
+            }
+
+            mm.reset(new MMInput());
+            const int32_t pad_id = g_tok->token_to_id("<|image_pad|>");
+            if (pad_id < 0) throw ChatTemplateError("tokenizer has no <|image_pad|>");
+            ids = expand_image_pads(ids, pad_id, want, mm->spans);
+
+            // Encode each image and pack the tokens back to back.
+            const int H = g_model->shape.hidden_size;
+            if (cudaMalloc(&mm->embeds, total_tokens * H * 2) != cudaSuccess)
+              throw ChatTemplateError("out of device memory for image embeddings");
+            __nv_bfloat16* d_pix = nullptr;
+            size_t off = 0;
+            for (size_t i = 0; i < pre.size(); ++i) {
+              const PreprocessedImage& pi = pre[i];
+              const size_t np = size_t(pi.grid.t) * pi.grid.h * pi.grid.w;
+              std::vector<uint16_t> bf(np * pi.patch_dim);
+              for (size_t k = 0; k < bf.size(); ++k) {
+                float v = pi.pixel_values[k];
+                uint32_t u; memcpy(&u, &v, 4);
+                bf[k] = uint16_t(u >> 16);   // truncate to bf16, as torch does
+              }
+              if (!d_pix && cudaMalloc(&d_pix, bf.size() * 2) != cudaSuccess)
+                throw ChatTemplateError("out of device memory for pixel values");
+              cudaMemcpy(d_pix, bf.data(), bf.size() * 2, cudaMemcpyHostToDevice);
+              const __nv_bfloat16* enc =
+                  vision_forward(*g_vision, d_pix, pi.grid.t, pi.grid.h, pi.grid.w);
+              cudaMemcpy(mm->embeds + off * H, enc,
+                         size_t(mm->spans[i].n_tokens) * H * 2, cudaMemcpyDeviceToDevice);
+              off += size_t(mm->spans[i].n_tokens);
+              cudaFree(d_pix); d_pix = nullptr;
+            }
+
+            // Cache key: image spans become a hash of the image bytes so two
+            // different pictures never look like the same prefix.
+            cache_key = ids;
+            for (size_t i = 0; i < mm->spans.size(); ++i) {
+              uint64_t hsh = 1469598103934665603ull;
+              for (uint8_t c : raw[i]) { hsh ^= c; hsh *= 1099511628211ull; }
+              const ImageSpan& sp = mm->spans[i];
+              for (int j = 0; j < sp.n_tokens; ++j)
+                cache_key[sp.start + j] = int32_t((hsh + uint64_t(j) * 2654435761ull) & 0x7fffffff);
+            }
+          }
+        }
       } else {
         if (!b.contains("prompt") || !b["prompt"].is_string())
           throw ChatTemplateError("`prompt` is required and must be a string");
@@ -538,7 +712,8 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
       g_metrics.queue_depth++;
       std::lock_guard<std::mutex> lk(g_engine);
       g_metrics.queue_depth--;
-      GenResult r = generate(ids, sp, max_new, stops, thinking, nullptr);
+      GenResult r = generate(ids, sp, max_new, stops, thinking, nullptr, mm.get(),
+                             cache_key.empty() ? nullptr : &cache_key);
       g_metrics.prompt_tokens += r.prompt_tokens;
       g_metrics.completion_tokens += r.completion_tokens;
       g_metrics.reasoning_tokens += r.reasoning_tokens;
@@ -576,7 +751,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     res.set_header("X-Accel-Buffering", "no");
     res.set_chunked_content_provider(
         "text/event-stream",
-        [id, created, ids, sp, max_new, stops, chat, want_usage, thinking]
+        [id, created, ids, sp, max_new, stops, chat, want_usage, thinking, mm, cache_key]
         (size_t, httplib::DataSink& sink) {
           auto emit = [&](const json& j) {
             const std::string s = "data: " + j.dump() + "\n\n";
@@ -605,7 +780,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
                 if (d.empty()) return true;
                 alive = emit(chunk(d, nullptr));
                 return alive;
-              });
+              }, mm.get(), cache_key.empty() ? nullptr : &cache_key);
           g_metrics.prompt_tokens += r.prompt_tokens;
           g_metrics.completion_tokens += r.completion_tokens;
           g_metrics.reasoning_tokens += r.reasoning_tokens;

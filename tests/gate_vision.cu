@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include "../third_party/json.hpp"
 #include "../src/vision/vit.h"
+#include "../src/vision/mm.h"
 
 using json = nlohmann::json;
 #define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
@@ -102,6 +103,39 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> got(want.size());
     CK(cudaMemcpy(got.data(), out, got.size() * 2, cudaMemcpyDeviceToHost));
     ok &= cmp("image tokens", got, want, TOL); }
+
+  // ---- mrope positions against the reference's get_rope_index ----------
+  // This is the subtlest piece of the image path: an image spans a (t,h,w) box
+  // and afterwards the position advances by max(h,w), NOT by the token count.
+  {
+    const int L = man["mrope_len"], NB = man["mrope_text_before"];
+    const int IMG = man["mrope_img_tokens"];
+    std::vector<int32_t> want(size_t(3) * L);
+    { std::ifstream f(fx + "/mrope_positions.i32", std::ios::binary);
+      if (!f) { printf("missing mrope fixture\n"); return 2; }
+      f.read(reinterpret_cast<char*>(want.data()), want.size() * 4); }
+
+    qwen::ImageSpan sp;
+    sp.start = NB; sp.t = gt;
+    sp.h = gh / v.sh.spatial_merge; sp.w = gw / v.sh.spatial_merge;
+    sp.n_tokens = IMG;
+    std::vector<int32_t> pt, ph, pw;
+    qwen::mrope_positions(L, {sp}, pt, ph, pw);
+
+    size_t bad = 0;
+    for (int i = 0; i < L; ++i) {
+      if (pt[i] != want[i]) ++bad;
+      if (ph[i] != want[L + i]) ++bad;
+      if (pw[i] != want[2 * L + i]) ++bad;
+    }
+    int mx = 0;
+    for (int i = 0; i < L; ++i) mx = std::max({mx, pt[i], ph[i], pw[i]});
+    const int delta = mx + 1 - L;
+    const bool okm = (bad == 0) && (delta == man["mrope_delta"].get<int>());
+    ok &= okm;
+    printf("  %-14s %zu / %d position entries differ, delta %d (ref %d)   %s\n",
+           "mrope", bad, 3 * L, delta, man["mrope_delta"].get<int>(), okm ? "OK" : "FAIL");
+  }
 
   printf("  RESULT: %s\n", ok ? "PASS" : "FAIL");
   qwen::vision_free(v);

@@ -89,6 +89,16 @@ struct Model {
 
   // DFlash2 taps: [max_batch][n_taps * hidden], already concatenated the way
   // the drafter's fc consumes it. tap_of[li] is the slot for layer li, or -1.
+  // mrope: three position axes. Text-only prefill passes the same array three
+  // times, which is the identity; an image span sets them independently.
+  int32_t *pos_t = nullptr, *pos_h = nullptr, *pos_w = nullptr;
+
+  // With images, the mrope position and the KV slot diverge: an image advances
+  // mrope by max(h, w) while occupying h*w slots. transformers calls the gap
+  // mrope_position_deltas and adds it to every later position. Zero for
+  // text-only prompts, which is why the text path never had to care.
+  int mrope_delta = 0;
+
   __nv_bfloat16* taps = nullptr;
   std::vector<int> tap_of;
   int n_taps = 0;
@@ -181,6 +191,22 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
 // Gather T embedding rows from the host table into m.h. Only valid when
 // m.embed_on_host.
 void embed_rows_host(Model& m, const int32_t* ids, int T);
+
+// A run of precomputed embedding rows (image tokens) to drop into the hidden
+// state after the token embedding, replacing whatever the placeholder id
+// produced.
+struct EmbedSplice {
+  int dst_row = 0;                        // row within THIS prefill chunk
+  int n_rows = 0;
+  const __nv_bfloat16* src = nullptr;     // [n_rows, hidden] on device
+};
+
+// Prefill with explicit 3-axis mrope positions and optional embedding splices.
+// model_prefill() is this with sequential positions on all three axes and no
+// splices.
+void model_prefill_mm(Model& m, const int32_t* ids, int T, int position,
+                      const int32_t* pt, const int32_t* ph, const int32_t* pw,
+                      const EmbedSplice* splices, int n_splices);
 
 void model_enable_taps(Model& m, const std::vector<int>& layer_ids);
 // The target's lm_head applied to arbitrary rows, WITHOUT the target's final

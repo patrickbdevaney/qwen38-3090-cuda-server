@@ -30,6 +30,11 @@ struct ChatOptions {
   std::optional<bool> enable_thinking;    // unset == Jinja "undefined"
   std::optional<bool> preserve_thinking;  // unset == Jinja "undefined"
   std::string reasoning_effort;           // "" == undefined -> "xhigh"
+  // When true, image parts render as <|vision_start|><|image_pad|><|vision_end|>
+  // exactly as the Jinja template does, and the caller is responsible for
+  // expanding each <|image_pad|> into one token per image patch-block. When
+  // false (the default) an image part raises UnsupportedContent.
+  bool allow_vision = false;
 };
 
 // Thrown for content the template supports but this build does not (images,

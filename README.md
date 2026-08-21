@@ -14,6 +14,7 @@ graphs, and an OpenAI-compatible server. Measured on this box, from committed bi
 | **DFlash2 speculative decode, mean of 3 prompts** | **100.1 tok/s (2.32x AR)** |
 | DFlash2 through the server, greedy request | **133.3 tok/s**, 7.54 accepted per round |
 | **prefix cache, 2nd turn of a conversation** | **90.5x faster prefill** (6715 of 6736 tokens reused) |
+| vision (`--vision`) | 448x448 image = 196 tokens; correct on content **and** position |
 | mean accepted tokens per block of 8 | 4.10 / 5.79 / 6.83 |
 | decode GEMV, traffic-weighted | 769.8 GB/s = 84.2% of measured DRAM |
 | prefill GEMM | 70.1 TFLOPS = 86% of measured BF16 peak |
@@ -116,8 +117,9 @@ definition is DFlash **1**: no two-tap dynamic convolution, no candidate selecto
 
 - **No continuous batching.** Single sequence plus one background prefill slot. Explicitly out
   of scope.
-- **No vision.** v1 is text-only. The loader detects and skips `model.visual.*` (0.858 GiB) and
-  the API returns 400 on image/video content parts. The hook is left in place.
+- **Vision is opt-in**, not absent: `--vision` loads the tower (0.858 GiB, which is 28,114
+  tokens of FP8 KV) and the API accepts image content parts as `data:` URLs or local paths.
+  Without the flag an image part returns 400. Remote URLs are never fetched. Video is rejected.
 - **No multi-GPU, no CPU offload.** One 3090.
 
 ## Layout
@@ -129,7 +131,7 @@ src/model/                 loader, layer stack, CUDA graph capture, VRAM budget
 src/draft/                 DFlash2 block-diffusion drafter and its candidate selector
 src/spec/                  speculative loop, GDN state rollback, acceptance
 src/cache/                 prefix cache: GDN state snapshots in pinned host memory
-src/vision/                27-block ViT tower (verified; not yet wired to the API)
+src/vision/                27-block ViT tower, image preprocessing, mrope/splice plumbing
 src/tokenizer/             BPE, NFC, Unicode tables, chat template
 src/server/                OpenAI-compatible endpoints, SSE, tool calls, reasoning parser
 tests/gate_*               one standalone executable each; `ctest` runs them all

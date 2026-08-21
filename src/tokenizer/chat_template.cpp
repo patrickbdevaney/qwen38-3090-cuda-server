@@ -88,6 +88,11 @@ void dump(const ojson& j, std::string& out) {
 // render_content(): a message's content is either a string or an array of
 // parts. v1 is text-only, so image/video parts raise rather than emitting the
 // vision placeholders the template would.
+// Set for the duration of a render_chat() call. The template's own vision
+// branch emits these three tokens verbatim; whether we are allowed to follow it
+// is a build/launch decision, not a template one.
+bool g_allow_vision = false;
+
 std::string render_content(const ojson& content) {
   if (content.is_null()) return "";
   if (content.is_string()) return content.get<std::string>();
@@ -96,10 +101,14 @@ std::string render_content(const ojson& content) {
     for (const auto& item : content) {
       if (!item.is_object()) throw ChatTemplateError("Unexpected item type in content.");
       const std::string type = item.value("type", "");
-      if (item.contains("image") || item.contains("image_url") || type == "image")
-        throw UnsupportedContent("image content is not supported: this build is text-only");
+      if (item.contains("image") || item.contains("image_url") || type == "image") {
+        if (!g_allow_vision)
+          throw UnsupportedContent("image content is not supported: start the server with --vision");
+        out += "<|vision_start|><|image_pad|><|vision_end|>";
+        continue;
+      }
       if (item.contains("video") || type == "video")
-        throw UnsupportedContent("video content is not supported: this build is text-only");
+        throw UnsupportedContent("video content is not supported");
       if (item.contains("text")) out += item.at("text").get<std::string>();
       else throw ChatTemplateError("Unexpected item type in content.");
     }
@@ -132,6 +141,7 @@ std::string json_dumps_python(const ojson& j) {
 
 std::string render_chat(const ojson& messages, const ojson& tools,
                         const ChatOptions& opt) {
+  g_allow_vision = opt.allow_vision;
   if (!messages.is_array() || messages.empty())
     throw ChatTemplateError("No messages provided.");
 

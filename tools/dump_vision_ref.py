@@ -147,6 +147,33 @@ def main():
         "layer_norm_eps": 1e-6,
         "out_absmax": float(out.float().abs().max()),
     }
+    # --- mrope golden -------------------------------------------------
+    # get_rope_index is the trickiest piece of the image path: an image spans a
+    # (t,h,w) box and afterwards the position advances by max(h,w), NOT by the
+    # token count. Drive the reference method directly with a stub `self`.
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+    class Stub:
+        pass
+    stub = Stub()
+    stub.config = type("C", (), {"vision_config": vcfg})()
+    stub.get_vision_position_ids = Qwen3_5Model.get_vision_position_ids.__get__(stub)
+    get_rope_index = Qwen3_5Model.get_rope_index.__get__(stub)
+
+    n_img_tok = n_patch // (merge * merge)
+    # text, image, text  -- exercises the offset on both sides
+    ids_seq = [5] * 7 + [cfg_all["image_token_id"]] * n_img_tok + [6] * 5
+    types = [0] * 7 + [1] * n_img_tok + [0] * 5
+    input_ids = torch.tensor([ids_seq], dtype=torch.long)
+    mm_types = torch.tensor([types], dtype=torch.int32)
+    pos_ids, delta = get_rope_index(input_ids, mm_types,
+                                    image_grid_thw=torch.tensor([[gt, gh, gw]], dtype=torch.long))
+    np.array(pos_ids[:, 0, :], dtype=np.int32).tofile(f"{a.out}/mrope_positions.i32")
+    man_extra = {"mrope_len": len(ids_seq), "mrope_text_before": 7,
+                 "mrope_text_after": 5, "mrope_delta": int(delta[0][0]),
+                 "mrope_img_tokens": int(n_img_tok)}
+    print("mrope: len", len(ids_seq), "delta", int(delta[0][0]))
+
+    man.update(man_extra)
     json.dump(man, open(f"{a.out}/manifest.json", "w"), indent=2)
     print("grid", (gt, gh, gw), "patches", n_patch, "-> out", tuple(out.shape))
     print("|out|max %.4f" % man["out_absmax"])

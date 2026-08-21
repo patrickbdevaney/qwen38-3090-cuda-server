@@ -17,5 +17,10 @@ struct ServerConfig {
   // and no device memory at all.
   int  prefix_slots = 4;
   bool prefix_cache = true;
+
+  // Vision. Costs 0.858 GiB resident -- 28,114 tokens of FP8 KV -- which is why
+  // it is opt-in rather than always loaded.
+  bool vision = false;
+  int  vision_max_patches = 4096;   // 1024 image tokens after the 2x2 merge
 };
 }  // namespace qwen

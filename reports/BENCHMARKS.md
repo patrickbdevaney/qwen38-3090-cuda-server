@@ -196,8 +196,23 @@ The first row is the tight one and it is deliberately gated: it is where an
 through 27 blocks. The second is the bf16 floor -- the reference itself ran on
 CPU in bf16, the same situation as `gate_dflash`.
 
+| mrope positions vs `get_rope_index` | 0 / 228 entries differ | OK |
+
 **Cost in context**: 0.858 GiB / 32 KiB per token = **28,114 tokens of FP8 KV**.
 That is why vision is a launch flag and not always-on.
+
+End to end through the server (`--vision`), a 448x448 PNG as a `data:` URL:
+
+| | |
+|---|---|
+| image | 784 patches -> 196 tokens |
+| prompt | 248 tokens, prefill 512 tok/s |
+| decode | 45.4 tok/s |
+| 2nd turn, same image | **304 of 320 cached**, prefill 5650 tok/s |
+
+The model reports a red circle upper-left and a blue square lower-right, which
+is where they were drawn -- content and position both, which is what catches a
+wrong patch order or a wrong mrope box.
 
 ---
 

@@ -137,7 +137,7 @@ add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
 # ---------------------------------------------------------------- vision
-add_library(qwen_vision STATIC src/vision/vit.cu)
+add_library(qwen_vision STATIC src/vision/vit.cu src/vision/image.cpp src/vision/mm.cpp)
 target_link_libraries(qwen_vision PUBLIC qwen_core CUDA::cublas)
 target_include_directories(qwen_vision PUBLIC src third_party)
 
@@ -192,7 +192,7 @@ target_link_libraries(bench_spec PRIVATE qwen_spec)
 add_library(qwen_server STATIC
   src/server/server.cpp
   src/server/reasoning_parser.cpp)
-target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer qwen_spec qwen_cache)
+target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer qwen_spec qwen_cache qwen_vision)
 target_include_directories(qwen_server PUBLIC src third_party)
 
 add_executable(cuda_server src/main.cpp)

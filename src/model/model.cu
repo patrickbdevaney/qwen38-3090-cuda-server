@@ -359,6 +359,9 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.sin_tab  = static_cast<float*>(dalloc(m, size_t(B) * S.rotary_dims / 2 * 4));
   m.logits   = static_cast<__nv_bfloat16*>(dalloc(m, size_t(S.vocab_size) * 2));
   m.pos_buf  = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
+  m.pos_t    = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
+  m.pos_h    = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
+  m.pos_w    = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
   m.id_buf   = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
   // 256 partial indices + 256 partial values = 512 ints, then room for the
   // chosen id and slack. The previous 256*8 allocation was EXACTLY 512 ints and
@@ -627,7 +630,9 @@ void head(Model& m, int T) {
 
 }  // namespace
 
-void model_prefill(Model& m, const int32_t* ids, int T, int position) {
+void model_prefill_mm(Model& m, const int32_t* ids, int T, int position,
+                      const int32_t* pt, const int32_t* ph, const int32_t* pw,
+                      const EmbedSplice* splices, int n_splices) {
   const ModelShape& S = m.shape;
   // The activation buffers, m.id_buf and the embedding staging buffer are all
   // sized for max_batch. A caller chunking by anything wider silently walks off
@@ -637,15 +642,33 @@ void model_prefill(Model& m, const int32_t* ids, int T, int position) {
     abort();
   }
   CKM(cudaMemcpy(m.id_buf, ids, size_t(T) * 4, cudaMemcpyHostToDevice));
-  std::vector<int32_t> pos(T);
-  for (int i = 0; i < T; ++i) pos[i] = position + i;
-  CKM(cudaMemcpy(m.pos_buf, pos.data(), size_t(T) * 4, cudaMemcpyHostToDevice));
+  CKM(cudaMemcpy(m.pos_t, pt, size_t(T) * 4, cudaMemcpyHostToDevice));
+  CKM(cudaMemcpy(m.pos_h, ph, size_t(T) * 4, cudaMemcpyHostToDevice));
+  CKM(cudaMemcpy(m.pos_w, pw, size_t(T) * 4, cudaMemcpyHostToDevice));
+
   if (m.embed_on_host)        embed_rows_host(m, ids, T);
   else if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
   else                        embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
+
+  // Image tokens: overwrite the placeholder embedding with the vision tower's
+  // output. `deepstack_visual_indexes` is empty in this checkpoint, so this is
+  // the only place visual features enter the language model.
+  for (int i = 0; i < n_splices; ++i) {
+    const EmbedSplice& sp = splices[i];
+    if (sp.n_rows <= 0) continue;
+    if (sp.dst_row < 0 || sp.dst_row + sp.n_rows > T) {
+      fprintf(stderr, "model_prefill_mm: splice [%d,%d) outside chunk of %d\n",
+              sp.dst_row, sp.dst_row + sp.n_rows, T);
+      abort();
+    }
+    CKM(cudaMemcpyAsync(m.h + size_t(sp.dst_row) * S.hidden_size, sp.src,
+                        size_t(sp.n_rows) * S.hidden_size * 2,
+                        cudaMemcpyDeviceToDevice, m.stream));
+  }
+
   if (m.dbg_hidden)
     CKM(cudaMemcpy(m.dbg_hidden, m.h, size_t(T) * S.hidden_size * 2, cudaMemcpyDeviceToDevice));
-  rope_tables(m.cos_tab, m.sin_tab, m.pos_buf, m.pos_buf, m.pos_buf, T,
+  rope_tables(m.cos_tab, m.sin_tab, m.pos_t, m.pos_h, m.pos_w, T,
               S.rotary_dims, float(S.rope_theta), m.stream);
   for (int i = 0; i < S.num_hidden_layers; ++i) {
     run_layer(m, i, T, position, T > 1);
@@ -655,6 +678,12 @@ void model_prefill(Model& m, const int32_t* ids, int T, int position) {
   }
   head(m, T);
   m.ctx_len = position + T;
+}
+
+void model_prefill(Model& m, const int32_t* ids, int T, int position) {
+  std::vector<int32_t> pos(T);
+  for (int i = 0; i < T; ++i) pos[i] = position + i + m.mrope_delta;
+  model_prefill_mm(m, ids, T, position, pos.data(), pos.data(), pos.data(), nullptr, 0);
 }
 
 int model_graph_bucket(const Model& m, int ctx) {
@@ -696,7 +725,7 @@ void model_graph_capture(Model& m) {
     } else {
       embed_bf16(m.h, m.embed_bf, m.d_step, 1, S.hidden_size, m.stream);
     }
-    rope_tables_dev(m.cos_tab, m.sin_tab, m.d_step + 1, S.rotary_dims,
+    rope_tables_dev(m.cos_tab, m.sin_tab, m.d_step + 3, S.rotary_dims,
                     float(S.rope_theta), m.stream);
     for (int i = 0; i < S.num_hidden_layers; ++i)
       run_layer(m, i, 1, 0, false, /*dev_pos=*/true);
@@ -706,8 +735,8 @@ void model_graph_capture(Model& m) {
   // Warm up OUTSIDE capture: the one-shot cudaFuncSetAttribute opt-ins and any
   // lazy cuBLAS workspace allocation must not happen during capture, or the
   // graph records an allocation it cannot replay.
-  m.h_step[0] = 0; m.h_step[1] = 0; m.h_step[2] = 1;
-  CKM(cudaMemcpy(m.d_step, m.h_step, 12, cudaMemcpyHostToDevice));
+  m.h_step[0] = 0; m.h_step[1] = 0; m.h_step[2] = 1; m.h_step[3] = 0;
+  CKM(cudaMemcpy(m.d_step, m.h_step, 16, cudaMemcpyHostToDevice));
   for (int g = 0; g < m.n_graphs; ++g) {
     m.graph_splits = m.graph_splits_of[g];
     // Warm up OUTSIDE capture: the one-shot cudaFuncSetAttribute opt-ins and any
@@ -762,8 +791,11 @@ void model_decode(Model& m, int32_t id, int position) {
   if (m.use_graph && m.n_graphs) {
     const int g = model_graph_bucket(m, position + 1);
     m.graph_splits = m.graph_splits_of[g];
+    // [1] is the KV slot, [3] is the rope position. They are the same thing
+    // until an image is in the context.
     m.h_step[0] = id; m.h_step[1] = position; m.h_step[2] = position + 1;
-    CKM(cudaMemcpy(m.d_step, m.h_step, 12, cudaMemcpyHostToDevice));
+    m.h_step[3] = position + m.mrope_delta;
+    CKM(cudaMemcpy(m.d_step, m.h_step, 16, cudaMemcpyHostToDevice));
     if (m.embed_on_host) embed_rows_host(m, &id, 1);
     CKM(cudaGraphLaunch(m.graph_exec[g], m.stream));
     m.ctx_len = position + 1;

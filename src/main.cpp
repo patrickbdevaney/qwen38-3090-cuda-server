@@ -8,6 +8,7 @@
 #include "server/server_config.h"
 
 namespace qwen { int run_server(Model&, Tokenizer&, const ServerConfig&); }
+namespace qwen { extern std::string g_model_dir; }
 
 static void usage(const char* a0) {
   printf(
@@ -38,6 +39,12 @@ static void usage(const char* a0) {
 "                         Measured 2.32x on greedy prompts.\n"
 "  --draft-bf16           keep the drafter in bf16 (3.70 GiB) instead of W4A16\n"
 "                         (1.25 GiB). Measured slower and no more accurate.\n"
+"  --vision               load the vision tower and accept image content parts.\n"
+"                         Costs 0.858 GiB resident, which is 28,114 tokens of\n"
+"                         FP8 KV, so it is off by default. Images arrive as\n"
+"                         data: URLs or local paths; remote URLs are not fetched.\n"
+"  --vision-max-patches N largest image, in 16px patches, default 4096\n"
+"                         (1024 image tokens after the 2x2 merge)\n"
 "  --prefix-slots N       recurrent-state snapshots kept for prefix reuse\n"
 "                         (default 4). Each is ~150 MiB of PINNED HOST memory\n"
 "                         and zero device memory. Measured 46x faster prefill\n"
@@ -76,6 +83,8 @@ int main(int argc, char** argv) {
     else if (a == "--webui") cfg.webui_path = next();
     else if (a == "--draft") cfg.draft_dir = next();
     else if (a == "--draft-bf16") cfg.draft_quantize = false;
+    else if (a == "--vision") cfg.vision = true;
+    else if (a == "--vision-max-patches") cfg.vision_max_patches = atoi(next());
     else if (a == "--prefix-slots") cfg.prefix_slots = atoi(next());
     else if (a == "--no-prefix-cache") cfg.prefix_cache = false;
     else if (a == "--no-graph") no_graph = true;
@@ -86,6 +95,7 @@ int main(int argc, char** argv) {
   if (model_dir.empty()) { usage(argv[0]); return 2; }
   cfg.max_ctx = opt.max_ctx;
 
+  qwen::g_model_dir = model_dir;
   qwen::Model m;
   qwen::model_load(m, model_dir, opt);
 
