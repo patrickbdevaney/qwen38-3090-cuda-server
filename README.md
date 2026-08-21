@@ -21,10 +21,12 @@ graphs, and an OpenAI-compatible server. Measured on this box, from committed bi
 Full tables and every invocation: [`reports/BENCHMARKS.md`](reports/BENCHMARKS.md).
 Phase reports: [`PHASE_0`](reports/PHASE_0.md) .. [`PHASE_7`](reports/PHASE_7.md).
 
-Peak VRAM at 128K context is **21.47 GB** of 24, so the full 128K window fits with the model,
-the INT8 head and the INT8 embedding resident.
+**Context is 262144 — the model's trained maximum** — at 24.4 tok/s, with the full 8 GiB KV
+cache resident (peak 23332 MiB of 24133). That needs `--embed-host`, which moves the embedding
+table to host memory: it is a row gather, never a matmul, so one 10 KB row per token over PCIe
+buys back 1.185 GiB of device memory at no accuracy cost. At 128K the peak is 21.47 GB.
 
-All 16 gates pass. Known misses, stated as misses: 64K decode is 82% of 4K against an 85%
+All 17 gates pass. Known misses, stated as misses: 64K decode is 82% of 4K against an 85%
 bar, and prose speculation lands below its 120 tok/s bar.
 
 ---
@@ -127,6 +129,7 @@ src/model/                 loader, layer stack, CUDA graph capture, VRAM budget
 src/draft/                 DFlash2 block-diffusion drafter and its candidate selector
 src/spec/                  speculative loop, GDN state rollback, acceptance
 src/cache/                 prefix cache: GDN state snapshots in pinned host memory
+src/vision/                27-block ViT tower (verified; not yet wired to the API)
 src/tokenizer/             BPE, NFC, Unicode tables, chat template
 src/server/                OpenAI-compatible endpoints, SSE, tool calls, reasoning parser
 tests/gate_*               one standalone executable each; `ctest` runs them all

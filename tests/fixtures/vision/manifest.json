@@ -1,0 +1,25 @@
+{
+  "depth": 27,
+  "hidden_size": 1152,
+  "intermediate_size": 4304,
+  "num_heads": 16,
+  "head_dim": 72,
+  "in_channels": 3,
+  "patch_size": 16,
+  "temporal_patch_size": 2,
+  "spatial_merge_size": 2,
+  "num_position_embeddings": 2304,
+  "num_grid_per_side": 48,
+  "out_hidden_size": 5120,
+  "hidden_act": "gelu_pytorch_tanh",
+  "grid": [
+    1,
+    16,
+    16
+  ],
+  "n_patch": 256,
+  "patch_dim": 1536,
+  "n_out": 64,
+  "layer_norm_eps": 1e-06,
+  "out_absmax": 77.0
+}

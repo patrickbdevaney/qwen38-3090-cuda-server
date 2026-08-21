@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
 
   qwen::Model m; qwen::LoadOptions o;
   o.max_ctx = max_ctx; o.max_batch = (argc > 5) ? atoi(argv[5]) : 4096;
+  o.embed_host = (argc > 6) ? atoi(argv[6]) != 0 : false;
   o.lm_head_bits = quant_lm; o.quantize_embed = true;
   qwen::model_load(m, md, o);
   printf("\nlm_head %d-bit, max_ctx %d\n", o.lm_head_bits, max_ctx);
@@ -28,12 +29,14 @@ int main(int argc, char** argv) {
   int32_t* d_id = m.argmax_scratch + 512;
   printf("\n%8s %12s %12s %12s %10s\n", "ctx", "median ms", "p95 ms", "tok/s", "vs 4K");
   double base = 0;
-  for (int ctx : {4096, 16384, 32768, 65536, 131072}) {
+  for (int ctx : {4096, 16384, 32768, 65536, 131072, 262144}) {
     if (ctx > max_ctx) break;
     // warm the cache to `ctx` with a chunked prefill
     cudaMemset(m.gdn_state, 0, size_t(m.shape.gdn_state_elems()) * 4);
     cudaMemset(m.gdn_conv, 0, size_t(m.shape.gdn_conv_state_elems()) * 4);
-    std::vector<int32_t> ids(std::min(ctx, 4096), 100);
+    // Chunk by the model's configured prefill width, not a hard-coded 4096:
+    // m.id_buf and the activation buffers are sized for max_batch.
+    std::vector<int32_t> ids(std::min(ctx, m.max_batch), 100);
     int pos = 0;
     while (pos < ctx - 1) {
       const int n = std::min<int>(ids.size(), ctx - 1 - pos);

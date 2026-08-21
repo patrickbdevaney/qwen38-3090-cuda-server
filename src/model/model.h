@@ -48,6 +48,13 @@ struct Model {
   std::vector<LayerWeights> layers;
 
   // vocabulary
+  // Host-resident embedding (opt.embed_host). `embed_host_bf` is plain host
+  // memory holding the whole table; `embed_stage` is a pinned staging buffer the
+  // gathered rows are assembled into before one DMA.
+  __nv_bfloat16* embed_host_bf = nullptr;
+  __nv_bfloat16* embed_stage = nullptr;
+  bool embed_on_host = false;
+
   int8_t*  embed_q = nullptr;        // [vocab, hidden] int8
   __nv_bfloat16* embed_bf = nullptr; // used when --embed bf16
   bool embed_quantized = true;
@@ -137,6 +144,13 @@ struct LoadOptions {
   int  lm_head_bits = 8;         // 16 | 8 | 4
   int  lm_head_group = 128;
   bool quantize_embed = true;    // INT8 rowwise; reclaims 1.183 GiB
+  // Keep embed_tokens in HOST memory and DMA one row per token instead. The
+  // embedding is a pure row gather -- it is never a matmul -- so the only cost
+  // is 10 KB of PCIe per decoded token, against 1.185 GiB of device memory
+  // reclaimed. That 1.185 GiB is 38k tokens of FP8 KV, which is the difference
+  // between 128K and 262K context on a 24 GB card. Held in bf16, so unlike
+  // INT8-on-device it costs no accuracy at all.
+  bool embed_host = false;
   bool verbose = true;
 };
 
@@ -164,6 +178,10 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
 // come from the TARGET's hidden states at a handful of layers, so those layers
 // have to publish h as they go. Layout is [row][tap][hidden], i.e. already
 // concatenated the way fc consumes it.
+// Gather T embedding rows from the host table into m.h. Only valid when
+// m.embed_on_host.
+void embed_rows_host(Model& m, const int32_t* ids, int T);
+
 void model_enable_taps(Model& m, const std::vector<int>& layer_ids);
 // The target's lm_head applied to arbitrary rows, WITHOUT the target's final
 // norm. The drafter's output is already normalised by its own `norm`, and the

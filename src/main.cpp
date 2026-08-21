@@ -17,12 +17,20 @@ static void usage(const char* a0) {
 "  --host HOST            default 127.0.0.1\n"
 "  --port N               default 8090\n"
 "  --alias NAME           model id reported by /v1/models (default qwen38-27b)\n"
-"  --max-context N        default 32768; the server REFUSES TO START if this\n"
-"                         does not fit with a 512 MB margin\n"
+"  --max-context N|auto   default 32768. `auto` gives the KV cache everything\n"
+"                         left after the model and workspaces, capped at the\n"
+"                         model's trained 262144 and keeping a 512 MB margin.\n"
+"                         With a number, the server REFUSES TO START if it does\n"
+"                         not fit with that margin.\n"
 "  --prefill-chunk N      chunked-prefill chunk, default 4096 (84%% of peak)\n"
 "  --lm-head-bits {16,8,4}  default 8. INT4 measured a KL of 1.8e-2 against\n"
 "                         7.8e-4 for INT8 and is not recommended.\n"
 "  --embed-bits {16,8}    default 8\n"
+"  --embed-host           keep embed_tokens in HOST memory and DMA one row per\n"
+"                         token. Reclaims 1.185 GiB of device memory -- 38k\n"
+"                         tokens of FP8 KV -- at no accuracy cost, because the\n"
+"                         embedding is a gather and never a matmul. Required to\n"
+"                         reach the model's native 262144 context on 24 GB.\n"
 "  --webui PATH           single-file web UI served at / (default src/clients/webui/index.html)\n"
 "  --draft DIR            DFlash2 drafter directory. Speculative decode is\n"
 "                         GREEDY ONLY (the acceptance rule is argmax equality),\n"
@@ -57,10 +65,14 @@ int main(int argc, char** argv) {
     else if (a == "--host") cfg.host = next();
     else if (a == "--port") cfg.port = atoi(next());
     else if (a == "--alias") cfg.model_alias = next();
-    else if (a == "--max-context") opt.max_ctx = atoi(next());
+    else if (a == "--max-context") {
+      const std::string v = next();
+      opt.max_ctx = (v == "auto") ? 0 : atoi(v.c_str());
+    }
     else if (a == "--prefill-chunk") opt.max_batch = atoi(next());
     else if (a == "--lm-head-bits") opt.lm_head_bits = atoi(next());
     else if (a == "--embed-bits") opt.quantize_embed = atoi(next()) == 8;
+    else if (a == "--embed-host") opt.embed_host = true;
     else if (a == "--webui") cfg.webui_path = next();
     else if (a == "--draft") cfg.draft_dir = next();
     else if (a == "--draft-bf16") cfg.draft_quantize = false;

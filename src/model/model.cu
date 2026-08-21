@@ -217,7 +217,11 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.attn.rotary_dim = S.rotary_dims;
   m.attn.rope_theta = float(S.rope_theta);
   m.attn.rms_eps = S.rms_norm_eps;
-  m.max_ctx = opt.max_ctx;
+  // --max-context auto (opt.max_ctx == 0): size the KV cache from whatever the
+  // device has left once everything else is resident. Until then use the model's
+  // trained maximum, so any scratch sized from max_ctx is an upper bound.
+  const bool auto_ctx = (opt.max_ctx <= 0);
+  m.max_ctx = auto_ctx ? S.max_position_embeddings : opt.max_ctx;
   m.max_batch = opt.max_batch;
   m.lm_head_bits = opt.lm_head_bits;
 
@@ -271,7 +275,21 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
 
   // ---- embeddings and lm_head ------------------------------------------
   const auto& emb = st.get("model.language_model.embed_tokens.weight");
-  {
+  if (opt.embed_host) {
+    // Straight off the mapping into our own host buffer, in bf16. The embedding
+    // never reaches the device: it is a row gather, not a matmul, so one row per
+    // token over PCIe buys back 1.185 GiB with no accuracy cost at all.
+    m.embed_host_bf = static_cast<__nv_bfloat16*>(malloc(emb.nbytes));
+    if (!m.embed_host_bf) {
+      fprintf(stderr, "embed_host: malloc of %zu bytes failed\n", emb.nbytes);
+      abort();
+    }
+    memcpy(m.embed_host_bf, emb.data, emb.nbytes);
+    CKM(cudaHostAlloc(reinterpret_cast<void**>(&m.embed_stage),
+                      size_t(m.max_batch) * S.hidden_size * 2, cudaHostAllocDefault));
+    m.embed_on_host = true;
+    m.embed_quantized = false;
+  } else {
     void* tmp = nullptr;
     CKM(cudaMalloc(&tmp, emb.nbytes));
     CKM(cudaMemcpy(tmp, emb.data, emb.nbytes, cudaMemcpyHostToDevice));
@@ -311,10 +329,10 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   }
 
   // ---- state ------------------------------------------------------------
-  const size_t kv_bytes = size_t(S.num_attn_layers) * m.max_ctx *
-                          S.num_key_value_heads * S.head_dim;
-  m.k_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
-  m.v_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
+  // The KV cache is allocated LAST, after every fixed cost is on the device, so
+  // that --max-context auto can hand it whatever is actually left. Sizing it
+  // first is what made an over-large context OOM inside a later allocation
+  // instead of being refused at startup.
   m.gdn_state = static_cast<float*>(dalloc(m, size_t(S.gdn_state_elems()) * 4));
   m.gdn_conv  = static_cast<float*>(dalloc(m, size_t(S.gdn_conv_state_elems()) * 4));
   CKM(cudaMemset(m.gdn_state, 0, size_t(S.gdn_state_elems()) * 4));
@@ -355,6 +373,33 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   gemv_scratch_alloc(m.gemv, widest, std::max(S.vocab_size, widest), GROUP, 16);
   gemm_workspace_alloc(m.gemm, 256ull << 20);
   m.owned.push_back(m.gemm.wbuf);
+
+  // ---- KV cache, sized against what is actually left --------------------
+  const size_t kv_per_token = size_t(S.num_attn_layers) * S.num_key_value_heads *
+                              S.head_dim;   // per side; k and v are separate
+  const size_t margin = 512ull << 20;
+  CKM(cudaMemGetInfo(&free_b, &total_b));
+  if (auto_ctx) {
+    const size_t avail = free_b > margin ? free_b - margin : 0;
+    size_t fit = avail / (2 * kv_per_token);
+    fit = (fit / 256) * 256;                       // whole graph buckets
+    if (fit > size_t(S.max_position_embeddings)) fit = S.max_position_embeddings;
+    if (fit < 1024) {
+      fprintf(stderr, "\nFATAL: only %.0f MB free after the model and workspaces; "
+                      "not enough for a usable KV cache.\n", free_b / 1048576.0);
+      abort();
+    }
+    m.max_ctx = int(fit);
+    if (opt.verbose)
+      printf("\n--max-context auto -> %d tokens (%.2f GiB of KV, %.0f MB margin)\n",
+             m.max_ctx, double(2 * kv_per_token * m.max_ctx) / (1 << 30),
+             margin / 1048576.0);
+  }
+  const size_t kv_bytes = kv_per_token * m.max_ctx;
+  m.k_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
+  m.v_cache = static_cast<uint8_t*>(dalloc(m, kv_bytes));
+  // splits depend on the final context, and the eager and graph paths must agree
+  m.graph_splits = attn_decode_splits(m.max_ctx);
 
   CKM(cudaMemGetInfo(&free_b, &total_b));
   if (opt.verbose) {
@@ -584,12 +629,20 @@ void head(Model& m, int T) {
 
 void model_prefill(Model& m, const int32_t* ids, int T, int position) {
   const ModelShape& S = m.shape;
+  // The activation buffers, m.id_buf and the embedding staging buffer are all
+  // sized for max_batch. A caller chunking by anything wider silently walks off
+  // the end of them.
+  if (T > m.max_batch) {
+    fprintf(stderr, "model_prefill: T=%d exceeds max_batch=%d\n", T, m.max_batch);
+    abort();
+  }
   CKM(cudaMemcpy(m.id_buf, ids, size_t(T) * 4, cudaMemcpyHostToDevice));
   std::vector<int32_t> pos(T);
   for (int i = 0; i < T; ++i) pos[i] = position + i;
   CKM(cudaMemcpy(m.pos_buf, pos.data(), size_t(T) * 4, cudaMemcpyHostToDevice));
-  if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
-  else                   embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
+  if (m.embed_on_host)        embed_rows_host(m, ids, T);
+  else if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
+  else                        embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
   if (m.dbg_hidden)
     CKM(cudaMemcpy(m.dbg_hidden, m.h, size_t(T) * S.hidden_size * 2, cudaMemcpyDeviceToDevice));
   rope_tables(m.cos_tab, m.sin_tab, m.pos_buf, m.pos_buf, m.pos_buf, T,
@@ -633,10 +686,16 @@ void model_graph_capture(Model& m) {
   cublasSetStream(m.cublas, m.capture_stream);
 
   auto body = [&]() {
-    if (m.embed_quantized)
+    // With a host-resident table the row is DMA'd into m.h before the graph is
+    // launched: the gather index is host data and cannot be a graph node. The
+    // graph therefore starts at the rope tables, and m.h is a graph input.
+    if (m.embed_on_host) {
+      /* filled by embed_rows_host() outside the capture */
+    } else if (m.embed_quantized) {
       embed_int8(m.h, m.embed_q, m.embed_scale, m.d_step, 1, S.hidden_size, m.stream);
-    else
+    } else {
       embed_bf16(m.h, m.embed_bf, m.d_step, 1, S.hidden_size, m.stream);
+    }
     rope_tables_dev(m.cos_tab, m.sin_tab, m.d_step + 1, S.rotary_dims,
                     float(S.rope_theta), m.stream);
     for (int i = 0; i < S.num_hidden_layers; ++i)
@@ -678,8 +737,9 @@ void model_forward_all_logits(Model& m, const int32_t* ids, int T, int position,
   std::vector<int32_t> pos(T);
   for (int i = 0; i < T; ++i) pos[i] = position + i;
   CKM(cudaMemcpyAsync(m.pos_buf, pos.data(), size_t(T) * 4, cudaMemcpyHostToDevice, m.stream));
-  if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
-  else                   embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
+  if (m.embed_on_host)        embed_rows_host(m, ids, T);
+  else if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
+  else                        embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
   rope_tables(m.cos_tab, m.sin_tab, m.pos_buf, m.pos_buf, m.pos_buf, T,
               S.rotary_dims, float(S.rope_theta), m.stream);
   for (int i = 0; i < S.num_hidden_layers; ++i) run_layer(m, i, T, position, T > 1);
@@ -704,6 +764,7 @@ void model_decode(Model& m, int32_t id, int position) {
     m.graph_splits = m.graph_splits_of[g];
     m.h_step[0] = id; m.h_step[1] = position; m.h_step[2] = position + 1;
     CKM(cudaMemcpy(m.d_step, m.h_step, 12, cudaMemcpyHostToDevice));
+    if (m.embed_on_host) embed_rows_host(m, &id, 1);
     CKM(cudaGraphLaunch(m.graph_exec[g], m.stream));
     m.ctx_len = position + 1;
     return;
@@ -750,6 +811,20 @@ void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int 
                  S.hidden_size, &zero, out, CUDA_R_16BF, S.vocab_size,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   }
+}
+
+void embed_rows_host(Model& m, const int32_t* ids, int T) {
+  const int H = m.shape.hidden_size;
+  if (T > m.max_batch) { fprintf(stderr, "embed_rows_host: T %d > max_batch\n", T); abort(); }
+  for (int i = 0; i < T; ++i) {
+    const int32_t id = ids[i];
+    if (id < 0 || id >= m.shape.vocab_size) {
+      fprintf(stderr, "embed_rows_host: token %d out of range\n", id);
+      abort();
+    }
+    memcpy(m.embed_stage + size_t(i) * H, m.embed_host_bf + size_t(id) * H, size_t(H) * 2);
+  }
+  CKM(cudaMemcpyAsync(m.h, m.embed_stage, size_t(T) * H * 2, cudaMemcpyHostToDevice, m.stream));
 }
 
 void model_enable_taps(Model& m, const std::vector<int>& layer_ids) {

@@ -136,6 +136,16 @@ target_link_libraries(bench_decode PRIVATE qwen_model)
 add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
+# ---------------------------------------------------------------- vision
+add_library(qwen_vision STATIC src/vision/vit.cu)
+target_link_libraries(qwen_vision PUBLIC qwen_core CUDA::cublas)
+target_include_directories(qwen_vision PUBLIC src third_party)
+
+add_executable(gate_vision tests/gate_vision.cu)
+target_link_libraries(gate_vision PRIVATE qwen_vision)
+add_test(NAME vision COMMAND gate_vision ${QWEN38_MODEL_DIR}
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/vision)
+
 # ---------------------------------------------------------------- prefix cache
 add_library(qwen_cache STATIC src/cache/prefix.cu)
 target_link_libraries(qwen_cache PUBLIC qwen_model)

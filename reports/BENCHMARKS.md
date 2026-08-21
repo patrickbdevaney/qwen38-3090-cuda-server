@@ -30,16 +30,30 @@ differences smaller than that are not claimed as differences.
 ./build/bench_decode $MODEL 131072 8 1
 ```
 
+```
+./build/bench_decode $MODEL 262144 8 1 2048 1     # last arg: embed on host
+```
+
 | ctx | median ms | p95 ms | tok/s | vs 4K |
 |---|---|---|---|---|
-| 4096 | 21.84 | 22.84 | **45.8** | 100% |
-| 16384 | 23.18 | 24.21 | 43.1 | 94% |
-| 32768 | 24.56 | 25.94 | 40.7 | 89% |
-| 65536 | 26.73 | 27.92 | 37.4 | 82% |
-| 131072 | 32.21 | 32.49 | 31.0 | 68% |
+| 4096 | 21.92 | 22.47 | **45.6** | 100% |
+| 16384 | 23.24 | 23.55 | 43.0 | 94% |
+| 32768 | 24.97 | 28.26 | 40.0 | 88% |
+| 65536 | 26.92 | 28.84 | 37.2 | 81% |
+| 131072 | 31.63 | 33.49 | 31.6 | 69% |
+| **262144** | 40.96 | 41.96 | **24.4** | 54% |
 
-Peak VRAM in use at `max_ctx = 131072`, sampled after the whole curve including
-CUDA graph instantiation: **20479 MiB = 21.47 GB** of 24133 MiB.
+**262144 is the model's trained maximum** (`rope_type: "default"`,
+`max_position_embeddings: 262144`), so this is the whole window, not a slice of
+it. Peak VRAM with the full 8 GiB KV resident: **23332 MiB of 24133**.
+
+At `max_ctx = 131072` the peak is **20479 MiB = 21.47 GB**.
+
+Reaching 262144 needs `--embed-host`: the embedding table is a pure row gather,
+never a matmul, so it lives in host memory and one row (10 KB) is DMA'd per
+token. That reclaims 1.185 GiB of device memory -- 38k tokens of FP8 KV -- at no
+accuracy cost, unlike quantising it further. Measured cost at 4K: within the 8%
+run-to-run spread of the device-resident path.
 
 llama.cpp on the same box, same model, same prompt style: **38.41 tok/s**
 (build 749f688, see `BASELINES.md`). So 4K decode is **1.19x llama.cpp**.
@@ -162,6 +176,31 @@ that different T picks different kernels and different cuBLAS algorithms. See
 
 ---
 
+## Vision tower
+
+```
+python3 tools/dump_vision_ref.py $MODEL --out tests/fixtures/vision --grid 16 16
+./build/gate_vision $MODEL tests/fixtures/vision
+```
+
+27-block SigLIP-style ViT, 0.858 GiB bf16, verified against the official
+transformers `Qwen3_5VisionModel`:
+
+| stage | rel error vs reference | |
+|---|---|---|
+| patch_embed + resampled pos_embed | 1.96e-03 | OK |
+| image tokens (merger output) | 2.70e-02 | OK |
+
+The first row is the tight one and it is deliberately gated: it is where an
+`align_corners` or patch-ordering mistake shows up on its own instead of smeared
+through 27 blocks. The second is the bf16 floor -- the reference itself ran on
+CPU in bf16, the same situation as `gate_dflash`.
+
+**Cost in context**: 0.858 GiB / 32 KiB per token = **28,114 tokens of FP8 KV**.
+That is why vision is a launch flag and not always-on.
+
+---
+
 ## Kernels
 
 ```
@@ -204,6 +243,7 @@ change that fixes it.
 | G5 spec, math/prose | 120 / 160 tok/s | 73.4 – 104.6 | MISS on prose |
 | G6 acceptance | >= 4.0 | 4.10 / 5.79 / 6.83 | PASS |
 | G7 peak VRAM @ 128K | <= 22.5 GB | **21.47 GB** | PASS |
+| context | 262144 (trained max) | **262144** | PASS |
 | G8 prefix cache | >= 20x | **90.5x** (gate 46.4x) | PASS |
 | G9 TTFT | <= 14 s | not measured this phase | |
 
