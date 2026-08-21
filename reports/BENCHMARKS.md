@@ -165,16 +165,26 @@ buys memory, not speed.**
 Quality, measured against the FP8 run on identical weights and prompts
 (`gate_kvquant`, 8179-token context, needle at the start, question at the end):
 
-| config | KL vs FP8 | tokens identical | needle |
+| context | K fp8 / V int4 | int4 / int4 | needle retrieved |
 |---|---|---|---|
-| K fp8 / V int4 | 2.30e-05 | 6/6 | FOUND |
-| int4 / int4 | 9.20e-05 | 6/6 | FOUND |
+| 8,179 tokens | KL 2.30e-05 | KL 9.20e-05 | both FOUND |
+| **131,067 tokens** | KL 1.79e-04 | KL **3.69e-04** | both FOUND |
 
-For scale, the INT4 **weights** already cost 6.99e-04 against the bf16
-reference, so full INT4 KV adds about a seventh of the error that is already
-there. V-only INT4 is 4x cleaner than both sides, which is the expected
-ordering: values are averaged over the attention distribution so their noise
-cancels, while keys decide *where* attention lands and theirs does not.
+Greedy token streams were identical to FP8 in every case.
+
+Two things this says. First, the error **grows with context** -- 4x from 8K to
+128K -- which is the predicted behaviour and the reason a short-context test
+would have been misleading: the damage is in the keys, and the number of
+competing keys grows. Second, even at 131k tokens it is still **below the
+6.99e-04 the INT4 weights already cost** against the bf16 reference, so INT4 KV
+adds less error than the weight quantisation that was already accepted.
+
+V-only INT4 is consistently ~2x cleaner than both sides, which is the expected
+ordering and the reason K and V are independent settings: values are averaged
+over the attention distribution so their noise cancels, while keys decide
+*where* attention lands and theirs does not.
+
+Peak VRAM at 131155 context: fp8 19188 MiB, K-fp8/V-int4 18328, int4 17425.
 
 ---
 

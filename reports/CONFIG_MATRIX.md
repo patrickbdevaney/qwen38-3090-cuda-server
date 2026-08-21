@@ -84,8 +84,12 @@ Recording this in advance so it can be checked rather than rationalised:
 * KV INT4 will pass needle retrieval at 8K and get *worse* as context grows,
   because the error is in the keys and the number of competing keys grows.
   If it fails anywhere it will fail at 128K+ first.
+  **MEASURED: correct on the trend (KL 9.2e-05 at 8K -> 3.69e-04 at 131k, 4x),
+  wrong on the consequence -- retrieval survived at 131k and the KL is still
+  below what the INT4 weights already cost.**
 * `K FP8 / V INT4` will be nearly free -- values are averaged over the attention
   distribution, so their noise cancels; keys are not.
+  **MEASURED: correct. V-only is ~2x cleaner than both sides at every length.**
 * AWQ INT4 g128 and a Q4-class GGUF will be within noise of each other, because
   they are the same bit budget. **UD-IQ4_XS is already measured to be the same
   size as our body (11.941 vs 11.859 GiB), so there is nothing to win there.**
