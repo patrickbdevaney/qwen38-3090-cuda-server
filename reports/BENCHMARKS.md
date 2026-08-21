@@ -124,6 +124,44 @@ the argmax. Measured fallbacks on the same server:
 
 ---
 
+## Prefix cache (multi-turn / agentic)
+
+```
+./build/gate_prefix $MODEL 3000 24 24 512
+./build/cuda_server --model $MODEL --draft $DRAFTER --prefill-chunk 512   # then two turns
+```
+
+| turn | prompt | cached | prefill | decode |
+|---|---|---|---|---|
+| 1 (cold) | 6635 | 0 | 689.7 tok/s (9.6 s) | 62.3 tok/s |
+| 2 (warm) | 6736 | **6715** | 62448 tok/s effective | 72.8 tok/s |
+
+**90.5x** on the second turn. Turn 2 answered a question that could only be
+answered from the document it never re-read.
+
+Snapshots are 150 MiB of PINNED HOST memory each and **zero device memory**, so
+the prefix cache does not compete with the KV cache. Restore costs 21 ms.
+
+Three exactness claims, tested separately by `gate_prefix`:
+
+| | claim | measured |
+|---|---|---|
+| A | store + restore is a bit-for-bit fp32 round trip | 24/24 tokens identical, exact |
+| B | resuming on a prefill chunk boundary is exact | 0 / 248320 logit bits differ |
+| C | resuming after generated tokens cannot be exact | top-1 agrees, KL 3.75e-04 |
+
+C's 3.75e-04 is smaller than the 6.99e-04 the INT4 weights already cost against
+the bf16 reference. C is the only mode that reuses generated tokens and so the
+only one that reaches the 20x bar.
+
+Related finding, independent of the cache: **chunked prefill is not
+chunk-invariant.** 1024 tokens in one call vs two differ in 215979/248320 logit
+bits (max |d| 3.44e-01). The recurrent state is carried correctly; the cause is
+that different T picks different kernels and different cuBLAS algorithms. See
+`PHASE_6.md` section 4.
+
+---
+
 ## Kernels
 
 ```
@@ -166,10 +204,10 @@ change that fixes it.
 | G5 spec, math/prose | 120 / 160 tok/s | 73.4 – 104.6 | MISS on prose |
 | G6 acceptance | >= 4.0 | 4.10 / 5.79 / 6.83 | PASS |
 | G7 peak VRAM @ 128K | <= 22.5 GB | **21.47 GB** | PASS |
-| G8 prefix cache | >= 20x | not implemented | NOT DONE |
+| G8 prefix cache | >= 20x | **90.5x** (gate 46.4x) | PASS |
 | G9 TTFT | <= 14 s | not measured this phase | |
 
-G2 and G5 are misses and are recorded as misses. G8 was never started.
+G2 and G5 are misses and are recorded as misses.
 
 G7 passed only because of Phase 7: `gemv_scratch_alloc` had been reserving a
 1.3 GB fp32 partial buffer it never needed (and, once `max_m` was introduced,
@@ -186,13 +224,14 @@ took the 128K peak from a measured 23.16 GB to 21.47 GB.
 | `gate_spec` | PASS — 4 prompts x 192 tokens, both drafters; the one divergence is exactly one bf16 ulp |
 | `gate_dflash` | PASS — drafter path 7/7 against the official reference |
 | `gate_gemm` / `gate_gemv` | PASS (numerics) |
-| `gate_forward` | **FAIL** at its own 99.5% bar: 382/384 = 99.48% teacher-forced top-1 over 4 prompts x 96 tokens, worst mean KL 6.99e-4 |
+| `gate_prefix` | PASS — snapshot round trip and chunk-aligned reuse both exact; end-of-turn reuse KL 3.75e-4 |
+| `gate_forward` | PASS — 99.74% teacher-forced top-1 counting exact bf16 ties (381/384 strict, 2 of the 3 mismatches are exact ties), worst mean KL 6.99e-4 |
 
-Full suite, `ctest --test-dir build`: **14 of 15 pass**. The one failure is
-`forward`, above.
+Full suite, `ctest --test-dir build`: **16 of 16 pass.**
 
-`gate_forward` misses by one token in 384. The two mismatches are both at
-roughly 1.5 bf16 ulp of logit gap. The bar was **not** moved to accommodate this;
-Phase 3 predicted in advance that token-exactness against PyTorch is not
-reachable through a bf16 GDN delta rule, and the honest claim is the measured
-per-step agreement, not a loosened threshold.
+`gate_forward` crossed its bar in Phase 6 rather than Phase 5, and the reason is
+worth stating precisely: routing 17..128-row prefills to the tensor-core path
+instead of cuBLAS moved which near-ties fall which way. Strict top-1 went DOWN
+(382/384 -> 381/384) while exact bf16 ties went up (0 -> 2), so the tie-inclusive
+metric crossed 99.5%. That is near-tie noise moving, not an accuracy improvement,
+and it should not be read as one. The bar was never moved.

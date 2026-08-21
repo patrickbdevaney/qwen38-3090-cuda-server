@@ -136,6 +136,17 @@ target_link_libraries(bench_decode PRIVATE qwen_model)
 add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
+# ---------------------------------------------------------------- prefix cache
+add_library(qwen_cache STATIC src/cache/prefix.cu)
+target_link_libraries(qwen_cache PUBLIC qwen_model)
+
+add_executable(probe_chunk tests/probe_chunk.cu)
+target_link_libraries(probe_chunk PRIVATE qwen_model)
+
+add_executable(gate_prefix tests/gate_prefix.cu)
+target_link_libraries(gate_prefix PRIVATE qwen_cache)
+add_test(NAME prefix_cache COMMAND gate_prefix ${QWEN38_MODEL_DIR} 3000 24 24 512)
+
 # ---------------------------------------------------------------- drafter
 add_library(qwen_draft STATIC src/draft/dflash.cu)
 target_link_libraries(qwen_draft PUBLIC qwen_model)
@@ -171,7 +182,7 @@ target_link_libraries(bench_spec PRIVATE qwen_spec)
 add_library(qwen_server STATIC
   src/server/server.cpp
   src/server/reasoning_parser.cpp)
-target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer qwen_spec)
+target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer qwen_spec qwen_cache)
 target_include_directories(qwen_server PUBLIC src third_party)
 
 add_executable(cuda_server src/main.cpp)

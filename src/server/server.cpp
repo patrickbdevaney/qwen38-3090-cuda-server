@@ -25,6 +25,7 @@
 #include "../../third_party/json.hpp"
 #include "../model/model.h"
 #include "../spec/spec.h"
+#include "../cache/prefix.h"
 #include "../tokenizer/bpe.h"
 #include "../tokenizer/chat_template.h"
 #include "../kernels/sampling.cuh"
@@ -53,6 +54,7 @@ Model*        g_model = nullptr;
 Tokenizer*    g_tok = nullptr;
 SamplerState  g_sampler;
 DraftModel*   g_draft = nullptr;
+PrefixCache*  g_prefix = nullptr;
 SpecState*    g_spec = nullptr;
 ServerConfig  g_cfg;
 Metrics       g_metrics;
@@ -101,6 +103,7 @@ struct GenResult {
   int prompt_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
   double ttft_s = 0, decode_tok_s = 0, prefill_tok_s = 0;
   int spec_rounds = 0, spec_committed = 0;
+  int cached_tokens = 0;
   std::string finish_reason = "stop";
 };
 
@@ -115,8 +118,6 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   const auto t0 = std::chrono::steady_clock::now();
 
   sampler_reset_counts(g_sampler);
-  cudaMemset(m.gdn_state, 0, size_t(m.shape.gdn_state_elems()) * 4);
-  cudaMemset(m.gdn_conv, 0, size_t(m.shape.gdn_conv_state_elems()) * 4);
 
   // Speculation is GREEDY ONLY: the acceptance rule is argmax equality, so it
   // reproduces greedy decoding and nothing else. A sampled request quietly falls
@@ -132,6 +133,10 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   const bool use_spec = g_draft && g_spec && greedy;
   if (use_spec) {
     model_enable_taps(m, g_draft->sh.target_layer_ids);
+    // The drafter's context cache is not part of the prefix snapshot yet, so on
+    // a cache hit it restarts from wherever the prefill resumed. Correct -- every
+    // drafted token is still verified -- but the drafter sees a shorter window
+    // than its 2048 for a while, so acceptance dips until enough tokens commit.
     draft_reset(*g_draft);
   }
   // Everything below this is outside the drafter's sliding window by the time
@@ -140,14 +145,32 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
       use_spec && g_draft->sh.sliding_window > 0
           ? std::max<int>(0, int(ids.size()) - g_draft->sh.sliding_window + 1) : 0;
 
+  // Prefix reuse. The recurrent state cannot be truncated to an arbitrary
+  // position, only restored at one that was snapshotted, so this either finds a
+  // snapshot covering a prefix of this request or starts cold.
+  int reuse = 0, slot = -1;
+  if (g_prefix) reuse = prefix_lookup(*g_prefix, ids, &slot);
+  if (reuse > 0) {
+    prefix_restore(*g_prefix, m, slot);
+    r.cached_tokens = reuse;
+  } else {
+    prefix_cold(m);
+  }
+
   // chunked prefill
-  int pos = 0;
+  int pos = reuse;
   const int chunk = m.max_batch;
   while (pos < int(ids.size())) {
     const int n = std::min<int>(chunk, int(ids.size()) - pos);
     model_prefill(m, ids.data() + pos, n, pos);
     if (use_spec) spec_push_taps(*g_draft, m.taps, n, pos, window_floor);
     pos += n;
+  }
+  if (g_prefix) {
+    prefix_set_kv(*g_prefix, ids);
+    // Snapshot at the end of prefill: this is the branch point for a prompt that
+    // gets re-sent or extended without the assistant's reply.
+    prefix_store(*g_prefix, m, ids, int(ids.size()));
   }
   cudaDeviceSynchronize();
   const auto t_prefill = std::chrono::steady_clock::now();
@@ -171,6 +194,7 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   // of them at once; the emit path below is identical either way, so streaming,
   // stop strings and the reasoning splitter see exactly the same sequence.
   std::deque<int32_t> pending;
+  std::vector<int32_t> emitted;
   std::vector<int32_t> nids;
   __nv_bfloat16 *lg = nullptr, *dlg = nullptr;
   std::vector<uint16_t> hostlg;
@@ -200,6 +224,7 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     }
     const int32_t tok = pending.front();
     pending.pop_front();
+    emitted.push_back(tok);
 
     if (first) {
       r.ttft_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -231,11 +256,27 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     if (i == max_new) { r.finish_reason = "length"; break; }
     // The speculative path already advanced the model past every committed
     // token; only the plain path steps here.
-    if (!use_spec) model_decode(m, tok, pos + i - 1);
+    if (!use_spec) { model_decode(m, tok, pos); ++pos; }
   }
   if (use_spec) {
     cudaFree(lg); cudaFree(dlg);
     model_disable_taps(m);
+  }
+
+  // THE snapshot: taken at the last token that actually went through the model,
+  // which is where the next turn of this conversation resumes. Marconi's finding
+  // is that this single admission point is worth more than any amount of
+  // periodic checkpointing, because conversations resume from the end.
+  if (g_prefix) {
+    std::vector<int32_t> seen = ids;
+    for (int32_t t : emitted) seen.push_back(t);
+    // `pos` is the position of the next token to be written, i.e. exactly the
+    // number of tokens the KV and the recurrent state cover.
+    const int covered = std::min<int>(pos, int(seen.size()));
+    if (covered > int(ids.size())) {
+      prefix_set_kv(*g_prefix, std::vector<int32_t>(seen.begin(), seen.begin() + covered));
+      prefix_store(*g_prefix, m, seen, covered);
+    }
   }
 
   std::string c, th;
@@ -262,6 +303,7 @@ json usage_json(const GenResult& r, int cached) {
 // without this object, taking `agent code` and `agent status` with it.
 json timings_json(const GenResult& r) {
   json t{{"prompt_n", r.prompt_tokens},
+         {"cached_n", r.cached_tokens},
          {"prompt_per_second", r.prefill_tok_s},
          {"predicted_n", r.completion_tokens},
          {"predicted_per_second", r.decode_tok_s}};
@@ -291,6 +333,16 @@ json tool_calls_json(const std::vector<ToolCall>& calls) {
 int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
   g_model = &model; g_tok = &tok; g_cfg = cfg;
   sampler_alloc(g_sampler, model.shape.vocab_size);
+
+  static PrefixCache prefix;
+  if (cfg.prefix_cache && cfg.prefix_slots > 0) {
+    prefix_alloc(prefix, model, cfg.prefix_slots);
+    g_prefix = &prefix;
+    printf("prefix cache: %d slots x %.0f MiB pinned host = %.2f GiB host, 0 device\n",
+           cfg.prefix_slots,
+           double(prefix.state_elems + prefix.conv_elems) * 4 / (1 << 20),
+           double(prefix.host_bytes) / (1 << 30));
+  }
 
   static DraftModel draft;
   static SpecState spec;

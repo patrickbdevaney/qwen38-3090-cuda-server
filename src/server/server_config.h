@@ -12,5 +12,10 @@ struct ServerConfig {
   // argmax equality; a sampled request falls back to plain decode.
   std::string draft_dir;
   bool draft_quantize = true;
+
+  // Prefix cache. Snapshots live in pinned host memory, so slots cost host RAM
+  // and no device memory at all.
+  int  prefix_slots = 4;
+  bool prefix_cache = true;
 };
 }  // namespace qwen

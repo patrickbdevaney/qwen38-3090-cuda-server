@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
   const int quant_lm = argc > 3 ? atoi(argv[3]) : 1;
 
   qwen::Model m; qwen::LoadOptions o;
-  o.max_ctx = max_ctx; o.max_batch = 4096;
+  o.max_ctx = max_ctx; o.max_batch = (argc > 5) ? atoi(argv[5]) : 4096;
   o.lm_head_bits = quant_lm; o.quantize_embed = true;
   qwen::model_load(m, md, o);
   printf("\nlm_head %d-bit, max_ctx %d\n", o.lm_head_bits, max_ctx);

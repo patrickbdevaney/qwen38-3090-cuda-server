@@ -399,7 +399,16 @@ static LinPath lin_path(int T) {
   if (mode < 0) { const char* e = getenv("QWEN_LINPATH"); mode = e ? atoi(e) : 0; }
   if (T == 1) return LinPath::Gemv;
   if (mode == 1) return LinPath::Cublas;          // debug: no MMA
-  if (T <= 16) return LinPath::Mma;
+  // The tensor-core path takes at most 16 rows per launch, but it is weight-
+  // stream bound and nearly flat in M, so chunking it by 16 costs a pass over
+  // the weights per chunk and nothing else. cuBLAS, by contrast, dequantises
+  // every weight to bf16 into a workspace first -- a fixed ~250 ms for the whole
+  // model, measured at 12.55x a decode step at T=8. So cuBLAS only wins once T
+  // is large enough to amortise that, which is far past 16. Getting this
+  // crossover wrong made a 25-token warm prefill cost 286 ms.
+  static int maxt = 0;
+  if (!maxt) { const char* e = getenv("QWEN_MMA_MAX_T"); maxt = e ? atoi(e) : 128; }
+  if (T <= maxt) return LinPath::Mma;
   return LinPath::Cublas;
 }
 
@@ -411,7 +420,13 @@ static void linear(Model& m, __nv_bfloat16* out, const W4A16Weights& w,
                     T, w.in_f, w.out_f, w.group_size, int(lin_path(T))); }
   switch (lin_path(T)) {
     case LinPath::Gemv:   gemv_w4a16(out, w, in, m.gemv, m.stream); break;
-    case LinPath::Mma:    gemm_mma_w4a16(out, w, in, T, m.gemv, m.stream); break;
+    case LinPath::Mma:
+      for (int i = 0; i < T; i += 16) {
+        const int n = std::min(16, T - i);
+        gemm_mma_w4a16(out + size_t(i) * w.out_f, w, in + size_t(i) * w.in_f, n,
+                       m.gemv, m.stream);
+      }
+      break;
     case LinPath::Cublas: gemm_w4a16(out, w, in, T, m.gemm, m.stream); break;
   }
 }
