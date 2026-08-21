@@ -7,5 +7,6 @@ struct ServerConfig {
   std::string model_alias = "qwen38-27b";
   int max_ctx = 32768;
   bool verbose = false;
+  std::string webui_path = "src/clients/webui/index.html";
 };
 }  // namespace qwen

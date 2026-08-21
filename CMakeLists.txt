@@ -22,6 +22,16 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --default-stream per-thread --expt-relaxed-constexpr")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -lineinfo")
 
+# Checkpoint paths. $ENV{} is evaluated at CONFIGURE time, so a reconfigure in a
+# shell without these exported would silently give every gate an empty path.
+# Cache variables keep them once set.
+set(QWEN38_MODEL_DIR "${QWEN38_MODEL_DIR}" CACHE PATH "W4A16 checkpoint directory")
+set(QWEN38_BF16_DIR  "${QWEN38_BF16_DIR}"  CACHE PATH "BF16 reference checkpoint (gates only)")
+if(NOT QWEN38_MODEL_DIR)
+  message(WARNING "QWEN38_MODEL_DIR is unset; model-dependent gates will fail. "
+                  "Configure with -DQWEN38_MODEL_DIR=/path/to/checkpoint")
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -52,7 +62,7 @@ add_test(NAME nfc COMMAND gate_nfc ${CMAKE_SOURCE_DIR}/tests/fixtures/nfc_cases.
 add_executable(gate_tokenizer tests/gate_tokenizer.cpp)
 target_link_libraries(gate_tokenizer PRIVATE qwen_tokenizer)
 add_test(NAME tokenizer COMMAND gate_tokenizer
-         $ENV{QWEN38_MODEL_DIR}/tokenizer.json
+         ${QWEN38_MODEL_DIR}/tokenizer.json
          ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/corpus.jsonl
          ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/meta.json)
 
@@ -60,15 +70,15 @@ add_executable(gate_chat_template tests/gate_chat_template.cpp)
 target_link_libraries(gate_chat_template PRIVATE qwen_tokenizer)
 add_test(NAME chat_template COMMAND gate_chat_template
          ${CMAKE_SOURCE_DIR}/tests/fixtures/chat/fixtures.jsonl
-         $ENV{QWEN38_MODEL_DIR}/tokenizer.json)
+         ${QWEN38_MODEL_DIR}/tokenizer.json)
 
 add_executable(gate_config tests/gate_config.cpp)
 target_link_libraries(gate_config PRIVATE qwen_core)
-add_test(NAME config COMMAND gate_config $ENV{QWEN38_MODEL_DIR}/config.json)
+add_test(NAME config COMMAND gate_config ${QWEN38_MODEL_DIR}/config.json)
 
 add_executable(gate_dequant tests/gate_dequant.cpp)
 target_link_libraries(gate_dequant PRIVATE qwen_core)
-add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
+add_test(NAME dequant COMMAND gate_dequant ${QWEN38_MODEL_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/dequant)
 
 add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu
@@ -80,16 +90,16 @@ set_target_properties(qwen_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 add_executable(gate_gemv tests/gate_gemv.cu)
 target_link_libraries(gate_gemv PRIVATE qwen_core qwen_kernels)
-add_test(NAME gemv_numerics COMMAND gate_gemv $ENV{QWEN38_MODEL_DIR})
+add_test(NAME gemv_numerics COMMAND gate_gemv ${QWEN38_MODEL_DIR})
 
 add_executable(gate_gemm tests/gate_gemm.cu)
 target_link_libraries(gate_gemm PRIVATE qwen_core qwen_kernels)
-add_test(NAME gemm_prefill COMMAND gate_gemm $ENV{QWEN38_MODEL_DIR})
+add_test(NAME gemm_prefill COMMAND gate_gemm ${QWEN38_MODEL_DIR})
 
 add_executable(gate_gdn tests/gate_gdn.cu)
 target_link_libraries(gate_gdn PRIVATE qwen_core qwen_kernels)
 add_test(NAME gdn COMMAND gate_gdn ${CMAKE_SOURCE_DIR}/tests/fixtures/gdn
-         $ENV{QWEN38_BF16_DIR})
+         ${QWEN38_BF16_DIR})
 
 add_executable(bench_gdn bench/bench_gdn.cu)
 target_link_libraries(bench_gdn PRIVATE qwen_kernels)
@@ -97,14 +107,14 @@ target_link_libraries(bench_gdn PRIVATE qwen_kernels)
 add_executable(gate_attn tests/gate_attn.cu)
 target_link_libraries(gate_attn PRIVATE qwen_core qwen_kernels)
 add_test(NAME attn COMMAND gate_attn ${CMAKE_SOURCE_DIR}/tests/fixtures/attn
-         $ENV{QWEN38_BF16_DIR})
+         ${QWEN38_BF16_DIR})
 
 add_executable(bench_attn bench/bench_attn.cu)
 target_link_libraries(bench_attn PRIVATE qwen_kernels)
 
 add_executable(bench_decode_gemv bench/bench_decode_gemv.cu)
 target_link_libraries(bench_decode_gemv PRIVATE qwen_core qwen_kernels)
-add_test(NAME gemv_bandwidth COMMAND bench_decode_gemv $ENV{QWEN38_MODEL_DIR})
+add_test(NAME gemv_bandwidth COMMAND bench_decode_gemv ${QWEN38_MODEL_DIR})
 
 # ---------------------------------------------------------------- model
 add_library(qwen_model STATIC src/model/model.cu)
@@ -112,12 +122,12 @@ target_link_libraries(qwen_model PUBLIC qwen_core qwen_kernels)
 
 add_executable(gate_forward tests/gate_forward.cu)
 target_link_libraries(gate_forward PRIVATE qwen_model)
-add_test(NAME forward COMMAND gate_forward $ENV{QWEN38_MODEL_DIR}
+add_test(NAME forward COMMAND gate_forward ${QWEN38_MODEL_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/reference 8 1 128)
 
 add_executable(gate_graph tests/gate_graph.cu)
 target_link_libraries(gate_graph PRIVATE qwen_model)
-add_test(NAME cuda_graph COMMAND gate_graph $ENV{QWEN38_MODEL_DIR})
+add_test(NAME cuda_graph COMMAND gate_graph ${QWEN38_MODEL_DIR})
 
 add_executable(bench_decode bench/bench_decode.cu)
 target_link_libraries(bench_decode PRIVATE qwen_model)

@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     bool in_reason = false;
     printf("\033[1;36mbot>\033[0m ");
     fflush(stdout);
-    cli.Post("/v1/chat/completions", body.dump(), "application/json",
+    cli.Post("/v1/chat/completions", httplib::Headers{}, body.dump(), "application/json",
              [&](const char* data, size_t len) {
                buf.append(data, len);
                size_t p;

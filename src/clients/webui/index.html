@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>qwen38-3090-cuda-server</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#fbfbfa;--fg:#1a1a19;--dim:#6b6b66;--line:#e3e3df;--acc:#2f6f4e;--code:#f2f2ef}
+@media(prefers-color-scheme:dark){:root{--bg:#141414;--fg:#e8e8e4;--dim:#9a9a92;--line:#2c2c2a;--acc:#7fbf9a;--code:#1e1e1d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
+header{padding:.7rem 1rem;border-bottom:1px solid var(--line);display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
+header b{font-weight:650}
+header .sp{flex:1}
+label{font-size:13px;color:var(--dim);display:flex;gap:.35rem;align-items:center}
+select,button{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+button{cursor:pointer}
+#log{flex:1;overflow-y:auto;padding:1rem;display:flex;flex-direction:column;gap:1rem}
+.msg{max-width:min(46rem,100%);white-space:pre-wrap;overflow-wrap:anywhere}
+.you{align-self:flex-end;background:var(--code);padding:.6rem .8rem;border-radius:10px}
+.bot{align-self:flex-start}
+details{border-left:2px solid var(--line);padding-left:.7rem;margin-bottom:.5rem;color:var(--dim);font-size:13.5px}
+summary{cursor:pointer;color:var(--acc);font-size:13px}
+pre{background:var(--code);padding:.7rem;border-radius:8px;overflow-x:auto}
+code{background:var(--code);padding:.1rem .3rem;border-radius:4px;font-size:13.5px}
+pre code{background:none;padding:0}
+form{display:flex;gap:.5rem;padding:.75rem 1rem;border-top:1px solid var(--line)}
+textarea{flex:1;resize:none;font:inherit;padding:.55rem .7rem;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);max-height:9rem}
+footer{padding:.3rem 1rem .6rem;font-size:12px;color:var(--dim);border-top:1px solid var(--line)}
+</style>
+<header>
+  <b>qwen38-3090</b>
+  <label>thinking <select id=think><option value=on>on</option><option value=off>off</option></select></label>
+  <label>effort <select id=effort><option>xhigh</option><option>medium</option><option>low</option></select></label>
+  <span class=sp></span>
+  <button id=clear>new chat</button>
+</header>
+<div id=log></div>
+<form id=f><textarea id=q rows=1 placeholder="Message... (Enter to send, Shift+Enter for newline)"></textarea><button>Send</button></form>
+<footer id=stat>ready</footer>
+<script>
+const log=document.getElementById('log'), f=document.getElementById('f'), q=document.getElementById('q');
+const stat=document.getElementById('stat'), think=document.getElementById('think'), effort=document.getElementById('effort');
+let history=[], busy=false;
+document.getElementById('clear').onclick=()=>{history=[];log.innerHTML='';stat.textContent='ready'};
+q.addEventListener('input',()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,144)+'px'});
+q.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();f.requestSubmit()}});
+function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function md(s){
+  return esc(s)
+    .replace(/```(\w*)\n([\s\S]*?)```/g,(m,l,c)=>'<pre><code>'+c+'</code></pre>')
+    .replace(/`([^`\n]+)`/g,'<code>$1</code>');
+}
+f.onsubmit=async e=>{
+  e.preventDefault();
+  if(busy) return;
+  const text=q.value.trim(); if(!text) return;
+  q.value=''; q.style.height='auto'; busy=true;
+  const u=document.createElement('div'); u.className='msg you'; u.textContent=text; log.appendChild(u);
+  history.push({role:'user',content:text});
+  const b=document.createElement('div'); b.className='msg bot';
+  const det=document.createElement('details'); det.open=true;
+  det.innerHTML='<summary>thinking...</summary><div></div>';
+  const rbox=det.querySelector('div');
+  const cbox=document.createElement('div');
+  b.append(det,cbox); log.appendChild(b); log.scrollTop=log.scrollHeight;
+  let content='',reasoning='',t0=performance.now(),n=0;
+  try{
+    const res=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:history,stream:true,max_tokens:4096,
+        enable_thinking:think.value==='on',reasoning_effort:effort.value,
+        stream_options:{include_usage:true}})});
+    const rd=res.body.getReader(), dec=new TextDecoder(); let buf='';
+    for(;;){
+      const r=await rd.read(); if(r.done) break;
+      buf+=dec.decode(r.value,{stream:true});
+      let i;
+      while((i=buf.indexOf('\n\n'))>=0){
+        const fr=buf.slice(0,i); buf=buf.slice(i+2);
+        if(!fr.startsWith('data:')) continue;
+        const p=fr.slice(5).trim(); if(p==='[DONE]') continue;
+        let j; try{j=JSON.parse(p)}catch(_){continue}
+        if(j.usage) stat.textContent=j.usage.completion_tokens+' tok · '+(j.timings?j.timings.predicted_per_second.toFixed(1):'?')+' tok/s · '+j.usage.prompt_tokens+' prompt';
+        for(const c of (j.choices||[])){
+          const d=c.delta||{};
+          if(d.reasoning_content){reasoning+=d.reasoning_content; rbox.textContent=reasoning; n++}
+          if(d.content){content+=d.content; cbox.innerHTML=md(content); n++}
+          if(d.tool_calls){cbox.innerHTML+='<pre><code>tool_calls '+esc(JSON.stringify(d.tool_calls,null,1))+'</code></pre>'}
+        }
+        log.scrollTop=log.scrollHeight;
+      }
+    }
+  }catch(err){cbox.textContent='[error] '+err}
+  if(!reasoning) det.remove(); else {det.open=false; det.querySelector('summary').textContent='thinking';}
+  if(!stat.textContent.includes('tok/s')) stat.textContent=n+' deltas · '+((performance.now()-t0)/1000).toFixed(1)+'s';
+  history.push({role:'assistant',content});
+  busy=false; q.focus();
+};
+</script>

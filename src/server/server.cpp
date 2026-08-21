@@ -236,6 +236,21 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
                     "application/json");
   });
 
+  srv.Get("/", [&](const httplib::Request&, httplib::Response& res) {
+    cors(res);
+    FILE* fp = fopen((g_cfg.webui_path).c_str(), "rb");
+    if (!fp) {
+      res.set_content("qwen38-3090-cuda-server\nendpoints: /health /v1/models "
+                      "/v1/chat/completions /v1/completions /metrics\n", "text/plain");
+      return;
+    }
+    std::string body;
+    char b[8192]; size_t n;
+    while ((n = fread(b, 1, sizeof b, fp)) > 0) body.append(b, n);
+    fclose(fp);
+    res.set_content(body, "text/html; charset=utf-8");
+  });
+
   srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
     cors(res);
     res.set_content(json{{"object", "list"},
