@@ -62,12 +62,16 @@ are configurable independently and `K FP8 / V INT4` is the conservative step.
 
 ## Left to do
 
-1. **Vision, toggleable.** 27-block SigLIP-style ViT, 0.858 GiB. Costs 28K
-   tokens of context when enabled, which is why it is a launch flag.
-2. **A lower GGUF quant, if the headroom is wanted.** The container and all 13
-   dequantisers are in and gated; what is missing is the fused GEMV that
-   consumes the blocks without a dequantised round trip. Only worth building
-   against a quant that actually frees memory -- UD-IQ4_XS does not.
+1. ~~**Vision, toggleable.**~~ DONE -- see reports/PHASE_9.md.
+2. **A GGUF loader in `model.cu`.** The container, all 13 dequantisers and the
+   fused GEMV are in and gated; what is missing is the path that maps GGUF
+   tensor names onto `LayerWeights` and dispatches the linears to `gguf_gemv`
+   instead of the AWQ GEMV. Until that exists no GGUF checkpoint runs end to
+   end, which is why there is no GGUF row in reports/QUANT_ACCURACY.md and why
+   "AWQ and GGUF are viable substitutes" cannot yet be claimed. The kernel side
+   is at a composition-weighted 355 GB/s, about 61% of llama.cpp; the next lever
+   there is moving the IQ4_XS/IQ3_S codebook lookups into shared memory, since
+   those two types are two thirds of UD-Q3_K_XL by bytes.
 3. **RoPE extension past 262144.** The real prize of a smaller quant: more KV
    headroom is only useful if the positions above 262144 are usable, which needs
    YaRN-style extrapolation. Quality there has to be measured, not assumed.
@@ -115,32 +119,34 @@ is why the bar is set here rather than lower:
   weights. Measured on this model: INT4 `lm_head` gives KL 1.8e-2 against INT8's
   7.8e-4, which is why the head is INT8.
 
-### FUTURE OPTION, not a blocker: measure KLD per quant on this model
+### DONE: KL against true BF16, measured on this box
 
-There is a real gap in the argument above. Our measured 6.99e-4 KL is against a
-BF16 model **dequantised from the INT4 checkpoint**, so it quantifies *kernel
-fidelity*, not AWQ's quantisation loss. The table it is compared against is
-Unsloth's, measured on a different model. Nobody has measured this model's
-quants against true BF16 on this box.
+This was the gap: our 6.99e-4 KL was against a BF16 model **dequantised from the
+INT4 checkpoint**, so it quantified *kernel fidelity*, not AWQ's quantisation
+loss, and it was compared against Unsloth's table for a different model. That is
+now measured directly — see `reports/QUANT_ACCURACY.md`.
 
-`llama.cpp` ships the tool for it:
+The `llama-perplexity --kl-divergence` route sketched here was not the one taken.
+It only compares GGUF against GGUF inside llama.cpp, which cannot say anything
+about our AWQ path or about EXL3, and it scores wikitext-shaped text. Instead
+`tools/quantcmp_*` runs the real `Qwen/Qwen3.8-27B` BF16 through HF with layer
+offload, teacher-forces a prompt set built from agentic-coding workloads, and
+scores any engine that can emit fp16 logits for the same token ids:
 
-```bash
-# once: reference logits from the F16 GGUF (~54 GB on disk, partial offload)
-llama-perplexity -m Qwen3.8-27B-F16.gguf -f corpus.txt --kl-divergence-base base.dat
-# then per candidate
-llama-perplexity -m Qwen3.8-27B-UD-IQ4_XS.gguf -f corpus.txt --kl-divergence-base base.dat --kl-divergence
-```
+| | KL mean | KL p99 | top-1 |
+|---|---:|---:|---:|
+| ours, AWQ INT4 + INT8 head | 1.495e-01 | 4.263 | 98.56% |
+| EXL3 3.00bpw | 1.672e-01 | 5.216 | 97.74% |
+| EXL3 3.50bpw (VRAM-matched) | **1.308e-01** | **3.493** | 98.51% |
 
-That yields per-quant KL divergence **and top-1 agreement on this model**, for
-IQ4_XS / Q3_K_XL / Q2_K_XL side by side. Corpus should be the workload, not
-wikitext: agent transcripts, tool-call JSON, and repository code.
+The headline finding is the *shape*: median KL 5e-05, p99 4.26. Quantisation
+error concentrates on a few positions and is invisible in an average, so any
+future quant decision on this repo should be made on the tail, not the mean.
 
-**This is deliberately deferred.** Its value is finding whether a *lower* quant
-is viable on our actual workload and therefore buys headroom for RoPE-extended
-context — which is an optimisation on top of a finished server, not a
-prerequisite for one. Implementing GGUF, vision and the rest comes first; the
-measurement tells us how far down the ladder we are allowed to go afterwards.
+**Still open: a GGUF row.** It needs a GGUF loader in `model.cu`, which does not
+exist — the container, dequantiser and fused GEMV are all gated in isolation but
+nothing runs end to end. Comparing llama.cpp against a BF16 GGUF instead would
+measure llama.cpp, not us, so the row is left empty rather than faked.
 
 ## DFlash2 transfers to any quant, unchanged
 
