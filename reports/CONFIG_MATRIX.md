@@ -194,6 +194,35 @@ conclusion is unchanged and now rests on someone else's mature kernels rather
 than mine: **Q3_K_XL does not buy decode speed on this card.** It buys 0.95 GiB,
 and INT4 KV already bought 3.58.
 
+### Attempt at llama.cpp parity, and why it failed
+
+The obvious fix for the 46% dequantisation overhead is to give each lane a whole
+32-element sub-block instead of 8 elements, so the block header (and for Q3_K a
+12-byte unpack into sixteen 6-bit scales) is computed once per 32 rather than
+once per 8. Implemented, and it stayed bit-exact on all 13 types.
+
+**It made things 2.6x WORSE: 347 -> 132 GB/s.**
+
+Not register spilling -- ptxas reports 0 bytes spilled. The cause is the
+ACTIVATION reads. In the 8-element layout, one load instruction has the 32 lanes
+touching addresses 16 bytes apart, spanning 512 bytes -- 8 cache lines. With 32
+consecutive elements per lane they are 64 bytes apart, spanning 2048 bytes -- 32
+cache lines, one transaction per lane. Improving the weight access made the `x`
+access four times worse, and `x` is read for every element while a weight byte is
+read once.
+
+The remaining route is per-type vectorised byte loads: our AWQ kernel gets its
+speed partly by loading 4 bytes at a time and shifting out nibbles, instead of
+eight single-byte loads. That is blocked here by alignment -- a Q5_K block is 176
+bytes but its `qs` array starts at byte 46, so a lane's 8 bytes are not 4-byte
+aligned. Fixing it needs a format-preserving repack at load time that pads
+blocks and reorders fields to align the quant arrays, at a few percent size cost.
+
+So llama.cpp parity is reachable but it is a per-type engineering project --
+which is, fairly, what llama.cpp's K-quant kernels ARE. Recorded rather than
+hand-waved: the current kernel is 347 GB/s, the mechanism of the gap is
+understood and measured, and the next step is specified.
+
 ## The Ampere constraint that applies to every format
 
 sm_86 has **no hardware for sub-8-bit types**. Every 4-bit format pays a
