@@ -1,0 +1,11 @@
+build/
+bench/microbench
+*.o
+*.so
+*.gguf
+*.safetensors
+*.bin
+__pycache__/
+.venv/
+venv/
+weights/

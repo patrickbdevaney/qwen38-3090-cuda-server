@@ -1,0 +1,175 @@
+=== GATE 0: /home/patrickd/qwen38-weights/Qwen3.8-27B-AWQ-INT4 ===
+architectures      : ['Qwen3_5ForConditionalGeneration']
+model_type         : qwen3_5 / text qwen3_5_text
+transformers_version: 5.8.0.dev0
+
+--- 1. architecture (config.json vs directive) ---
+  [OK  ] hidden_size                  = 5120                     (expect 5120)
+  [OK  ] vocab_size                   = 248320                   (expect 248320)
+  [OK  ] num_hidden_layers            = 64                       (expect 64)
+  [OK  ] num_gdn_layers               = 48                       (expect 48)
+  [OK  ] num_attn_layers              = 16                       (expect 16)
+  [OK  ] full_attention_interval      = 4                        (expect 4)
+  [OK  ] linear_num_value_heads       = 48                       (expect 48)
+  [OK  ] linear_num_key_heads         = 16                       (expect 16)
+  [OK  ] linear_key_head_dim          = 128                      (expect 128)
+  [OK  ] linear_value_head_dim        = 128                      (expect 128)
+  [OK  ] linear_conv_kernel_dim       = 4                        (expect 4)
+  [OK  ] num_attention_heads          = 24                       (expect 24)
+  [OK  ] num_key_value_heads          = 4                        (expect 4)
+  [OK  ] head_dim                     = 256                      (expect 256)
+  [OK  ] partial_rotary_factor        = 0.25                     (expect 0.25)
+  [OK  ] rotary_dims                  = 64                       (expect 64)   -> 192 dims pass through UNROTATED (directive 8.2)
+  [OK  ] intermediate_size            = 17408                    (expect 17408)
+  [OK  ] max_position_embeddings      = 262144                   (expect 262144)
+  [OK  ] rope_theta                   = 10000000                 (expect 10000000)
+  [OK  ] mrope_section                = [11, 11, 10]             (expect [11, 11, 10])
+  [OK  ] mrope_interleaved            = True                     (expect True)
+  [OK  ] mrope_section sum       = 32 == rotary_dims/2   (tiles exactly)
+  [OK  ] layer pattern                = True                     (expect True)   16 x (L,L,L,A)
+         attention layers at indices: [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63]
+
+--- 2. budget-critical facts (directive Gate 0 / failure mode #4) ---
+  tie_word_embeddings        = False
+         -> lm_head is a SEPARATE 248320x5120 tensor. Budget it.
+  attn_output_gate           = True  (gated attention)
+  output_gate_type           = swish
+  mamba_ssm_dtype            = float32  (GDN state accum dtype)
+  mtp_num_hidden_layers      = 1  (built-in MTP head)
+  rms_norm_eps               = 1e-06
+  quantization_config        = {"config_groups": {"group_0": {"format": "pack-quantized", "input_activations": null, "output_activations": null, "targets": ["Linear"], "weights": {"actorder": null, "block_structure": null, "dynamic": false, "group_size": 32, "num_bits": 4, "observer": "mse", "observer_kwargs": {}, "scale_dtype": 
+
+--- 3. safetensors manifest ---
+  shards: 5   tensors: 2396
+       1  lm_head.weight                                                     BF16     [248320, 5120]
+       1  model.language_model.embed_tokens.weight                           BF16     [248320, 5120]
+      64  model.language_model.layers.N.input_layernorm.weight               BF16     [5120]
+      48  model.language_model.layers.N.linear_attn.A_log                    BF16     [48]
+      48  model.language_model.layers.N.linear_attn.conv1d.weight            BF16     [10240, 1, 4]
+      48  model.language_model.layers.N.linear_attn.dt_bias                  BF16     [48]
+      48  model.language_model.layers.N.linear_attn.in_proj_a.weight         BF16     [48, 5120]
+      48  model.language_model.layers.N.linear_attn.in_proj_b.weight         BF16     [48, 5120]
+      48  model.language_model.layers.N.linear_attn.in_proj_qkv.weight_packed I32      [10240, 640]
+      48  model.language_model.layers.N.linear_attn.in_proj_qkv.weight_scale BF16     [10240, 160]
+      48  model.language_model.layers.N.linear_attn.in_proj_qkv.weight_shape I64      [2]
+      48  model.language_model.layers.N.linear_attn.in_proj_qkv.weight_zero_point I32      [1280, 160]
+      48  model.language_model.layers.N.linear_attn.in_proj_z.weight_packed  I32      [6144, 640]
+      48  model.language_model.layers.N.linear_attn.in_proj_z.weight_scale   BF16     [6144, 160]
+      48  model.language_model.layers.N.linear_attn.in_proj_z.weight_shape   I64      [2]
+      48  model.language_model.layers.N.linear_attn.in_proj_z.weight_zero_point I32      [768, 160]
+      48  model.language_model.layers.N.linear_attn.norm.weight              BF16     [128]
+       1  model.language_model.layers.N.linear_attn.out_proj.weight          BF16     [5120, 6144]
+      47  model.language_model.layers.N.linear_attn.out_proj.weight_packed   I32      [5120, 768]
+      47  model.language_model.layers.N.linear_attn.out_proj.weight_scale    BF16     [5120, 192]
+      47  model.language_model.layers.N.linear_attn.out_proj.weight_shape    I64      [2]
+      47  model.language_model.layers.N.linear_attn.out_proj.weight_zero_point I32      [640, 192]
+      64  model.language_model.layers.N.mlp.down_proj.weight_packed          I32      [5120, 2176]
+      64  model.language_model.layers.N.mlp.down_proj.weight_scale           BF16     [5120, 544]
+      64  model.language_model.layers.N.mlp.down_proj.weight_shape           I64      [2]
+      64  model.language_model.layers.N.mlp.down_proj.weight_zero_point      I32      [640, 544]
+      64  model.language_model.layers.N.mlp.gate_proj.weight_packed          I32      [17408, 640]
+      64  model.language_model.layers.N.mlp.gate_proj.weight_scale           BF16     [17408, 160]
+      64  model.language_model.layers.N.mlp.gate_proj.weight_shape           I64      [2]
+      64  model.language_model.layers.N.mlp.gate_proj.weight_zero_point      I32      [2176, 160]
+      64  model.language_model.layers.N.mlp.up_proj.weight_packed            I32      [17408, 640]
+      64  model.language_model.layers.N.mlp.up_proj.weight_scale             BF16     [17408, 160]
+      64  model.language_model.layers.N.mlp.up_proj.weight_shape             I64      [2]
+      64  model.language_model.layers.N.mlp.up_proj.weight_zero_point        I32      [2176, 160]
+      64  model.language_model.layers.N.post_attention_layernorm.weight      BF16     [5120]
+      16  model.language_model.layers.N.self_attn.k_norm.weight              BF16     [256]
+      16  model.language_model.layers.N.self_attn.k_proj.weight_packed       I32      [1024, 640]
+      16  model.language_model.layers.N.self_attn.k_proj.weight_scale        BF16     [1024, 160]
+      16  model.language_model.layers.N.self_attn.k_proj.weight_shape        I64      [2]
+      16  model.language_model.layers.N.self_attn.k_proj.weight_zero_point   I32      [128, 160]
+      16  model.language_model.layers.N.self_attn.o_proj.weight_packed       I32      [5120, 768]
+      16  model.language_model.layers.N.self_attn.o_proj.weight_scale        BF16     [5120, 192]
+      16  model.language_model.layers.N.self_attn.o_proj.weight_shape        I64      [2]
+      16  model.language_model.layers.N.self_attn.o_proj.weight_zero_point   I32      [640, 192]
+      16  model.language_model.layers.N.self_attn.q_norm.weight              BF16     [256]
+      16  model.language_model.layers.N.self_attn.q_proj.weight_packed       I32      [12288, 640]
+      16  model.language_model.layers.N.self_attn.q_proj.weight_scale        BF16     [12288, 160]
+      16  model.language_model.layers.N.self_attn.q_proj.weight_shape        I64      [2]
+      16  model.language_model.layers.N.self_attn.q_proj.weight_zero_point   I32      [1536, 160]
+      16  model.language_model.layers.N.self_attn.v_proj.weight_packed       I32      [1024, 640]
+      16  model.language_model.layers.N.self_attn.v_proj.weight_scale        BF16     [1024, 160]
+      16  model.language_model.layers.N.self_attn.v_proj.weight_shape        I64      [2]
+      16  model.language_model.layers.N.self_attn.v_proj.weight_zero_point   I32      [128, 160]
+       1  model.language_model.norm.weight                                   BF16     [5120]
+      27  model.visual.blocks.N.attn.proj.bias                               BF16     [1152]
+      27  model.visual.blocks.N.attn.proj.weight                             BF16     [1152, 1152]
+      27  model.visual.blocks.N.attn.qkv.bias                                BF16     [3456]
+      27  model.visual.blocks.N.attn.qkv.weight                              BF16     [3456, 1152]
+      27  model.visual.blocks.N.mlp.linear_fc1.bias                          BF16     [4304]
+      27  model.visual.blocks.N.mlp.linear_fc1.weight                        BF16     [4304, 1152]
+      27  model.visual.blocks.N.mlp.linear_fc2.bias                          BF16     [1152]
+      27  model.visual.blocks.N.mlp.linear_fc2.weight                        BF16     [1152, 4304]
+      27  model.visual.blocks.N.norm1.bias                                   BF16     [1152]
+      27  model.visual.blocks.N.norm1.weight                                 BF16     [1152]
+      27  model.visual.blocks.N.norm2.bias                                   BF16     [1152]
+      27  model.visual.blocks.N.norm2.weight                                 BF16     [1152]
+       1  model.visual.merger.linear_fc1.bias                                BF16     [4608]
+       1  model.visual.merger.linear_fc1.weight                              BF16     [4608, 4608]
+       1  model.visual.merger.linear_fc2.bias                                BF16     [5120]
+       1  model.visual.merger.linear_fc2.weight                              BF16     [5120, 4608]
+       1  model.visual.merger.norm.bias                                      BF16     [1152]
+       1  model.visual.merger.norm.weight                                    BF16     [1152]
+       1  model.visual.patch_embed.proj.bias                                 BF16     [1152]
+       1  model.visual.patch_embed.proj.weight                               BF16     [1152, 3, 2, 16, 16]
+       1  model.visual.pos_embed.weight                                      BF16     [2304, 1152]
+       1  mtp.fc.weight                                                      BF16     [5120, 10240]
+       1  mtp.layers.N.input_layernorm.weight                                BF16     [5120]
+       1  mtp.layers.N.mlp.down_proj.weight                                  BF16     [5120, 17408]
+       1  mtp.layers.N.mlp.gate_proj.weight                                  BF16     [17408, 5120]
+       1  mtp.layers.N.mlp.up_proj.weight                                    BF16     [17408, 5120]
+       1  mtp.layers.N.post_attention_layernorm.weight                       BF16     [5120]
+       1  mtp.layers.N.self_attn.k_norm.weight                               BF16     [256]
+       1  mtp.layers.N.self_attn.k_proj.weight                               BF16     [1024, 5120]
+       1  mtp.layers.N.self_attn.o_proj.weight                               BF16     [5120, 6144]
+       1  mtp.layers.N.self_attn.q_norm.weight                               BF16     [256]
+       1  mtp.layers.N.self_attn.q_proj.weight                               BF16     [12288, 5120]
+       1  mtp.layers.N.self_attn.v_proj.weight                               BF16     [1024, 5120]
+       1  mtp.norm.weight                                                    BF16     [5120]
+       1  mtp.pre_fc_norm_embedding.weight                                   BF16     [5120]
+       1  mtp.pre_fc_norm_hidden.weight                                      BF16     [5120]
+
+--- 4. presence checks the directive asked for ---
+  [yes] attention q_norm     QK-norm on Q
+  [yes] attention k_norm     QK-norm on K
+  [yes] GDN conv1d           short conv
+  [yes] GDN A_log            decay
+  [yes] GDN dt_bias          timestep bias
+  [yes] GDN in_proj_z        output gate
+  [yes] GDN norm             per-head RMSNorm
+  [yes] MTP head             built-in multi-token-prediction head
+  [yes] vision tower         DEFERRED in v1 - loader must skip
+
+--- 5. VRAM accounting (on-disk, by role) ---
+  body int4 packed             11.313 GiB
+  lm_head                       2.368 GiB
+  embed_tokens                  2.368 GiB
+  body scales                   1.414 GiB
+  vision (SKIPPED)              0.858 GiB
+  mtp head                      0.791 GiB
+  body zeros                    0.354 GiB
+  body bf16 (norms etc)         0.107 GiB
+  quant meta                    0.000 GiB
+  TOTAL on disk                19.574 GiB
+
+  quantized params : 24.296 B
+  effective bpw    : 4.625
+  quant group size : 32
+
+--- 6. derived runtime constants (the server must use THESE) ---
+  KV elements/token        : 16 layers x 4 kv-heads x 256 dim x 2 = 32768
+  KV bytes/token  bf16     : 64 KiB
+  KV bytes/token  fp8 e4m3 : 32 KiB
+    ctx   32768: bf16   2.00 GiB   fp8   1.00 GiB
+    ctx  131072: bf16   8.00 GiB   fp8   4.00 GiB
+    ctx  262144: bf16  16.00 GiB   fp8   8.00 GiB
+  GDN recurrent state      : 48 x 48 x 128 x 128 = 37748736 elems
+    fp32 144.0 MiB   bf16 72.0 MiB   (CONSTANT in context length)
+  GDN short-conv state     : 48 x 10240 x 3 = 1474560 elems (5.6 MiB fp32)
+
+=== VERDICT ===
+  GATE 0 PASSED — checkpoint matches the directive's architecture table.
+  wrote reports/model_shape_cyankiwi.json

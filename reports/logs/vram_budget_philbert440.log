@@ -1,0 +1,28 @@
+=== VRAM BUDGET  (Qwen3.8-27B-W4A16-AWQ) ===
+free VRAM (measured)          22.640 GiB
+safety margin                 -0.500 GiB
+arena                         22.140 GiB
+
+  LM body INT4 g128 (+scales/zeros/norms)      11.820 GiB
+  lm_head INT4 g128 (repacked from bf16)        0.615 GiB
+  embed_tokens INT8 rowwise (repacked)          1.185 GiB
+  DFlash2 drafter [int8]                        1.792 GiB
+  GDN recurrent + conv state (fp32)             0.146 GiB
+  GDN rollback buffers (2x, spec decode)        0.292 GiB
+  GDN prefix snapshots (8 x bf16)               0.584 GiB
+  Activations + prefill workspace               1.400 GiB
+  FIXED TOTAL                                  17.835 GiB
+  REMAINING FOR KV                              4.305 GiB
+
+KV per token: 16 attn layers x 4 kv-heads x 256 x 2 = 32768 elems
+  bf16         64 KiB/token -> max ctx 70,537 tokens
+  fp8 e4m3     32 KiB/token -> max ctx 141,074 tokens
+
+REQUESTED --max-context 131,072 at FP8 needs 4.000 GiB : FITS  (headroom +0.305 GiB)
+
+skipped: vision tower 0.858 GiB, mtp head 0.791 GiB (ablation only)
+saved by repack: lm_head 1.753 GiB, embed 1.183 GiB
+
+decode weight traffic/token   12.435 GiB
+  @ measured 914.2 GB/s        14.60 ms ->   68.5 tok/s AR ceiling
+  @ 80% of that                18.26 ms ->   54.8 tok/s realistic

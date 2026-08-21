@@ -1,0 +1,28 @@
+# llama.cpp build for the baseline (trimmed; full build output is ~76KB of compile lines)
+
+749f688 ggml: support ggml_rope_set_offset on opencl, sycl, wgpu, hexagon (#27345)
+-- The C compiler identification is GNU 11.5.0
+-- The CXX compiler identification is GNU 11.5.0
+-- Found Git: /usr/bin/git (found version "2.45.2")
+-- The ASM compiler identification is GNU
+-- Found assembler: /usr/bin/cc
+-- Found Threads: TRUE
+-- Found OpenMP_C: -fopenmp (found version "4.5")
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5")
+-- Found CUDAToolkit: /usr/local/cuda-12.1/targets/x86_64-linux/include (found version "12.1.105")
+-- CUDA Toolkit found
+-- The CUDA compiler identification is NVIDIA 12.1.105
+-- Using CMAKE_CUDA_ARCHITECTURES=86 CMAKE_CUDA_ARCHITECTURES_NATIVE=86-real
+-- CUDA host compiler is GNU 11.5.0
+-- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.3.1")
+-- Generating embedded license file for target: llama-app
+-- Configuring done (2.9s)
+-- Generating done (0.3s)
+-- Build files have been written to: /home/patrickd/qwen38-weights/llama.cpp/build
+LLAMACPP_BUILD_RC=0
+
+# resulting binaries:
+llama-bench
+llama-cli
+llama-server

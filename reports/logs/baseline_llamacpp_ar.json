@@ -1,0 +1,91 @@
+{
+  "tag": "llamacpp-Q4_K_M-AR",
+  "model": "qwen38-27b",
+  "max_tokens": 256,
+  "temperature": 0.0,
+  "warmup": 2,
+  "reps": 5,
+  "cases": {
+    "gsm8k_math": {
+      "decode_tok_s_median": 38.36943445710636,
+      "decode_tok_s_p95": 38.4247046439872,
+      "decode_tok_s_all": [
+        38.449516463404436,
+        38.36943445710636,
+        38.34520154914615,
+        38.4247046439872,
+        38.26625072002453
+      ],
+      "prefill_tok_s_median": 25.021268077866186,
+      "ttft_s_median": null,
+      "completion_tokens": 171,
+      "prompt_tokens": 101,
+      "sample_text": "In April, Natalia sold 48 clips.\n\nIn May, she sold half as many:  \n48 \u00f7 2 = 24 clips.\n\nAltogether:  \n48 + 24 = 72 clips.\n\n**72**"
+    },
+    "humaneval_code": {
+      "decode_tok_s_median": 38.27963800972903,
+      "decode_tok_s_p95": 38.297419865277185,
+      "decode_tok_s_all": [
+        38.25412953328312,
+        38.27963800972903,
+        38.228425787906595,
+        38.35699684269269,
+        38.297419865277185
+      ],
+      "prefill_tok_s_median": 25.360274398168986,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 102,
+      "sample_text": ""
+    },
+    "mbpp_code": {
+      "decode_tok_s_median": 38.41035940949872,
+      "decode_tok_s_p95": 38.41545729534391,
+      "decode_tok_s_all": [
+        38.40689986733805,
+        38.43773952929597,
+        38.35005144922588,
+        38.41035940949872,
+        38.41545729534391
+      ],
+      "prefill_tok_s_median": 25.25922277371525,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 81,
+      "sample_text": ""
+    },
+    "prose_chat": {
+      "decode_tok_s_median": 38.480784657907336,
+      "decode_tok_s_p95": 38.495859581596804,
+      "decode_tok_s_all": [
+        38.5187995910663,
+        38.4604536795116,
+        38.480784657907336,
+        38.495859581596804,
+        38.44651938383045
+      ],
+      "prefill_tok_s_median": 25.593775593775593,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 91,
+      "sample_text": ""
+    },
+    "tool_style": {
+      "decode_tok_s_median": 38.45914854159892,
+      "decode_tok_s_p95": 38.49641168153232,
+      "decode_tok_s_all": [
+        38.511411610873445,
+        38.49641168153232,
+        38.44531952357354,
+        38.44445590239993,
+        38.45914854159892
+      ],
+      "prefill_tok_s_median": 25.75162557136419,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 117,
+      "sample_text": ""
+    }
+  },
+  "overall_decode_tok_s_median": 38.41035940949872
+}

@@ -1,0 +1,15 @@
+{
+  "note": "Workload basket, not one prompt. Acceptance on code is roughly double acceptance on prose, so a single number is not a useful summary of a speculative server (gemma-cuda-hybrid WIKI s10).",
+  "cases": [
+    {"name": "gsm8k_math", "class": "math",
+     "prompt": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May? Think step by step and give the final numeric answer."},
+    {"name": "humaneval_code", "class": "code",
+     "prompt": "Write a complete Python function `def longest_common_subsequence(a: str, b: str) -> str:` that returns the actual longest common subsequence string (not just its length), using dynamic programming. Include docstring and three doctests."},
+    {"name": "mbpp_code", "class": "code",
+     "prompt": "Write a Python function that takes a list of integers and returns the length of the longest strictly increasing contiguous run. Then write pytest tests for it."},
+    {"name": "prose_chat", "class": "prose",
+     "prompt": "Explain, in about four paragraphs and without using bullet points, why GDDR6X memory bandwidth rather than raw FLOPS is the binding constraint for single-batch large language model decoding."},
+    {"name": "tool_style", "class": "toolish",
+     "prompt": "You have tools: search(query: str), read_file(path: str), write_file(path: str, content: str). A user asks you to find the current CUDA occupancy rules for sm_86 and save a summary to notes.md. Describe the exact sequence of tool calls you would make and the arguments for each."}
+  ]
+}

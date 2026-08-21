@@ -1,0 +1,91 @@
+{
+  "tag": "llamacpp-Q4_K_M-MTP-spec",
+  "model": "qwen38-27b",
+  "max_tokens": 256,
+  "temperature": 0.0,
+  "warmup": 2,
+  "reps": 5,
+  "cases": {
+    "gsm8k_math": {
+      "decode_tok_s_median": 82.93880813537554,
+      "decode_tok_s_p95": 82.96005352136318,
+      "decode_tok_s_all": [
+        82.96005352136318,
+        83.25721708613372,
+        82.73695792172502,
+        82.82026742712786,
+        82.93880813537554
+      ],
+      "prefill_tok_s_median": 25.36912070627632,
+      "ttft_s_median": null,
+      "completion_tokens": 172,
+      "prompt_tokens": 101,
+      "sample_text": "In April, Natalia sold 48 clips.\n\nIn May, she sold half as many:  \n48 \u00f7 2 = 24 clips.\n\nAltogether:  \n48 + 24 = 72 clips.\n\n**72**"
+    },
+    "humaneval_code": {
+      "decode_tok_s_median": 51.3012615281982,
+      "decode_tok_s_p95": 51.301849823994424,
+      "decode_tok_s_all": [
+        51.37851580161365,
+        51.3012615281982,
+        51.22252087518598,
+        51.301849823994424,
+        51.22981695887753
+      ],
+      "prefill_tok_s_median": 25.088751458283678,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 102,
+      "sample_text": ""
+    },
+    "mbpp_code": {
+      "decode_tok_s_median": 48.79114672205769,
+      "decode_tok_s_p95": 48.850471771036496,
+      "decode_tok_s_all": [
+        48.78941036371262,
+        48.870413104476704,
+        48.850471771036496,
+        48.79114672205769,
+        48.77958266484582
+      ],
+      "prefill_tok_s_median": 25.503047614189896,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 81,
+      "sample_text": ""
+    },
+    "prose_chat": {
+      "decode_tok_s_median": 43.963250859998766,
+      "decode_tok_s_p95": 43.98660047402031,
+      "decode_tok_s_all": [
+        44.01052179392409,
+        43.98660047402031,
+        43.95832474996764,
+        43.92613518914077,
+        43.963250859998766
+      ],
+      "prefill_tok_s_median": 25.13320599175631,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 91,
+      "sample_text": ""
+    },
+    "tool_style": {
+      "decode_tok_s_median": 55.28553569949645,
+      "decode_tok_s_p95": 55.293351830947195,
+      "decode_tok_s_all": [
+        55.2151583148507,
+        55.293351830947195,
+        55.35918122251308,
+        55.281568539714605,
+        55.28553569949645
+      ],
+      "prefill_tok_s_median": 25.546862525946032,
+      "ttft_s_median": null,
+      "completion_tokens": 256,
+      "prompt_tokens": 117,
+      "sample_text": ""
+    }
+  },
+  "overall_decode_tok_s_median": 51.3012615281982
+}
