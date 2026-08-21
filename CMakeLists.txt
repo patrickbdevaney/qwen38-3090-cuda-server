@@ -28,7 +28,7 @@ add_executable(microbench bench/microbench.cu)
 target_link_libraries(microbench PRIVATE CUDA::cudart)
 
 # ---------------------------------------------------------------- tokenizer
-add_library(qwen_tokenizer STATIC src/tokenizer/bpe.cpp)
+add_library(qwen_tokenizer STATIC src/tokenizer/bpe.cpp src/tokenizer/chat_template.cpp)
 target_include_directories(qwen_tokenizer PUBLIC src third_party)
 
 # ---------------------------------------------------------------- gates
@@ -46,6 +46,12 @@ add_test(NAME tokenizer COMMAND gate_tokenizer
          $ENV{QWEN38_MODEL_DIR}/tokenizer.json
          ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/corpus.jsonl
          ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/meta.json)
+
+add_executable(gate_chat_template tests/gate_chat_template.cpp)
+target_link_libraries(gate_chat_template PRIVATE qwen_tokenizer)
+add_test(NAME chat_template COMMAND gate_chat_template
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/chat/fixtures.jsonl
+         $ENV{QWEN38_MODEL_DIR}/tokenizer.json)
 
 # ---------------------------------------------------------------- server
 # Sources are added per phase as each gate passes.
