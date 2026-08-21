@@ -1,8 +1,12 @@
 # QUANT_CHOICE.md
 
-**Status: OPEN.** The structural analysis is complete and is decisive about what the trade *is*.
-The quality half of the bake-off (perplexity, KL vs BF16, HumanEval, GSM8K) has not been run.
-No checkpoint is finally chosen. Working assumption for Phases 1–2 is stated in §5.
+**Status: DECIDED — `philbert440/Qwen3.8-27B-W4A16-AWQ` (INT4, group 128).**
+
+The structural analysis below is complete and measured. The BF16-reference half of the bake-off
+(perplexity / KL vs BF16, HumanEval, GSM8K) was **deliberately not run**: it requires the 55.6 GB
+BF16 checkpoint and an hour or two of CPU-offloaded evaluation, and the operator's call was that
+this is not worth the time when the structural trade is already decisive. §5 states the decision
+and, honestly, what it rests on and what remains unverified.
 
 ---
 
@@ -114,18 +118,65 @@ venv has transformers 4.56.0, which cannot load this architecture at all.)
 
 ---
 
-## 5. Working assumption, pending the bake-off
+## 5. Decision: philbert440 / g128
 
-**Phases 1–2 target `philbert440/Qwen3.8-27B-W4A16-AWQ` (g128).** Reasons:
+### What the choice rests on
 
-1. It is the configuration the whole VRAM budget and the 128K claim depend on.
-2. g128 is the *harder* kernel target — wider groups, fewer scale reads per output, so the
-   dequant-fused GEMV has less scale traffic to hide behind. Code written for g128 handles g32
-   by changing a constant; the reverse is not true.
-3. Switching later is a loader change, not a kernel change.
+1. **The two checkpoints differ in exactly one parameter.** Both are llm-compressor
+   `compressed-tensors` / `pack-quantized`, 4-bit, **asymmetric**, **MSE observer**, `strategy:
+   group`. Same tool, same method, same calibration philosophy. Only `group_size` differs,
+   128 vs 32. That makes the quality ordering knowable a priori — finer groups cannot be worse —
+   so the open question was never *which is more accurate*, only *by how much*.
+2. **The cost of g32 is measured and large.** 1.368 GiB more body weight, which is
+   **11% of the AR decode ceiling** (68.5 → 61.6 tok/s) and **~45,000 tokens of context**
+   (141,074 → 96,240). Its scale tensors alone are 1.414 GiB against g128's 0.380 GiB, and those
+   scales are read on the hot path, so the penalty is bandwidth as well as capacity.
+3. **g32 forecloses the project's headline result.** 128K FP8 KV needs 4.000 GiB; g32 leaves
+   2.937 GiB. The whole reason to build this on a 3090 is that the 3:1 GDN layout makes 128K fit.
+   A checkpoint choice that takes that away is not a neutral quality upgrade.
+4. **The published behaviour of group size at this scale is not close to the cost.** For 4-bit
+   weight-only quantization of models in the 20–30 B range, g128 → g32 is a small accuracy
+   move; the cost here is 11% of throughput and a third of the context. The burden of proof
+   sits with g32, and nothing in the structural data discharges it.
+5. **g128 is the harder kernel target**, so writing for it is the conservative engineering
+   choice: wider groups mean fewer scale reads per output and less traffic to hide dequant
+   behind. Code written for g128 handles g32 by changing a constant; the reverse is not true.
 
-**This is not the final decision and is not presented as one.** If the bake-off shows g128 costs
-materially more than g32 in KL or task score, the honest outcome may be that 128K context and
-best-quality-4-bit are not simultaneously available on 24 GB, and that becomes a documented,
-user-selectable trade (`--quant g32 --max-context 96000` vs `--quant g128 --max-context 131072`)
-rather than a silent choice.
+Secondary: philbert440 ships the MTP head as a separate `model-mtp.safetensors` (0.791 GiB),
+which is convenient for the Phase 9 MTP-vs-DFlash2 ablation, and a `recipe.yaml` recording the
+quantization run.
+
+### What this does NOT rest on, stated plainly
+
+**No KL divergence or task score was measured against BF16.** The directive asked for the
+decision to be made on KL and task score; it is instead being made on the structural trade plus
+a prior about group size, because the operator judged the BF16 evaluation not worth its cost.
+That is a real weakening of the evidence and it is recorded here rather than papered over.
+
+Note also that Phase 5's gate — token-exact match against HF transformers on the *same quantized
+weights* — validates our **implementation**, not this **checkpoint choice**. Those are different
+claims and must not be conflated in `BENCHMARKS.md`.
+
+One detail worth carrying forward: **cyankiwi leaves layer 0's `linear_attn.out_proj` in BF16**
+while quantizing the other 47. Its author evidently judged that tensor sensitive. Our own
+`lm_head` INT4 and `embed_tokens` INT8 repacks should be gated the same way — measured, with a
+per-tensor escape hatch — rather than applied blindly.
+
+### The escape hatch
+
+The loader reads group size from `quantization_config` and never hardcodes it, so both
+checkpoints load through one path. If Phase 5 or Phase 9 turns up a quality problem traceable to
+g128, switching is a `--model` flag, not a rewrite, and the honest consequence is documented:
+
+```
+--model philbert440-g128  --max-context 131072   (default)
+--model cyankiwi-g32      --max-context  96000   (higher-fidelity 4-bit, less context, ~11% slower)
+```
+
+### Deferred, cheap, worth doing in Phase 9
+
+Once the server exists, comparing the two checkpoints costs almost nothing and needs **no BF16
+model**: run both through our own runtime on the same prompts and report top-1 agreement between
+them plus HumanEval/GSM8K scores for each. That bounds the disagreement without a 55.6 GB
+download. It cannot say which is closer to BF16 — only how far apart they are — but if they
+agree at >99.5% top-1 the question is settled for practical purposes.

@@ -113,16 +113,25 @@ The host is **Ubuntu 24.10, which is EOL**, and its archive has no `nvidia-drive
 graphics-drivers PPA or NVIDIA's `.run` installer on an out-of-support release, on a machine
 reached over RustDesk — i.e. a real risk of losing the display and remote access.
 
-**This is a decision for the operator, not something to do unilaterally.** Three options:
+### Decision: vLLM is out of scope
 
-| option | cost | risk |
-|---|---|---|
-| (a) upgrade driver to 580+ | reboot | display/RustDesk loss on an EOL distro |
-| (b) build vLLM from source against CUDA 12.8 | ~1 h build, plus a CUDA 12.8 toolkit (local is 12.1) | moderate; no system change |
-| (c) defer vLLM to Phase 9 | none now | ship with only the llama.cpp comparison until then |
+The operator's call, and it is a reasonable one: driver 580 risks a known suspend/resume
+regression on this desktop, and a from-source CUDA 12.8 build is an hour of work for a number
+that is only a comparison point. **llama.cpp is the measured competitor for this project.**
 
-Until one is chosen, **llama.cpp is the measured baseline and vLLM is an open item.** No vLLM
-number will be quoted anywhere, including as an estimate.
+Consequences, stated so they are not forgotten:
+
+- Directive §12 asks for a measured comparison against **both** llama.cpp and vLLM. That item is
+  **not met and will not be**, unless the driver situation changes. `BENCHMARKS.md` must say so
+  explicitly rather than quietly listing one baseline.
+- vLLM would have been the *only* available with-and-without-**DFlash2** comparison, since
+  llama.cpp cannot run DFlash2 at all (§1.4). So there is no external DFlash2 reference on this
+  box. Our speculative numbers will be compared against **our own AR path** and against
+  llama.cpp's MTP speculation, and the acceptance-length figures from the DFlash2 model card
+  (H200/SGLang) stay clearly labelled as somebody else's hardware.
+- **No vLLM number will be quoted anywhere, including as an estimate.**
+
+The diagnosis above is kept so the decision is reversible if the driver is ever updated.
 
 ## 3. What this does to the gate targets
 

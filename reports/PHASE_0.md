@@ -131,10 +131,11 @@ They differ in the one way that matters:
 
 So the quant choice is not a rounding decision: it trades ~11% decode speed and ~45K context
 against whatever g32 buys in quality. Per the directive that call is made on KL divergence and
-task score, not file size — see `reports/QUANT_CHOICE.md`, which is **open pending the bake-off**.
-Working assumption for Phases 1–2 is philbert440/g128, chosen so the kernel work targets the
-harder (wider group, fewer scale reads) layout; switching later is a loader change, not a kernel
-change.
+task score, not file size. **Decided: philbert440 / g128**, on the structural trade plus a prior
+about group size rather than a measured KL — the BF16 evaluation was judged not worth its cost.
+`reports/QUANT_CHOICE.md` §5 records both the reasoning and the fact that the KL evidence is
+absent. The loader reads group size from `quantization_config` and never hardcodes it, so
+switching is a `--model` flag.
 
 **Rejected as directed, one line each:**
 - `amd/...-Quark-AWQ-MXFP4`, `TelperionAI/...-NVFP4-AWQ-AutoRound` — Ampere has no FP4 path;
@@ -216,8 +217,12 @@ If that transfers, INT8 drafting costs ~15% of τ, and τ is the throughput mult
 with no obviously right answer, and it must be settled by measurement in Phase 7, not assumed
 now.** It is the single riskiest open question in the build.
 
-**#2 — will the g128 checkpoint's quality hold?** An 11% decode ceiling and 45K of context ride
-on choosing g128 over g32. Undecided until the bake-off runs.
+**#2 — g128 quality is assumed, not measured.** 11% of the decode ceiling and 45K of context ride
+on g128 over g32, and the decision was taken without a KL measurement against BF16 (see
+`QUANT_CHOICE.md` §5). Both checkpoints come from the same tool with the same settings and differ
+only in group size, so g32 cannot be *worse* — the unquantified part is how much better. The cheap
+Phase 9 check (agreement between the two checkpoints through our own runtime, no BF16 needed)
+bounds it without a 55.6 GB download.
 
 **#3 — head_dim 256 attention tiling.** Measured: `Br=64,Bc=64` Q+K+V in BF16 is **96 KB against
 a 99 KB ceiling** — it fits, but with 3 KB left and nothing for softmax statistics. `Br=64,Bc=32`
@@ -240,10 +245,12 @@ State at the time of writing:
   prefill at 8K. It **cannot** run DFlash2 — its DFLASH arch is DFlash 1. Full numbers and the
   tensor-level diagnosis in `reports/BASELINES.md`.
 - **GGUFs**: downloaded — Q4_K_M (18.97 GB), `mtp-...-Q8_0` (3.16 GB), DFlash2 BF16 and Q8_0.
-- **vLLM**: **blocked.** It *does* support `Qwen3_5ForConditionalGeneration`, `Qwen3_5MTP` and
-  `DFlashDraftModel` — but every release that does pins torch >= 2.11, whose wheels are CUDA 13,
-  and CUDA 13 needs driver >= 580. This box has 570.133.07 on an EOL Ubuntu 24.10 with no 580
-  package. See `reports/BASELINES.md` §2 for the three options; this needs an operator decision.
+- **vLLM**: **dropped from scope by operator decision.** It is blocked on the driver (every
+  release supporting `Qwen3_5` pins torch >= 2.11 → CUDA 13 wheels → driver >= 580; this box has
+  570.133.07). Upgrading risks a known suspend/resume regression on this desktop, and a
+  from-source CUDA 12.8 build was judged not worth the time for a number that is only a
+  comparison point. **llama.cpp is the measured competitor.** `reports/BASELINES.md` §2 keeps
+  the full diagnosis so the decision can be revisited if the driver situation changes.
 - **transformers 5.15.1 + compressed-tensors 0.18.0**: installed and verified — parses the
   config as `Qwen3_5Config`. Ready for the P1 reference oracle and the quant bake-off.
 
@@ -289,7 +296,7 @@ quoted anywhere until it comes from a committed log.**
 | `tools/vram_budget.py` + `reports/logs/vram_budget_philbert440.log` | done |
 | `reports/PRIOR_ART.md` | done |
 | `reports/PHASE_0.md` | this file |
-| `reports/QUANT_CHOICE.md` | **open** — bake-off not yet run |
+| `reports/QUANT_CHOICE.md` | **decided** — philbert440 g128; see that file for what the decision rests on |
 | `bench/bench_openai.py` + `bench/prompt_suite.json` | done |
 | `reports/BASELINES.md` | llama.cpp **measured**; vLLM **blocked on driver** |
 
