@@ -73,7 +73,7 @@ add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
 
 add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu
                                 src/kernels/gdn.cu src/kernels/attn.cu
-                                src/kernels/elementwise.cu)
+                                src/kernels/elementwise.cu src/kernels/sampling.cu)
 target_include_directories(qwen_kernels PUBLIC src third_party)
 target_link_libraries(qwen_kernels PUBLIC CUDA::cublas)
 set_target_properties(qwen_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -126,5 +126,20 @@ add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
 # ---------------------------------------------------------------- server
-# Sources are added per phase as each gate passes.
-#   Phase 1 (in progress): src/config, src/loader, src/tokenizer/chat_template
+add_library(qwen_server STATIC
+  src/server/server.cpp
+  src/server/reasoning_parser.cpp)
+target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer)
+target_include_directories(qwen_server PUBLIC src third_party)
+
+add_executable(cuda_server src/main.cpp)
+target_link_libraries(cuda_server PRIVATE qwen_server)
+
+add_executable(cuda_chat src/clients/tui.cpp)
+target_include_directories(cuda_chat PRIVATE src third_party)
+target_link_libraries(cuda_chat PRIVATE Threads::Threads)
+
+add_executable(gate_reasoning tests/gate_reasoning.cpp)
+target_include_directories(gate_reasoning PRIVATE src third_party)
+target_sources(gate_reasoning PRIVATE src/server/reasoning_parser.cpp)
+add_test(NAME reasoning_parser COMMAND gate_reasoning)

@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
   const int T = int(ids.size());
 
   qwen::Model m; qwen::LoadOptions o;
-  o.max_ctx = 4096; o.max_batch = 256; o.quantize_lm_head = false; o.verbose = false;
+  o.max_ctx = 4096; o.max_batch = 256; o.lm_head_bits = 16; o.verbose = false;
   qwen::model_load(m, md, o);
   const int NL = m.shape.num_hidden_layers, H = m.shape.hidden_size;
   cudaMalloc(&m.dbg_hidden, size_t(NL + 1) * m.max_batch * H * 2);

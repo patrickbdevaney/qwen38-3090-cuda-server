@@ -532,7 +532,7 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
     int32_t tok = 0;
     CKM(cudaMemcpy(&tok, d_id, 4, cudaMemcpyDeviceToHost));
     out.push_back(tok);
-    if (tok == eos_id) break;
+    if (m.shape.is_stop_token(tok)) break;
     if (i + 1 < max_new) model_decode(m, tok, int(prompt.size()) + i);
   }
   return out;

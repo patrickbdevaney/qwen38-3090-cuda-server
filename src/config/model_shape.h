@@ -64,6 +64,14 @@ struct ModelShape {
   int32_t mtp_num_hidden_layers = 0;    // 1, built-in MTP head
   bool    has_vision = false;           // deferred; loader skips model.visual.*
   int32_t eos_token_id = -1;
+  // generation_config.json declares eos_token_id as a LIST for this model
+  // ([248046 <|im_end|>, 248044 <|endoftext|>]). config.json carries only the
+  // scalar 248044, so stopping on that alone leaks <|im_end|> into the output.
+  std::vector<int32_t> stop_token_ids;
+  bool is_stop_token(int32_t t) const {
+    for (int32_t s : stop_token_ids) if (s == t) return true;
+    return false;
+  }
   int32_t image_token_id = -1;
   int32_t video_token_id = -1;
 

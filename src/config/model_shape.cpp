@@ -110,6 +110,23 @@ ModelShape ModelShape::from_file(const std::string& path) {
   if (tc.contains("eos_token_id") && tc["eos_token_id"].is_number())
     s.eos_token_id = tc["eos_token_id"].get<int32_t>();
   s.has_vision = root.contains("vision_config");
+  // generation_config.json is the authority on stopping.
+  {
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash);
+    std::ifstream gf(dir + "/generation_config.json");
+    if (gf) {
+      json g; gf >> g;
+      if (g.contains("eos_token_id")) {
+        if (g["eos_token_id"].is_array())
+          for (auto& v : g["eos_token_id"]) s.stop_token_ids.push_back(v.get<int32_t>());
+        else if (g["eos_token_id"].is_number())
+          s.stop_token_ids.push_back(g["eos_token_id"].get<int32_t>());
+      }
+    }
+  }
+  if (s.stop_token_ids.empty() && s.eos_token_id >= 0)
+    s.stop_token_ids.push_back(s.eos_token_id);
   if (root.contains("image_token_id")) s.image_token_id = root["image_token_id"].get<int32_t>();
   if (root.contains("video_token_id")) s.video_token_id = root["video_token_id"].get<int32_t>();
 
