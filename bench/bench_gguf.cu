@@ -60,6 +60,42 @@ int main(int argc, char** argv) {
     tot_bytes += double(nb); tot_ms += ms;
     cudaFree(d_w); cudaFree(d_x); cudaFree(d_y);
   }
+  // Does speculation compress the gap? At M rows the weight stream is read ONCE
+  // and the dequantisation is amortised across M outputs, so an ALU-bound kernel
+  // should improve almost linearly in M while a bandwidth-bound one stays flat.
+  {
+    const qwen::GgufTensor* t = f.find("blk.1.ffn_up.weight");
+    if (t && t->row_len() % 256 == 0) {
+      const int in_f = int(t->row_len()), out_f = int(t->rows());
+      const size_t nb = qwen::gguf_row_bytes(t->type, in_f) * size_t(out_f);
+      void* d_w = nullptr; __nv_bfloat16 *d_x = nullptr, *d_y = nullptr;
+      CK(cudaMalloc(&d_w, nb));
+      CK(cudaMemcpy(d_w, t->data, nb, cudaMemcpyHostToDevice));
+      CK(cudaMalloc(&d_x, size_t(in_f) * 8 * 2));
+      CK(cudaMalloc(&d_y, size_t(out_f) * 8 * 2));
+      CK(cudaMemset(d_x, 0, size_t(in_f) * 8 * 2));
+      qwen::GgufWeight w;
+      w.data = d_w; w.type = t->type; w.out_f = out_f; w.in_f = in_f;
+      printf("\nM sweep on %s (%s) -- speculation reads the weights once for M rows\n",
+             t->name.c_str(), qwen::ggml_type_name(t->type));
+      printf("%6s %10s %12s %14s\n", "M", "ms", "GB/s", "per-token ms");
+      for (int M : {1, 2, 4, 8}) {
+        for (int i = 0; i < 3; ++i) qwen::gguf_gemm_small(d_y, w, d_x, M);
+        CK(cudaDeviceSynchronize());
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+        const int IT = 20;
+        cudaEventRecord(a);
+        for (int i = 0; i < IT; ++i) qwen::gguf_gemm_small(d_y, w, d_x, M);
+        cudaEventRecord(b);
+        CK(cudaEventSynchronize(b));
+        float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= IT;
+        printf("%6d %10.3f %12.1f %14.4f\n", M, ms,
+               double(nb) / (ms * 1e-3) / 1e9, ms / M);
+      }
+      cudaFree(d_w); cudaFree(d_x); cudaFree(d_y);
+    }
+  }
+
   if (tot_ms > 0)
     printf("\naggregate %.1f GB/s (%.1f%% of the 914.2 GB/s measured DRAM read)\n",
            tot_bytes / (tot_ms * 1e-3) / 1e9,

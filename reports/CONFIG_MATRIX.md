@@ -158,6 +158,58 @@ So: the GGUF stack stays in the tree, complete and verified, as the foundation
 for a future quant that actually pays. Q3_K_XL is not that quant at this kernel
 efficiency, and that is a measurement rather than an opinion.
 
+### Is 347 GB/s the FORMAT or MY KERNEL? Measured: mostly my kernel, and it
+### does not change the conclusion.
+
+Two checks rather than an assumption.
+
+**Speculation amortises the dequantisation, as predicted.** At M rows the weight
+stream is read once and the per-block header work is shared, so an ALU-bound
+kernel should improve with M. On blk.1.ffn_up (Q3_K):
+
+| M | ms | per-token ms |
+|---|---|---|
+| 1 | 0.208 | 0.2079 |
+| 8 | 0.724 | **0.0905** |
+
+2.3x better per token. So yes -- with DFlash2 running blocks of 8, the gap
+narrows substantially.
+
+**llama.cpp's mature K-quant kernels on this box, same file:**
+
+| | size | tok/s | effective GB/s |
+|---|---|---|---|
+| llama.cpp Q4_K_M | 17.67 GiB | 38.41 | 679 |
+| llama.cpp **UD-Q3_K_XL** | 12.23 GiB | **44.63** | 546 |
+| **ours, AWQ INT4 g128** | 13.06 GiB/token | **45.8** | 598 |
+
+So a *mature* Q3_K_XL implementation reaches 44.63 tok/s -- still slightly below
+our AWQ at 45.8, despite reading 1.34 GiB less per token. The 3-bit dequant
+costs llama.cpp 20% of its bandwidth efficiency (679 -> 546), which eats the
+size advantage there too.
+
+My kernel at 347 GB/s is therefore genuinely immature relative to llama.cpp's
+~546, and closing that is a real (if unrewarding) engineering task. But the
+conclusion is unchanged and now rests on someone else's mature kernels rather
+than mine: **Q3_K_XL does not buy decode speed on this card.** It buys 0.95 GiB,
+and INT4 KV already bought 3.58.
+
+## The Ampere constraint that applies to every format
+
+sm_86 has **no hardware for sub-8-bit types**. Every 4-bit format pays a
+software dequantisation, and the binding question is always ops-per-byte, not
+bits-per-weight:
+
+* our AWQ path is ~2.5 ops/weight using the bf16 magic-number trick -- about as
+  cheap as this arithmetic gets, which is why it holds 84.2% of DRAM,
+* K-quants cost more (six-bit sub-block scales, mins, high-bit merges) and
+  llama.cpp lands at 546-679 GB/s,
+* going *lower* in bits raises ops-per-byte, because the same header work is
+  spread over fewer bytes.
+
+That is the mechanism behind every measurement in this file, and it is why
+"smaller quant" has not once translated into "faster decode" on this card.
+
 ## Why this matters beyond the numbers
 
 The point of the headroom is **RoPE-extended context**. 262144 is the trained
