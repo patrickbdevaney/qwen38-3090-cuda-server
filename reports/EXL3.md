@@ -75,9 +75,9 @@ result; ours from `./build/bench_decode <model> 33408 8 1 4096 1 0`.
 
 | ctx | ours, AWQ INT4 + FP8 KV | EXL3 3.00bpw + FP16 KV | EXL3 vs ours |
 |---:|---:|---:|---:|
-| 4096 | 45.5 tok/s | **47.50** | +4.4% |
-| 16384 | 42.8 | **44.83** | +4.7% |
-| 32768 | 40.2 | **40.52** | +0.8% |
+| 4096 | 45.5 tok/s | **47.51** | +4.4% |
+| 16384 | 42.8 | **44.51** | +4.0% |
+| 32768 | 40.2 | **40.61** | +1.0% |
 | resident | 16585 MiB | 16352 MiB | −233 MiB |
 
 For reference on the same box: llama.cpp UD-Q3_K_XL measures 44.63 tok/s.
@@ -109,12 +109,47 @@ PROJECTED: EXL3 3.00bpw at 262144 ctx = 12.87 GiB weights + 16.8 GiB FP16 KV
            = ~29.7 GiB, which does not fit in 24 GiB.
 ```
 
+(That projection holds only for the FP16 cache, which is the default and not
+the ceiling. See the quantised-cache section below, where it is measured
+instead of projected and the answer changes.)
+
 Ours at 262144 with INT4 KV measures **19749 MiB**, with 4.4 GiB to spare.
 
-exllamav3 does ship a quantised cache (`CacheLayer_quant`, `k_bits`/`v_bits`),
-which would close most of that gap; measuring it is still open — the attempt
-failed with `stloader: failed to allocate pinned pool` while 50 GiB of page
-cache from the BF16 download was resident, and is queued behind that download.
+### With its quantised cache it does fit — and then we are faster
+
+exllamav3 ships a quantised cache (`CacheLayer_quant`, `k_bits`/`v_bits`), so
+the FP16 figure above is not its ceiling. At 4 bits it measures **16 KiB/token**
+against our INT4's 18, and it costs nothing in decode:
+
+| ctx | EXL3 + FP16 KV | EXL3 + 4-bit KV |
+|---:|---:|---:|
+| 4096 | 47.51 | 47.26 |
+| 16384 | 44.51 | 44.79 |
+| 32768 | 40.61 | 41.00 |
+| resident @ 33408 | 14.54 GiB | **12.91 GiB** |
+
+So the projection above is wrong for the configuration that actually matters,
+which is why it is labelled as one. Run rather than extrapolated: at the full
+262144 tokens EXL3 3.00bpw with a 4-bit cache **does** fit, and the comparison
+inverts.
+
+| ctx | ours, AWQ INT4 + INT4 KV | EXL3 3.00bpw + 4-bit KV | ours vs EXL3 |
+|---:|---:|---:|---:|
+| 65536 | **37.2** tok/s | 36.75 | +1.2% |
+| 131072 | **31.8** | 30.80 | +3.2% |
+| 262144 | **24.5** | 22.59 | **+8.5%** |
+| peak VRAM | 19749 MiB | 19910 MiB | −161 MiB |
+
+Both reach 262K in 24 GiB within 161 MiB of each other, and we decode 8.5%
+faster at the length this server exists for. EXL3 wins the short-context race
+by 4%; we win the long-context one by 8.5%. There is no headroom left to trade
+against, because the cache is quantised on both sides and the weights were
+never the binding constraint at 262K.
+
+The crossover is unsurprising once stated: past a few thousand tokens the bytes
+moved per decode step are dominated by the KV cache rather than the weights, so
+a lighter weight format stops buying anything and the attention kernel decides
+the result.
 
 ## Also worth knowing
 
@@ -135,11 +170,14 @@ measurement against BF16.
 ## Where this leaves the "build an EXL3 backend" question
 
 The original condition was: *if exllama remains accurate and fastest, build a
-kernel server for it too*. It is not fastest by a margin that would justify a
-second trellis-decoder backend — +4% at 4K, +0.8% at 32K, behind at the context
-lengths this server exists for. **Accuracy is the only remaining reason to keep
-it in scope**, and that is exactly what the BF16 comparison now downloading will
-settle. Quality on this box is at least sane: 3.00bpw answers factual, coding
+kernel server for it too*. **It is not fastest**, and the measurement is now
+complete enough to say so without hedging: +4% at 4K, +1% at 32K, and −8.5% at
+262K, at the same VRAM. A second trellis-decoder backend would buy a few percent
+at the context lengths an agentic harness spends the least time in, and cost
+throughput where it spends the most.
+
+**Accuracy is the only remaining reason to keep it in scope**, and that is what
+the BF16 comparison settles. Quality on this box is at least sane: 3.00bpw answers factual, coding
 and arithmetic prompts coherently and correctly (`scratchpad/exl3_qual.py`).
 
 Decision deferred to the BF16 KL numbers. If EXL3 3.00bpw is materially closer
