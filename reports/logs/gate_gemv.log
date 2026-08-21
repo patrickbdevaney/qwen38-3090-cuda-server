@@ -1,0 +1,16 @@
+tensor                                                    shape   max|err|       rel      GB/s    %peak
+layers.0.mlp.gate_proj                               17408x5120  1.165e-07  1.59e-06     730.6    79.9% k=5
+layers.0.mlp.down_proj                               5120x17408  2.147e-07  1.92e-06     731.8    80.0% k=17
+layers.3.self_attn.q_proj                            12288x5120  1.120e-07  2.12e-06     721.1    78.9% k=8
+layers.3.self_attn.k_proj                             1024x5120  9.416e-08  1.75e-06     291.3    31.9% k=40
+layers.3.self_attn.o_proj                             5120x6144  3.055e-07  1.57e-06     532.1    58.2% k=24
+layers.0.linear_attn.in_proj_qkv                     10240x5120  2.394e-07  1.76e-06     701.6    76.7% k=10
+layers.0.linear_attn.in_proj_z                        6144x5120  2.874e-07  2.64e-06     536.0    58.6% k=20
+layers.0.linear_attn.out_proj                         5120x6144  2.856e-07  1.71e-06     532.8    58.3% k=24
+
+gate_gemv
+  worst relative error : 2.642e-06
+  failures             : 0
+  mean % of 914.2 GB/s : 65.3%
+  worst % of peak      : 31.9%
+  RESULT               : numerics PASS, bandwidth BELOW GATE
