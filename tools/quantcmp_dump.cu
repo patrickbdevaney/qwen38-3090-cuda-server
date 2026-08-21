@@ -28,15 +28,16 @@ using ojson = nlohmann::ordered_json;
 #define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
   printf("CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(2);} } while(0)
 
-// bf16 -> fp16 on the host. The reference is fp16 because 15K x 248K x 4 bytes
-// of fp32 is 15 GiB of disk for no extra information: bf16 logits carry 8
-// mantissa bits and fp16 carries 10, so the conversion is lossless here.
-static uint16_t bf16_to_fp16(uint16_t b) {
-  uint32_t u = uint32_t(b) << 16;
-  float f; memcpy(&f, &u, 4);
-  __half h = __float2half(f);
-  uint16_t o; memcpy(&o, &h, 2);
-  return o;
+// bf16 -> fp16 on the DEVICE. The reference is fp16 because 15K x 248K x 4
+// bytes of fp32 is 15 GiB of disk for no extra information: bf16 logits carry 8
+// mantissa bits and fp16 10, so the narrowing is lossless here.
+//
+// This has to be a kernel. Doing it on the host is 3.9e9 conversions for the
+// full prompt set, which is over an hour single-threaded -- longer than
+// generating the BF16 reference it is being compared against.
+__global__ void bf16_to_fp16_k(__half* dst, const __nv_bfloat16* src, size_t n) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = __float2half(__bfloat162float(src[i]));
 }
 
 int main(int argc, char** argv) {
@@ -81,8 +82,10 @@ int main(int argc, char** argv) {
 
   const int V = m.shape.vocab_size;
   __nv_bfloat16* d_logits = nullptr;
+  __half* d_fp16 = nullptr;
   CK(cudaMalloc(&d_logits, size_t(chunk) * V * 2));
-  std::vector<uint16_t> host(size_t(chunk) * V), fp16(size_t(chunk) * V);
+  CK(cudaMalloc(&d_fp16, size_t(chunk) * V * 2));
+  std::vector<uint16_t> fp16(size_t(chunk) * V);
 
   ojson manifest;
   manifest["model"] = md;
@@ -97,29 +100,21 @@ int main(int argc, char** argv) {
     std::ofstream of(path, std::ios::binary);
     if (!of) { printf("cannot write %s\n", path.c_str()); return 1; }
 
-    std::vector<int32_t> top1(T);
     for (int s = 0; s < T; s += chunk) {
       const int n = std::min(chunk, T - s);
       qwen::model_forward_all_logits(m, ids.data() + s, n, s, d_logits);
+      const size_t elems = size_t(n) * size_t(V);
+      bf16_to_fp16_k<<<int((elems + 255) / 256), 256>>>(d_fp16, d_logits, elems);
+      CK(cudaGetLastError());
       CK(cudaDeviceSynchronize());
-      CK(cudaMemcpy(host.data(), d_logits, size_t(n) * V * 2, cudaMemcpyDeviceToHost));
-      for (int i = 0; i < n; ++i) {
-        const uint16_t* row = host.data() + size_t(i) * V;
-        uint16_t* dst = fp16.data() + size_t(i) * V;
-        int best = 0; float bv = -1e30f;
-        for (int v = 0; v < V; ++v) {
-          dst[v] = bf16_to_fp16(row[v]);
-          uint32_t u = uint32_t(row[v]) << 16; float f; memcpy(&f, &u, 4);
-          if (f > bv) { bv = f; best = v; }
-        }
-        top1[s + i] = best;
-      }
-      of.write(reinterpret_cast<const char*>(fp16.data()), size_t(n) * V * 2);
+      CK(cudaMemcpy(fp16.data(), d_fp16, elems * 2, cudaMemcpyDeviceToHost));
+      of.write(reinterpret_cast<const char*>(fp16.data()), elems * 2);
     }
     of.close();
+    // No top-1 here: the scorer takes the argmax off the logits themselves, so
+    // recording it would only create a second thing that can disagree.
     manifest["prompts"][name] = {
-      {"tokens", T}, {"vocab", V}, {"ids", ids}, {"top1", top1},
-      {"file", name + ".f16"}};
+      {"tokens", T}, {"vocab", V}, {"ids", ids}, {"file", name + ".f16"}};
     printf("%-16s %6d tok -> %s\n", name.c_str(), T, path.c_str());
     fflush(stdout);
   }

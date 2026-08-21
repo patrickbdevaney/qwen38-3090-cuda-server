@@ -789,17 +789,7 @@ void model_forward_all_logits(Model& m, const int32_t* ids, int T, int position,
               S.rotary_dims, float(S.rope_theta), m.stream);
   for (int i = 0; i < S.num_hidden_layers; ++i) run_layer(m, i, T, position, T > 1);
   rmsnorm(m.h2, m.h, m.final_norm, T, S.hidden_size, S.rms_norm_eps, m.stream);
-  if (m.lm_head_bits == 4)      gemm_mma_w4a16(logits_out, m.lm_head_q, m.h2, T, m.gemv, m.stream);
-  else if (m.lm_head_bits == 8) gemm_small_w8a16(logits_out, m.lm_head_q8, m.h2, T, m.gemv, m.stream);
-  else {
-    const float one = 1.f, zero = 0.f;
-    cublasSetStream(m.cublas, m.stream);
-    cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N, S.vocab_size, T, S.hidden_size,
-                 &one, m.lm_head_bf16, CUDA_R_16BF, S.hidden_size,
-                 m.h2, CUDA_R_16BF, S.hidden_size, &zero,
-                 logits_out, CUDA_R_16BF, S.vocab_size,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  }
+  model_apply_head(m, logits_out, m.h2, T);
   m.ctx_len = position + T;
 }
 
@@ -848,9 +838,7 @@ void quantize_w4a16(W4A16Weights& dst, const __nv_bfloat16* src, int rows, int c
 
 void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int T) {
   const ModelShape& S = m.shape;
-  if (m.lm_head_bits == 4)      gemm_mma_w4a16(out, m.lm_head_q, x, T, m.gemv, m.stream);
-  else if (m.lm_head_bits == 8) gemm_small_w8a16(out, m.lm_head_q8, x, T, m.gemv, m.stream);
-  else {
+  if (m.lm_head_bits != 4 && m.lm_head_bits != 8) {
     const float one = 1.f, zero = 0.f;
     cublasSetStream(m.cublas, m.stream);
     CKM(cudaGetLastError());
@@ -858,6 +846,23 @@ void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int 
                  &one, m.lm_head_bf16, CUDA_R_16BF, S.hidden_size, x, CUDA_R_16BF,
                  S.hidden_size, &zero, out, CUDA_R_16BF, S.vocab_size,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return;
+  }
+  // The quantised heads go through the small-M GEMM, whose partial-sum scratch
+  // is sized for gemv.max_m rows -- 16, the speculation block size, because
+  // that is the only caller that ever wanted logits for more than one position.
+  // A caller asking for a whole prefill chunk's logits (block verification with
+  // a bigger block, or a teacher-forced logits dump) used to walk straight off
+  // the end of that buffer and abort from inside the kernel with "gemv partial
+  // overflow". Walk T in max_m-row steps instead; the weights are re-read per
+  // step, which is the right trade for a path that is not the decode hot loop.
+  const int step = m.gemv.max_m > 0 ? m.gemv.max_m : 1;
+  for (int s = 0; s < T; s += step) {
+    const int n = std::min(step, T - s);
+    __nv_bfloat16* o = out + size_t(s) * size_t(S.vocab_size);
+    const __nv_bfloat16* xi = x + size_t(s) * size_t(S.hidden_size);
+    if (m.lm_head_bits == 4) gemm_mma_w4a16(o, m.lm_head_q, xi, n, m.gemv, m.stream);
+    else                     gemm_small_w8a16(o, m.lm_head_q8, xi, n, m.gemv, m.stream);
   }
 }
 
