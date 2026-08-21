@@ -1,0 +1,13 @@
+F32 blk.0.attn_norm.weight 5120
+IQ2_S blk.0.ffn_up.weight 262144
+IQ2_XS blk.0.ffn_gate.weight 262144
+IQ3_S blk.1.ffn_down.weight 262144
+IQ3_XXS blk.0.ffn_down.weight 262144
+IQ4_NL blk.3.attn_q.weight 262144
+IQ4_XS blk.0.attn_gate.weight 262144
+Q2_K blk.15.attn_q.weight 262144
+Q3_K blk.1.ffn_up.weight 262144
+Q4_K blk.1.attn_gate.weight 262144
+Q5_K blk.0.ssm_out.weight 262144
+Q6_K blk.23.attn_v.weight 262144
+Q8_0 blk.0.ssm_alpha.weight 245760

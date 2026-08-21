@@ -136,6 +136,36 @@ target_link_libraries(bench_decode PRIVATE qwen_model)
 add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
+# ---------------------------------------------------------------- gguf
+add_library(qwen_gguf STATIC src/gguf/gguf.cpp)
+target_include_directories(qwen_gguf PUBLIC src third_party)
+
+add_executable(gguf_inspect tools/gguf_inspect.cpp)
+target_link_libraries(gguf_inspect PRIVATE qwen_gguf)
+
+add_library(qwen_gguf_dequant STATIC src/gguf/dequant.cu)
+target_link_libraries(qwen_gguf_dequant PUBLIC qwen_gguf)
+
+# Oracle: links llama.cpp's own ggml so the goldens are ggml's, not a
+# reimplementation of ggml. Only built when LLAMA_CPP_DIR points at a build.
+set(LLAMA_CPP_DIR "${LLAMA_CPP_DIR}" CACHE PATH "llama.cpp source+build, for the GGUF oracle")
+if(LLAMA_CPP_DIR AND EXISTS "${LLAMA_CPP_DIR}/ggml/include/ggml.h")
+  add_executable(gguf_dequant_ref tools/gguf_dequant_ref.cpp)
+  target_include_directories(gguf_dequant_ref PRIVATE ${LLAMA_CPP_DIR}/ggml/include)
+  target_link_directories(gguf_dequant_ref PRIVATE ${LLAMA_CPP_DIR}/build/bin)
+  target_link_libraries(gguf_dequant_ref PRIVATE qwen_gguf ggml ggml-base)
+  set_target_properties(gguf_dequant_ref PROPERTIES
+                        BUILD_RPATH ${LLAMA_CPP_DIR}/build/bin)
+endif()
+
+add_executable(gate_gguf tests/gate_gguf.cu)
+target_link_libraries(gate_gguf PRIVATE qwen_gguf_dequant)
+set(QWEN38_GGUF "${QWEN38_GGUF}" CACHE FILEPATH "UD-IQ4_XS GGUF checkpoint")
+if(QWEN38_GGUF)
+  add_test(NAME gguf_dequant COMMAND gate_gguf ${QWEN38_GGUF}
+           ${CMAKE_SOURCE_DIR}/tests/fixtures/gguf)
+endif()
+
 # ---------------------------------------------------------------- vision
 add_library(qwen_vision STATIC src/vision/vit.cu src/vision/image.cpp src/vision/mm.cpp)
 target_link_libraries(qwen_vision PUBLIC qwen_core CUDA::cublas)
