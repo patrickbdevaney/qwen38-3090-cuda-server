@@ -234,7 +234,37 @@ def main():
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
-    tk = AutoTokenizer.from_pretrained(a.model_dir)
+    from tokenizers import Tokenizer as RawTokenizer
+
+    # AutoTokenizer is used ONLY for apply_chat_template (Jinja rendering).
+    tf = AutoTokenizer.from_pretrained(a.model_dir)
+
+    # Encoding ground truth comes from tokenizers.Tokenizer.from_file, NOT from
+    # AutoTokenizer.
+    #
+    # transformers 5.15.1 REPLACES the pre_tokenizer pattern that ships in
+    # tokenizer.json with a legacy Qwen2 one, dropping \p{M}:
+    #   on disk      ... [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ ... [^\s\p{L}\p{M}\p{N}]+ ...
+    #   transformers ... [^\r\n\p{L}\p{N}]?\p{L}+          ... [^\s\p{L}\p{N}]+      ...
+    # The two disagree on every script with combining marks. Measured on this
+    # checkpoint: 6,354 vocab entries contain a Mark, and 5,504 of them are
+    # UNREACHABLE under the transformers pattern -- it can never emit 2.2% of
+    # the model's own vocabulary. e.g. Thai 'thi' (id 148285) becomes two tokens.
+    # The on-disk pattern emits ~99.9% of them as single tokens.
+    # A tokenizer that cannot produce its own vocabulary is the broken one, so
+    # the on-disk pattern is authoritative and is what src/tokenizer implements.
+    raw = RawTokenizer.from_file(os.path.join(a.model_dir, "tokenizer.json"))
+
+    class _Shim:
+        """Encode/decode via the on-disk pattern; everything else via transformers."""
+        def __init__(self, raw, tf): self._raw, self._tf = raw, tf
+        def encode(self, text, add_special_tokens=False):
+            return self._raw.encode(text, add_special_tokens=add_special_tokens).ids
+        def decode(self, ids, **kw):
+            return self._raw.decode(ids, skip_special_tokens=False)
+        def __len__(self): return len(self._tf)
+        def __getattr__(self, k): return getattr(self._tf, k)
+    tk = _Shim(raw, tf)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     os.makedirs(os.path.join(a.out, "tokenizer"), exist_ok=True)

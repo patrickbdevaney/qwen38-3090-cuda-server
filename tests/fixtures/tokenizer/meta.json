@@ -54,6 +54,6 @@
     "<tts_text_bos_single>": 248075,
     "<|audio_pad|>": 248076
   },
-  "total_corpus_tokens": 394387,
+  "total_corpus_tokens": 393815,
   "segments": 232
 }

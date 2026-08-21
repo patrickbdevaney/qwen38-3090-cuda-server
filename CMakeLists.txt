@@ -27,8 +27,26 @@ find_package(Threads REQUIRED)
 add_executable(microbench bench/microbench.cu)
 target_link_libraries(microbench PRIVATE CUDA::cudart)
 
+# ---------------------------------------------------------------- tokenizer
+add_library(qwen_tokenizer STATIC src/tokenizer/bpe.cpp)
+target_include_directories(qwen_tokenizer PUBLIC src third_party)
+
+# ---------------------------------------------------------------- gates
+# Every gate is a standalone executable returning 0 on pass. `ctest` runs them
+# all; each also runs on its own for debugging.
+enable_testing()
+
+add_executable(gate_nfc tests/gate_nfc.cpp)
+target_include_directories(gate_nfc PRIVATE src third_party)
+add_test(NAME nfc COMMAND gate_nfc ${CMAKE_SOURCE_DIR}/tests/fixtures/nfc_cases.jsonl)
+
+add_executable(gate_tokenizer tests/gate_tokenizer.cpp)
+target_link_libraries(gate_tokenizer PRIVATE qwen_tokenizer)
+add_test(NAME tokenizer COMMAND gate_tokenizer
+         $ENV{QWEN38_MODEL_DIR}/tokenizer.json
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/corpus.jsonl
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/tokenizer/meta.json)
+
 # ---------------------------------------------------------------- server
-# Sources are added per phase as each gate passes. Nothing here yet: Phase 0 is
-# recon only, and the directive forbids writing kernels before Gate 0 passes.
-# Gate 0 has now passed (reports/PHASE_0.md); Phase 1 adds:
-#   src/config, src/loader, src/tokenizer
+# Sources are added per phase as each gate passes.
+#   Phase 1 (in progress): src/config, src/loader, src/tokenizer/chat_template
