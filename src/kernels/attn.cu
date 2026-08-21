@@ -5,6 +5,12 @@
 #include <cuda_runtime.h>
 
 namespace qwen {
+
+// cuBLAS returns NOT_SUPPORTED for unsupported dtype combinations rather than
+// doing anything, so an unchecked call silently produces zeros.
+#define CBA(x) do { cublasStatus_t s_=(x); if(s_!=CUBLAS_STATUS_SUCCESS){ \
+  fprintf(stderr,"cuBLAS %s:%d status %d\n",__FILE__,__LINE__,int(s_)); abort(); } } while(0)
+
 namespace {
 
 // ---------------------------------------------------------------- fp8 e4m3
@@ -49,6 +55,17 @@ __device__ __forceinline__ uint8_t f32_to_e4m3(float f) {
 }
 
 // ---------------------------------------------------------------- rope
+__global__ void k_rope_tables_dev(float* __restrict__ cosv, float* __restrict__ sinv,
+                                  const int32_t* __restrict__ dpos, int half, float theta) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= half) return;
+  const int32_t p = dpos[0];
+  const float inv = float(exp(-log(double(theta)) * (double(2 * j) / double(2 * half))));
+  const float ang = float(p) * inv;
+  cosv[j] = __bfloat162float(__float2bfloat16(cosf(ang)));
+  sinv[j] = __bfloat162float(__float2bfloat16(sinf(ang)));
+}
+
 __global__ void k_rope_tables(float* __restrict__ cosv, float* __restrict__ sinv,
                               const int32_t* __restrict__ pt,
                               const int32_t* __restrict__ ph,
@@ -132,7 +149,7 @@ __global__ void k_prepare_kv(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
                              const float* __restrict__ cosv, const float* __restrict__ sinv,
                              int T, int nkv, int D, int rot, float eps,
                              int stride_in, int k_off, int v_off,
-                             int cache_pos, int max_ctx) {
+                             int cache_pos, int max_ctx, const int32_t* dpos) {
   const int t = blockIdx.x, h = blockIdx.y;
   const int d = threadIdx.x;
   const size_t base = size_t(t) * stride_in;
@@ -160,7 +177,8 @@ __global__ void k_prepare_kv(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
     x = (d < half) ? (sh[d] * c - sh[d + half] * sn)
                    : (sh[d] * c + sh[d - half] * sn);
   }
-  const size_t off = (size_t(cache_pos + t) * nkv + h) * D + d;
+  const int cp = dpos ? dpos[0] : cache_pos;
+  const size_t off = (size_t(cp + t) * nkv + h) * D + d;
   kc[off] = f32_to_e4m3(x);
   vc[off] = f32_to_e4m3(vv);
 }
@@ -182,11 +200,13 @@ __global__ __launch_bounds__(DEC_THREADS) void k_attn_decode(
     float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
     const __nv_bfloat16* __restrict__ q,
     const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
-    int ctx_len, int nkv, int D, int nq, float scaling, int splits) {
+    int ctx_len, int nkv, int D, int nq, float scaling, int splits,
+    const int32_t* __restrict__ d_ctx) {
   const int kvh = blockIdx.x, sp = blockIdx.y;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int d0 = lane * DPL;
 
+  if (d_ctx) ctx_len = d_ctx[0];
   const int per = (ctx_len + splits - 1) / splits;
   const int p0 = sp * per, p1 = min(p0 + per, ctx_len);
 
@@ -317,6 +337,11 @@ __global__ void k_gate(__nv_bfloat16* __restrict__ o, const __nv_bfloat16* __res
 
 // ---------------------------------------------------------------- prefill
 // Dequantize an FP8 KV tile to bf16 so cuBLAS can consume it.
+__global__ void k_fill(float* __restrict__ p, float v, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = v;
+}
+
 __global__ void k_kv_deq(__nv_bfloat16* __restrict__ dst, const uint8_t* __restrict__ src,
                          int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -325,16 +350,21 @@ __global__ void k_kv_deq(__nv_bfloat16* __restrict__ dst, const uint8_t* __restr
 
 // Causal-masked online-softmax update over one KV tile.
 // scores: [nq][q_tile][kv_tile] fp32 in, probabilities out.
-__global__ void k_softmax_tile(float* __restrict__ scores, float* __restrict__ mrun,
+__global__ void k_softmax_tile(float* __restrict__ scores,
+                               __nv_bfloat16* __restrict__ probs,
+                               float* __restrict__ mrun,
                                float* __restrict__ lrun, float* __restrict__ corr,
-                               int q_cap, int q_n, int kv_tile, int kv0, int q_abs0,
-                               float scaling, int ctx_len) {
+                               int q_cap, int q_n, int kv_cap, int kv_tile,
+                               int kv0, int q_abs0, float scaling, int ctx_len) {
   // blockIdx.x enumerates the LIVE rows (nq * q_n) but the buffers are strided
   // by the tile CAPACITY q_cap, so the two must be decoded separately. Deriving
   // h from blockIdx.x / q_cap silently addressed head 0 for every partial tile.
   const int h = blockIdx.x / q_n, qi = blockIdx.x % q_n;
   const int row = h * q_cap + qi;
-  float* s = scores + size_t(row) * kv_tile;
+  // Row stride is the tile CAPACITY, not the live width. Both this and the
+  // GEMM's ldc have to use it, and they only coincide on a full tile -- which
+  // no context under 2048 ever produces, so a short prompt read the wrong row.
+  float* s = scores + size_t(row) * kv_cap;
   const int qpos = q_abs0 + qi;
 
   float mx = -FLT_MAX;
@@ -376,7 +406,11 @@ __global__ void k_softmax_tile(float* __restrict__ scores, float* __restrict__ m
   }
   __syncthreads();
   const float pscale = rm[0];
-  for (int i = threadIdx.x; i < kv_tile; i += blockDim.x) s[i] *= pscale;
+  __nv_bfloat16* pb = probs + size_t(row) * kv_cap;
+  for (int i = threadIdx.x; i < kv_tile; i += blockDim.x) {
+    s[i] *= pscale;
+    pb[i] = __float2bfloat16(s[i]);
+  }
 }
 
 __global__ void k_acc_tile(float* __restrict__ o, const float* __restrict__ corr,
@@ -414,7 +448,7 @@ void attn_prepare(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, uint8_
   k_prepare_kv<<<dim3(T, d.num_kv_heads), d.head_dim, 0, st>>>(
       kc, vc, qkv_in, knw, cosv, sinv, T, d.num_kv_heads, d.head_dim, d.rotary_dim,
       d.rms_eps, stride, d.q_proj_out(), d.q_proj_out() + d.kv_proj_out(),
-      cache_pos, max_ctx);
+      cache_pos, max_ctx, nullptr);
 }
 
 int attn_decode_splits(int ctx_len) {
@@ -456,7 +490,43 @@ void attn_decode(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
   }
   k_attn_decode<6><<<dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st>>>(
       po, pm, pl, q, kc, vc, ctx_len, d.num_kv_heads, d.head_dim, d.num_q_heads,
-      d.scaling(), splits);
+      d.scaling(), splits, nullptr);
+  k_decode_combine<<<d.num_q_heads, d.head_dim, 0, st>>>(out, po, pm, pl,
+                                                         d.num_q_heads, d.head_dim, splits);
+}
+
+void rope_tables_dev(float* c, float* s, const int32_t* dpos, int rot, float theta,
+                     cudaStream_t st) {
+  const int half = rot / 2;
+  k_rope_tables_dev<<<(half + 63) / 64, 64, 0, st>>>(c, s, dpos, half, theta);
+}
+
+void attn_prepare_dev(__nv_bfloat16* q_out, __nv_bfloat16* gate, uint8_t* kc, uint8_t* vc,
+                      const __nv_bfloat16* qkv_in, const __nv_bfloat16* qnw,
+                      const __nv_bfloat16* knw, const float* cosv, const float* sinv,
+                      const int32_t* dpos, int max_ctx, const AttnDims& d,
+                      cudaStream_t st) {
+  const int stride = d.q_proj_out() + 2 * d.kv_proj_out();
+  k_prepare_q<<<dim3(1, d.num_q_heads), d.head_dim, 0, st>>>(
+      q_out, gate, qkv_in, qnw, cosv, sinv, 1, d.num_q_heads, d.head_dim,
+      d.rotary_dim, d.rms_eps, stride);
+  k_prepare_kv<<<dim3(1, d.num_kv_heads), d.head_dim, 0, st>>>(
+      kc, vc, qkv_in, knw, cosv, sinv, 1, d.num_kv_heads, d.head_dim, d.rotary_dim,
+      d.rms_eps, stride, d.q_proj_out(), d.q_proj_out() + d.kv_proj_out(),
+      0, max_ctx, dpos);
+}
+
+void attn_decode_dev(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
+                     const uint8_t* vc, const int32_t* d_ctx, int max_ctx,
+                     const AttnDims& d, float* ws, int splits, cudaStream_t st) {
+  float* po = ws;
+  float* pm = ws + size_t(splits) * d.num_q_heads * d.head_dim;
+  float* pl = pm + size_t(splits) * d.num_q_heads;
+  const size_t sm = size_t(DEC_WARPS) * d.q_per_kv() * d.head_dim * sizeof(float) +
+                    size_t(2 * DEC_WARPS) * d.q_per_kv() * sizeof(float);
+  k_attn_decode<6><<<dim3(d.num_kv_heads, splits), DEC_THREADS, sm, st>>>(
+      po, pm, pl, q, kc, vc, 0, d.num_kv_heads, d.head_dim, d.num_q_heads,
+      d.scaling(), splits, d_ctx);
   k_decode_combine<<<d.num_q_heads, d.head_dim, 0, st>>>(out, po, pm, pl,
                                                          d.num_q_heads, d.head_dim, splits);
 }
@@ -483,10 +553,12 @@ void attn_prefill(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
   const int nkvh = d.num_kv_heads, qpk = d.q_per_kv();
 
   float *o_acc, *mrun, *lrun, *corr;
+  __nv_bfloat16* probs = nullptr;
   cudaMallocAsync(&o_acc, size_t(NQ) * QT * D * sizeof(float), st);
   cudaMallocAsync(&mrun,  size_t(NQ) * QT * sizeof(float), st);
   cudaMallocAsync(&lrun,  size_t(NQ) * QT * sizeof(float), st);
   cudaMallocAsync(&corr,  size_t(NQ) * QT * sizeof(float), st);
+  cudaMallocAsync(&probs, size_t(NQ) * QT * KVT * sizeof(__nv_bfloat16), st);
 
   cublasSetStream(cublas, st);
   const float one = 1.f, zero = 0.f;
@@ -495,8 +567,10 @@ void attn_prefill(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
     const int qn = min(QT, T - q0);
     cudaMemsetAsync(o_acc, 0, size_t(NQ) * QT * D * sizeof(float), st);
     cudaMemsetAsync(lrun, 0, size_t(NQ) * QT * sizeof(float), st);
-    // mrun = -FLT_MAX
-    cudaMemsetAsync(mrun, 0xFF, size_t(NQ) * QT * sizeof(float), st);
+    // mrun = -FLT_MAX. memset(0xFF) gives 0xFFFFFFFF, which is NaN, not
+    // -FLT_MAX; fmaxf then quietly drops it but the (mprev == -FLT_MAX) guard
+    // does not fire, so every running max became NaN and every output NaN.
+    k_fill<<<(NQ * QT + 255) / 256, 256, 0, st>>>(mrun, -FLT_MAX, NQ * QT);
 
     const int qmax = q_offset + q0 + qn - 1;
     for (int kv0 = 0; kv0 < ctx_len; kv0 += KVT) {
@@ -515,33 +589,37 @@ void attn_prefill(__nv_bfloat16* out, const __nv_bfloat16* q, const uint8_t* kc,
       // 6:1 GQA sharing costs no extra memory
       for (int h = 0; h < NQ; ++h) {
         const int kh = h / qpk;
-        cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kvn, qn, D,
+        CBA(cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kvn, qn, D,
                      &one,
                      kv_scratch + size_t(kh) * D, CUDA_R_16BF, nkvh * D,
                      q + (size_t(q0) * NQ + h) * D, CUDA_R_16BF, NQ * D,
                      &zero,
-                     score_scratch + size_t(h) * QT * KVT, CUDA_R_32F, kvn,
-                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                     // ldc is the TILE STRIDE, not the live tile width: the
+                     // softmax indexes rows at KVT and the two only coincide on
+                     // a full tile, which no context under 2048 ever produces.
+                     score_scratch + size_t(h) * QT * KVT, CUDA_R_32F, KVT,
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       }
-      k_softmax_tile<<<NQ * qn, 256, 0, st>>>(score_scratch, mrun, lrun, corr,
-                                              QT, qn, kvn, kv0, q_offset + q0,
+      k_softmax_tile<<<NQ * qn, 256, 0, st>>>(score_scratch, probs, mrun, lrun, corr,
+                                              QT, qn, KVT, kvn, kv0, q_offset + q0,
                                               d.scaling(), ctx_len);
       k_acc_tile<<<NQ * qn, D, 0, st>>>(o_acc, corr, QT, qn, D);
       for (int h = 0; h < NQ; ++h) {
         const int kh = h / qpk;
-        cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, D, qn, kvn,
+        CBA(cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, D, qn, kvn,
                      &one,
                      vbuf + size_t(kh) * D, CUDA_R_16BF, nkvh * D,
-                     score_scratch + size_t(h) * QT * KVT, CUDA_R_32F, kvn,
+                     probs + size_t(h) * QT * KVT, CUDA_R_16BF, KVT,
                      &one,
                      o_acc + size_t(h) * QT * D, CUDA_R_32F, D,
-                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
       }
     }
     k_finish<<<NQ * qn, D, 0, st>>>(out, o_acc, lrun, QT, qn, NQ, D, q0);
   }
   cudaFreeAsync(o_acc, st); cudaFreeAsync(mrun, st);
   cudaFreeAsync(lrun, st);  cudaFreeAsync(corr, st);
+  cudaFreeAsync(probs, st);
 }
 
 }  // namespace qwen

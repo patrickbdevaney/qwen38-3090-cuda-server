@@ -264,3 +264,90 @@ void gemv_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,
 }
 
 }  // namespace qwen
+
+// ================================================================ W8A16
+namespace qwen {
+namespace {
+
+// Same lane-owns-a-row mapping as the INT4 path, so activations broadcast and
+// weights stay coalesced; only the unpack differs (one byte, symmetric).
+__global__ void k_quant_w8(int8_t* __restrict__ q, __nv_bfloat16* __restrict__ sc,
+                           const __nv_bfloat16* __restrict__ src,
+                           int in_f, int G, int group) {
+  const int o = blockIdx.x;
+  const int b = o >> 5, l = o & 31;
+  for (int g = threadIdx.x; g < G; g += blockDim.x) {
+    const size_t base = size_t(o) * in_f + size_t(g) * group;
+    float mx = 0.f;
+    for (int i = 0; i < group; ++i)
+      mx = fmaxf(mx, fabsf(__bfloat162float(src[base + i])));
+    const float s = mx / 127.0f;
+    const float inv = (mx > 0.f) ? 127.0f / mx : 0.f;
+    sc[(size_t(b) * G + g) * 32 + l] = __float2bfloat16(s);
+    for (int i = 0; i < group; ++i) {
+      const int v = __float2int_rn(__bfloat162float(src[base + i]) * inv);
+      q[(size_t(b) * in_f + size_t(g) * group + i) * 32 + l] = int8_t(max(-127, min(127, v)));
+    }
+  }
+}
+
+template <int GROUP>
+__global__ __launch_bounds__(BLOCK) void k_gemv8(
+    float* __restrict__ partial, const int8_t* __restrict__ qw,
+    const __nv_bfloat16* __restrict__ sc, const float* __restrict__ xf,
+    int out_f, int in_f, int G, int groups_per_split) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int o = blockIdx.x * ROWS_PER_BLOCK + warp * WARP + lane;
+  if (o >= out_f) return;
+  const int b = o >> 5;
+  const int g0 = blockIdx.y * groups_per_split;
+  const int g1 = min(g0 + groups_per_split, G);
+
+  float acc = 0.f;
+  for (int g = g0; g < g1; ++g) {
+    const float s = __bfloat162float(sc[(size_t(b) * G + g) * 32 + lane]);
+    const int8_t* wp = qw + (size_t(b) * in_f + size_t(g) * GROUP) * 32 + lane;
+    const float* xp = xf + size_t(g) * GROUP;
+    float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+    #pragma unroll 8
+    for (int t = 0; t < GROUP; t += 4) {
+      p0 = fmaf(float(wp[size_t(t) * 32]),       xp[t],     p0);
+      p1 = fmaf(float(wp[size_t(t + 1) * 32]),   xp[t + 1], p1);
+      p2 = fmaf(float(wp[size_t(t + 2) * 32]),   xp[t + 2], p2);
+      p3 = fmaf(float(wp[size_t(t + 3) * 32]),   xp[t + 3], p3);
+    }
+    acc = fmaf(s, (p0 + p1) + (p2 + p3), acc);
+  }
+  partial[size_t(blockIdx.y) * out_f + o] = acc;
+}
+
+}  // namespace
+
+void quantize_w8a16(W8A16Weights& dst, const __nv_bfloat16* src, int out_f, int in_f,
+                    int group, cudaStream_t st) {
+  dst.out_f = out_f; dst.in_f = in_f; dst.group_size = group;
+  dst.num_groups = in_f / group;
+  cudaMalloc(&dst.qweight, size_t(out_f) * in_f);
+  cudaMalloc(&dst.scale, size_t(out_f) * dst.num_groups * 2);
+  k_quant_w8<<<out_f, 128, 0, st>>>(dst.qweight, dst.scale, src, in_f, dst.num_groups, group);
+}
+
+void w8a16_free(W8A16Weights& w) {
+  cudaFree(w.qweight); cudaFree(w.scale); w = W8A16Weights{};
+}
+
+void gemv_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
+                GemvScratch& s, cudaStream_t st) {
+  const int G = w.num_groups;
+  const int splits = gemv_choose_splits(w.out_f, G);
+  const int gps = G / splits;
+  k_prep<<<G, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size);
+  dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
+  if (w.group_size == 128)
+    k_gemv8<128><<<grid, BLOCK, 0, st>>>(s.partial, w.qweight, w.scale, s.xf,
+                                         w.out_f, w.in_f, G, gps);
+  else { fprintf(stderr, "gemv_w8a16: unsupported group %d\n", w.group_size); abort(); }
+  k_reduce_bf16<<<(w.out_f + 255) / 256, 256, 0, st>>>(y, s.partial, w.out_f, splits);
+}
+
+}  // namespace qwen

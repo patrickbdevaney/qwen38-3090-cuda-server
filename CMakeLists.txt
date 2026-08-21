@@ -72,7 +72,8 @@ add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
          ${CMAKE_SOURCE_DIR}/tests/fixtures/dequant)
 
 add_library(qwen_kernels STATIC src/kernels/gemv_w4a16.cu src/kernels/gemm_w4a16.cu
-                                src/kernels/gdn.cu src/kernels/attn.cu)
+                                src/kernels/gdn.cu src/kernels/attn.cu
+                                src/kernels/elementwise.cu)
 target_include_directories(qwen_kernels PUBLIC src third_party)
 target_link_libraries(qwen_kernels PUBLIC CUDA::cublas)
 set_target_properties(qwen_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
@@ -104,6 +105,25 @@ target_link_libraries(bench_attn PRIVATE qwen_kernels)
 add_executable(bench_decode_gemv bench/bench_decode_gemv.cu)
 target_link_libraries(bench_decode_gemv PRIVATE qwen_core qwen_kernels)
 add_test(NAME gemv_bandwidth COMMAND bench_decode_gemv $ENV{QWEN38_MODEL_DIR})
+
+# ---------------------------------------------------------------- model
+add_library(qwen_model STATIC src/model/model.cu)
+target_link_libraries(qwen_model PUBLIC qwen_core qwen_kernels)
+
+add_executable(gate_forward tests/gate_forward.cu)
+target_link_libraries(gate_forward PRIVATE qwen_model)
+add_test(NAME forward COMMAND gate_forward $ENV{QWEN38_MODEL_DIR}
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/reference 8 1 128)
+
+add_executable(gate_graph tests/gate_graph.cu)
+target_link_libraries(gate_graph PRIVATE qwen_model)
+add_test(NAME cuda_graph COMMAND gate_graph $ENV{QWEN38_MODEL_DIR})
+
+add_executable(bench_decode bench/bench_decode.cu)
+target_link_libraries(bench_decode PRIVATE qwen_model)
+
+add_executable(debug_layers tests/debug_layers.cu)
+target_link_libraries(debug_layers PRIVATE qwen_model)
 
 # ---------------------------------------------------------------- server
 # Sources are added per phase as each gate passes.

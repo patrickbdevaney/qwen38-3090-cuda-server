@@ -115,3 +115,29 @@ void gemv_w4a16_f32(float* y, const W4A16Weights& w, const __nv_bfloat16* x,
 int gemv_choose_splits(int out_f, int num_groups);
 
 }  // namespace qwen
+
+namespace qwen {
+
+// INT8 group-quantized weights, for lm_head.
+//
+// lm_head is the one tensor where 4 bits measurably costs output quality: it
+// maps a 5120-dim state onto 248,320 logits, and a rare token's logit is carried
+// by a handful of large weights that 16 levels cannot represent. INT4 measured a
+// KL of 1.1e-2 (g32) to 1.8e-2 (g128) against 1.5e-3 for everything else.
+// INT8 costs 1.20 GiB against BF16's 2.37 and INT4 g128's 0.62.
+struct W8A16Weights {
+  int8_t*        qweight = nullptr;   // [out/32][in][32] interleaved, same idea as W4A16
+  __nv_bfloat16* scale   = nullptr;   // [out/32][G][32]
+  int out_f = 0, in_f = 0, group_size = 0, num_groups = 0;
+  size_t total_bytes() const {
+    return size_t(out_f) * in_f + size_t(out_f) * num_groups * 2;
+  }
+};
+
+void quantize_w8a16(W8A16Weights& dst, const __nv_bfloat16* src, int out_f, int in_f,
+                    int group_size, cudaStream_t stream = 0);
+void gemv_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
+                GemvScratch& s, cudaStream_t stream = 0);
+void w8a16_free(W8A16Weights& w);
+
+}  // namespace qwen

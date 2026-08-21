@@ -34,12 +34,15 @@ static std::vector<T> load(const std::string& p, size_t n) {
   return v;
 }
 
-struct Stat { double maxabs = 0, maxrel = 0, ref_absmax = 0; };
+struct Stat { double maxabs = 0, maxrel = 0, ref_absmax = 0; bool bad = false; };
 
 static Stat cmp_bf16(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want) {
   Stat s;
   for (size_t i = 0; i < want.size(); ++i) {
     const double a = b2f(got[i]), b = b2f(want[i]);
+    // std::max(x, NaN) returns x, so without this a NaN output would measure as
+    // a ZERO difference and pass. That exact false pass happened in gate_attn.
+    if (!std::isfinite(a)) s.bad = true;
     s.maxabs = std::max(s.maxabs, std::fabs(a - b));
     s.ref_absmax = std::max(s.ref_absmax, std::fabs(b));
   }
@@ -49,6 +52,7 @@ static Stat cmp_bf16(const std::vector<uint16_t>& got, const std::vector<uint16_
 static Stat cmp_f32(const std::vector<float>& got, const std::vector<float>& want) {
   Stat s;
   for (size_t i = 0; i < want.size(); ++i) {
+    if (!std::isfinite(got[i])) s.bad = true;
     s.maxabs = std::max(s.maxabs, std::fabs(double(got[i]) - double(want[i])));
     s.ref_absmax = std::max(s.ref_absmax, std::fabs(double(want[i])));
   }
@@ -123,10 +127,10 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&d_g, size_t(T)*NV*4));
     CK(cudaMalloc(&d_beta, size_t(T)*NV*4));
 
-    qwen::gdn_conv(d_qkv, d_cs, d_mixed, d_conv_w, CD, D.conv_k, T, warm);
+    qwen::gdn_conv(d_qkv, d_cs, d_mixed, d_conv_w, CD, D.conv_k, T, warm, CD);
     qwen::gdn_gates(d_g, d_beta, d_a, d_b, d_Alog, d_dt, T, NV);
     qwen::gdn_scan(d_core, d_S, d_qkv, d_g, d_beta, D, T);
-    qwen::gdn_norm_gate(d_gated, d_core, d_z, d_normw, T, NV, DV, D.rms_eps);
+    qwen::gdn_norm_gate(d_gated, d_core, d_z, d_normw, T, NV, DV, D.rms_eps, NV * DV);
     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
 
     auto fetch_b = [&](__nv_bfloat16* p, size_t n) {
@@ -145,10 +149,10 @@ int main(int argc, char** argv) {
     rows.push_back({"norm+gate",  cmp_bf16(fetch_b(d_gated, size_t(T)*VD), r_gated), 2e-2});
 
     for (auto& r : rows) {
-      const bool ok = r.s.maxrel <= r.tol;
+      const bool ok = r.s.maxrel <= r.tol && !r.s.bad;
       if (!ok) ++nfail;
       printf("%-10s %-18s %11.3e %11.2e %11s\n", name.c_str(), r.stage,
-             r.s.maxabs, r.s.maxrel, ok ? "ok" : "FAIL");
+             r.s.maxabs, r.s.maxrel, ok ? "ok" : (r.s.bad ? "NON-FINITE" : "FAIL"));
     }
 
     cudaFree(d_mixed); cudaFree(d_a); cudaFree(d_b); cudaFree(d_z);

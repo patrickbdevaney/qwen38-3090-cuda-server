@@ -25,7 +25,7 @@ __device__ __forceinline__ float softplus(float x) {
 __global__ void k_conv(__nv_bfloat16* __restrict__ out, float* __restrict__ state,
                        const __nv_bfloat16* __restrict__ in,
                        const __nv_bfloat16* __restrict__ w,
-                       int conv_dim, int K, int T, bool use_state) {
+                       int conv_dim, int K, int T, bool use_state, int in_stride) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= conv_dim) return;
 
@@ -37,7 +37,7 @@ __global__ void k_conv(__nv_bfloat16* __restrict__ out, float* __restrict__ stat
   for (int j = 0; j < K; ++j) wc[j] = __bfloat162float(w[size_t(c) * K + j]);
 
   for (int t = 0; t < T; ++t) {
-    const float x = __bfloat162float(in[size_t(t) * conv_dim + c]);
+    const float x = __bfloat162float(in[size_t(t) * in_stride + c]);
     // Accumulate oldest-to-newest, the order F.conv1d uses. fp32 addition is not
     // associative, and a different order rounds to a different bf16 output,
     // which the delta rule's (v_t - g*S^T k) cancellation then amplifies.
@@ -247,10 +247,13 @@ __global__ void k_norm_gate(__nv_bfloat16* __restrict__ out,
                             const __nv_bfloat16* __restrict__ x,
                             const __nv_bfloat16* __restrict__ z,
                             const __nv_bfloat16* __restrict__ w,
-                            int rows, int D, float eps) {
+                            int rows, int D, float eps, int nh, int z_stride) {
   const int r = blockIdx.x;
   if (r >= rows) return;
   const size_t off = size_t(r) * D;
+  // z lives at column offset z_off of a row that may be wider than nh*D
+  const int tk = r / nh, hh = r % nh;
+  const size_t zoff = size_t(tk) * z_stride + size_t(hh) * D;
   float acc = 0.f;
   for (int i = threadIdx.x; i < D; i += blockDim.x) {
     const float v = __bfloat162float(x[off + i]);
@@ -274,7 +277,7 @@ __global__ void k_norm_gate(__nv_bfloat16* __restrict__ out,
     // weight, then gates in fp32. Reproduced exactly.
     const float n = __bfloat162float(__float2bfloat16(__bfloat162float(x[off + i]) * inv));
     const float wv = __bfloat162float(w[i]);
-    out[off + i] = __float2bfloat16(wv * n * silu(__bfloat162float(z[off + i])));
+    out[off + i] = __float2bfloat16(wv * n * silu(__bfloat162float(z[zoff + i])));
   }
 }
 
@@ -287,7 +290,7 @@ __global__ void k_conv_prefill(__nv_bfloat16* __restrict__ out,
                                const __nv_bfloat16* __restrict__ in,
                                const __nv_bfloat16* __restrict__ w,
                                const float* __restrict__ state,
-                               int conv_dim, int K, int T, bool use_state) {
+                               int conv_dim, int K, int T, bool use_state, int in_stride) {
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= size_t(T) * conv_dim) return;
   const int t = int(i / conv_dim), c = int(i % conv_dim);
@@ -295,7 +298,7 @@ __global__ void k_conv_prefill(__nv_bfloat16* __restrict__ out,
   for (int j = 0; j < K; ++j) {
     const int tt = t + j - (K - 1);
     float x;
-    if (tt >= 0)              x = __bfloat162float(in[size_t(tt) * conv_dim + c]);
+    if (tt >= 0)              x = __bfloat162float(in[size_t(tt) * in_stride + c]);
     else if (use_state)       x = state[size_t(c) * (K - 1) + (K - 1 + tt)];
     else                      x = 0.f;
     acc += __bfloat162float(w[size_t(c) * K + j]) * x;
@@ -306,13 +309,13 @@ __global__ void k_conv_prefill(__nv_bfloat16* __restrict__ out,
 __global__ void k_conv_state_tail(float* __restrict__ state,
                                   const __nv_bfloat16* __restrict__ in,
                                   const float* __restrict__ old_state,
-                                  int conv_dim, int K, int T, bool use_state) {
+                                  int conv_dim, int K, int T, bool use_state, int in_stride) {
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= size_t(conv_dim) * (K - 1)) return;
   const int c = int(i / (K - 1)), j = int(i % (K - 1));
   // new state column j holds input at absolute position T - (K-1) + j
   const int tt = T - (K - 1) + j;
-  if (tt >= 0)        state[i] = __bfloat162float(in[size_t(tt) * conv_dim + c]);
+  if (tt >= 0)        state[i] = __bfloat162float(in[size_t(tt) * in_stride + c]);
   else if (use_state) state[i] = old_state[size_t(c) * (K - 1) + (K - 1 + tt)];
   else                state[i] = 0.f;
 }
@@ -321,9 +324,11 @@ __global__ void k_conv_state_tail(float* __restrict__ state,
 
 void gdn_conv(__nv_bfloat16* out, float* state, const __nv_bfloat16* in,
               const __nv_bfloat16* w, int conv_dim, int K, int T, bool use_state,
-              cudaStream_t st) {
+              int in_stride, cudaStream_t st) {
+  if (in_stride <= 0) in_stride = conv_dim;
   if (T == 1) {
-    k_conv<<<(conv_dim + 255) / 256, 256, 0, st>>>(out, state, in, w, conv_dim, K, T, use_state);
+    k_conv<<<(conv_dim + 255) / 256, 256, 0, st>>>(out, state, in, w, conv_dim, K, T,
+                                                   use_state, in_stride);
     return;
   }
   // The tail must be read before the state is overwritten, so snapshot it.
@@ -337,9 +342,9 @@ void gdn_conv(__nv_bfloat16* out, float* state, const __nv_bfloat16* in,
   }
   cudaMemcpyAsync(saved, state, need, cudaMemcpyDeviceToDevice, st);
   const size_t n = size_t(T) * conv_dim;
-  k_conv_prefill<<<(n + 255) / 256, 256, 0, st>>>(out, in, w, saved, conv_dim, K, T, use_state);
+  k_conv_prefill<<<(n + 255) / 256, 256, 0, st>>>(out, in, w, saved, conv_dim, K, T, use_state, in_stride);
   const size_t m = size_t(conv_dim) * (K - 1);
-  k_conv_state_tail<<<(m + 255) / 256, 256, 0, st>>>(state, in, saved, conv_dim, K, T, use_state);
+  k_conv_state_tail<<<(m + 255) / 256, 256, 0, st>>>(state, in, saved, conv_dim, K, T, use_state, in_stride);
 }
 
 void gdn_gates(float* g, float* beta, const __nv_bfloat16* a, const __nv_bfloat16* b,
@@ -414,8 +419,9 @@ void gdn_scan(__nv_bfloat16* out, float* state, const __nv_bfloat16* qkv,
 
 void gdn_norm_gate(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* z,
                    const __nv_bfloat16* w, int T, int H, int D, float eps,
-                   cudaStream_t st) {
-  k_norm_gate<<<T * H, 128, 0, st>>>(out, x, z, w, T * H, D, eps);
+                   int z_stride, cudaStream_t st) {
+  if (z_stride <= 0) z_stride = H * D;
+  k_norm_gate<<<T * H, 128, 0, st>>>(out, x, z, w, T * H, D, eps, H, z_stride);
 }
 
 }  // namespace qwen

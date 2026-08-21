@@ -37,11 +37,14 @@ template <typename T> static std::vector<T> load(const std::string& p, size_t n)
   f.read(reinterpret_cast<char*>(v.data()), n * sizeof(T));
   return v;
 }
-struct Stat { double maxabs = 0, rel = 0; };
+struct Stat { double maxabs = 0, rel = 0; bool bad = false; };
 static Stat cmp_b(const std::vector<uint16_t>& g, const std::vector<uint16_t>& w) {
   Stat s; double mx = 0;
   for (size_t i = 0; i < w.size(); ++i) {
-    s.maxabs = std::max(s.maxabs, std::fabs(double(b2f(g[i])) - b2f(w[i])));
+    const double gv = b2f(g[i]);
+    if (!std::isfinite(gv)) s.bad = true;   // std::max(x, NaN) returns x: a NaN
+                                            // would otherwise measure as zero
+    s.maxabs = std::max(s.maxabs, std::fabs(gv - b2f(w[i])));
     mx = std::max(mx, std::fabs(double(b2f(w[i]))));
   }
   s.rel = mx > 0 ? s.maxabs / mx : 0; return s;
@@ -49,6 +52,7 @@ static Stat cmp_b(const std::vector<uint16_t>& g, const std::vector<uint16_t>& w
 static Stat cmp_f(const std::vector<float>& g, const std::vector<float>& w) {
   Stat s; double mx = 0;
   for (size_t i = 0; i < w.size(); ++i) {
+    if (!std::isfinite(g[i])) s.bad = true;
     s.maxabs = std::max(s.maxabs, std::fabs(double(g[i]) - w[i]));
     mx = std::max(mx, std::fabs(double(w[i])));
   }
@@ -208,10 +212,10 @@ int main(int argc, char** argv) {
     }
 
     for (auto& r : rows) {
-      const bool ok = r.st.rel <= r.tol;
+      const bool ok = r.st.rel <= r.tol && !r.st.bad;
       if (!ok) ++nfail;
       printf("%-12s %-16s %11.3e %11.2e %8s\n", name.c_str(), r.s,
-             r.st.maxabs, r.st.rel, ok ? "ok" : "FAIL");
+             r.st.maxabs, r.st.rel, ok ? "ok" : (r.st.bad ? "NONFINITE" : "FAIL"));
     }
     cudaFree(d_in); cudaFree(d_pos); cudaFree(d_qo); cudaFree(d_gate);
     cudaFree(d_out); cudaFree(d_kc); cudaFree(d_vc); cudaFree(d_cos); cudaFree(d_sin);

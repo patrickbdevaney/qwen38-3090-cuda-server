@@ -64,6 +64,25 @@ void attn_prepare(__nv_bfloat16* q_out, __nv_bfloat16* gate,
                   int T, int cache_pos, int max_ctx, const AttnDims& d,
                   cudaStream_t stream = 0);
 
+// Graph-capturable variants: the position and context length are read from
+// DEVICE memory instead of being baked in as kernel arguments, so one captured
+// graph serves every decode step. Without this a graph would be pinned to the
+// position it was captured at.
+void attn_prepare_dev(__nv_bfloat16* q_out, __nv_bfloat16* gate,
+                      uint8_t* k_cache, uint8_t* v_cache,
+                      const __nv_bfloat16* qkv_in,
+                      const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+                      const float* cos_tab, const float* sin_tab,
+                      const int32_t* d_pos, int max_ctx, const AttnDims& d,
+                      cudaStream_t stream = 0);
+void attn_decode_dev(__nv_bfloat16* out, const __nv_bfloat16* q,
+                     const uint8_t* k_cache, const uint8_t* v_cache,
+                     const int32_t* d_ctx_len, int max_ctx, const AttnDims& d,
+                     float* workspace, int splits, cudaStream_t stream = 0);
+// Fills a [1] position buffer and the rope table for a single decode step.
+void rope_tables_dev(float* cos_out, float* sin_out, const int32_t* d_pos,
+                     int rotary_dim, float theta, cudaStream_t stream = 0);
+
 // Flash-decoding: one query position, KV split across blocks.
 // out: [num_q_heads, head_dim] bf16
 void attn_decode(__nv_bfloat16* out, const __nv_bfloat16* q,

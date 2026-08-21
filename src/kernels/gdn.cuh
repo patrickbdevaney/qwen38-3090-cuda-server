@@ -48,9 +48,11 @@ struct GdnDims {
 // Causal depthwise conv over the concatenated q|k|v, then SiLU.
 // Decode consumes and updates a [conv_dim, conv_k-1] rolling state; prefill
 // writes the trailing conv_k-1 columns as the new state.
+// `in_stride` is the row stride of `in`, which is the FUSED qkv|z projection
+// width, not conv_dim. Passing conv_dim here reads z as if it were qkv.
 void gdn_conv(__nv_bfloat16* out, float* conv_state, const __nv_bfloat16* in,
               const __nv_bfloat16* weight, int conv_dim, int conv_k, int T,
-              bool use_state, cudaStream_t stream = 0);
+              bool use_state, int in_stride, cudaStream_t stream = 0);
 
 // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). Both fp32, because
 // the reference is explicit that A can overflow to -inf in fp16 otherwise.
@@ -68,8 +70,9 @@ void gdn_scan(__nv_bfloat16* out,        // [T, val_dim]
               const GdnDims& d, int T, cudaStream_t stream = 0);
 
 // Gated RMSNorm over head_v then SiLU gate: out = w * rms(x) * silu(z).
+// `z_stride` likewise: z lives at column conv_dim of the fused projection.
 void gdn_norm_gate(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* z,
                    const __nv_bfloat16* w, int T, int num_v_heads, int head_v,
-                   float eps, cudaStream_t stream = 0);
+                   float eps, int z_stride, cudaStream_t stream = 0);
 
 }  // namespace qwen

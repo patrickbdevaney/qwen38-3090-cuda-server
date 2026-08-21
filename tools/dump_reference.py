@@ -39,6 +39,12 @@ PROMPTS = {
     "p1_code":    "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
     "p2_math":    "If a train travels 60 miles in 1.5 hours, its average speed is",
     "p3_cjk":     "人工智能的本质是",
+    "p4_list":    "The three primary colors are",
+    "p5_code2":   "public static int gcd(int a, int b) {\n    while (b != 0) {",
+    "p6_reason":  "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. Therefore the ball costs",
+    "p7_prose":   "The single most important property of GDDR6X memory for language model inference is",
+    "p8_json":    "{\"name\": \"kernel\", \"arch\": \"sm_86\", \"params\": {",
+    "p9_multi":   "Traduce al espanol: The quick brown fox jumps over the lazy dog. Respuesta:",
 }
 GREEDY_TOKENS = 32
 

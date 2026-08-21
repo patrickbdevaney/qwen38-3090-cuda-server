@@ -27,9 +27,9 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&beta, size_t(T)*NV*4)); CK(cudaMemset(beta, 0, size_t(T)*NV*4));
 
     auto run = [&]{
-      qwen::gdn_conv(qkv, cs, qkv, cw, CD, D.conv_k, T, true);
+      qwen::gdn_conv(qkv, cs, qkv, cw, CD, D.conv_k, T, true, CD);
       qwen::gdn_scan(out, state, qkv, g, beta, D, T);
-      qwen::gdn_norm_gate(z, out, z, w, T, NV, D.head_v, D.rms_eps);
+      qwen::gdn_norm_gate(z, out, z, w, T, NV, D.head_v, D.rms_eps, NV * D.head_v);
     };
     for (int i = 0; i < 3; ++i) run();
     CK(cudaDeviceSynchronize());
