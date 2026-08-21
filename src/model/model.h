@@ -94,12 +94,21 @@ struct Model {
   // The captured graph must be position-INDEPENDENT, so the token id, the
   // position and the context length all live in device memory (d_step), and the
   // attention split count is fixed at capture so the grid shape never changes.
-  cudaGraph_t     graph = nullptr;
-  cudaGraphExec_t graph_exec = nullptr;
+  // Graphs are BUCKETED by context. The attention split count has to be fixed
+  // inside a graph, and sizing it for 128K wastes partial-buffer traffic at
+  // short context: 164 splits x 24 heads x 256 dims x 16 layers is 64 MB per
+  // token, which measured as 47.3 -> 44.8 tok/s at 4K. One graph per bucket
+  // gets both ends.
+  static constexpr int kMaxGraphs = 4;
+  cudaGraph_t     graph[kMaxGraphs] = {};
+  cudaGraphExec_t graph_exec[kMaxGraphs] = {};
+  int             graph_ctx[kMaxGraphs] = {};     // upper bound of each bucket
+  int             graph_splits_of[kMaxGraphs] = {};
+  int             n_graphs = 0;
   cudaStream_t    capture_stream = nullptr;
-  int32_t*        d_step = nullptr;      // [0]=token id, [1]=position
+  int32_t*        d_step = nullptr;      // [0]=token id, [1]=position, [2]=ctx_len
   int32_t*        h_step = nullptr;      // pinned staging for d_step
-  int             graph_splits = 0;
+  int             graph_splits = 0;      // the count the CURRENT step uses
   bool            use_graph = true;
 
   // owned device allocations, freed on destruction
@@ -130,6 +139,7 @@ void model_prefill(Model& m, const int32_t* ids, int T, int position);
 
 // Capture the decode step as a CUDA graph. Call once after load.
 void model_graph_capture(Model& m);
+int  model_graph_bucket(const Model& m, int ctx);
 
 // Greedy generation; returns the generated ids.
 std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>& prompt,

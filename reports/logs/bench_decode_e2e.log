@@ -1,5 +1,28 @@
-VRAM: 22.83 GiB free of 23.57 GiB
+VRAM: 23.17 GiB free of 23.57 GiB
   loaded 16/64 layers
   loaded 32/64 layers
   loaded 48/64 layers
   loaded 64/64 layers
+
+=== VRAM ===
+  body (int4 fused)      11.859 GiB
+  lm_head                 1.203 GiB (8-bit)
+  embed_tokens            1.185 GiB (INT8 rowwise)
+  KV cache @ 131072 ctx     4.000 GiB (FP8, 32 KiB/token)
+  GDN state               0.141 GiB
+  free after load         2.444 GiB
+
+lm_head 8-bit, max_ctx 131072
+CUDA graphs captured: 3 buckets, 1750 nodes each (ctx<=8192:s32, 32768:s128, 131072:s164)
+
+     ctx    median ms       p95 ms        tok/s      vs 4K
+    4096        21.87        23.03         45.7       100%
+   16384        23.27        24.70         43.0        94%
+   32768        24.65        25.85         40.6        89%
+   65536        26.84        28.55         37.3        81%
+  131072        31.72        33.18         31.5        69%
+
+G1 gate: 45 tok/s min at 4K (revised up from 35; llama.cpp measures 38.41)
+G2 gate: 64K decode >= 85% of 4K
+LONG_RC=0
+PEAK_VRAM_MIB 22066

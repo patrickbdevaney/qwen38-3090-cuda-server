@@ -439,14 +439,29 @@ void model_prefill(Model& m, const int32_t* ids, int T, int position) {
   m.ctx_len = position + T;
 }
 
+int model_graph_bucket(const Model& m, int ctx) {
+  for (int i = 0; i < m.n_graphs; ++i) if (ctx <= m.graph_ctx[i]) return i;
+  return m.n_graphs - 1;
+}
+
 void model_graph_capture(Model& m) {
   const ModelShape& S = m.shape;
   if (!m.d_step) {
     m.d_step = static_cast<int32_t*>(dalloc(m, 16));
     CKM(cudaHostAlloc(&m.h_step, 16, cudaHostAllocDefault));
   }
-  // Split count was already fixed at load, so the eager path matches.
   CKM(cudaStreamCreate(&m.capture_stream));
+
+  const int cand[] = {8192, 32768, 131072};
+  m.n_graphs = 0;
+  for (int c : cand) {
+    const int b = std::min(c, m.max_ctx);
+    if (m.n_graphs && m.graph_ctx[m.n_graphs - 1] >= b) continue;
+    m.graph_ctx[m.n_graphs] = b;
+    m.graph_splits_of[m.n_graphs] = attn_decode_splits(b);
+    ++m.n_graphs;
+    if (b >= m.max_ctx) break;
+  }
 
   cudaStream_t saved = m.stream;
   m.stream = m.capture_stream;
@@ -469,29 +484,41 @@ void model_graph_capture(Model& m) {
   // graph records an allocation it cannot replay.
   m.h_step[0] = 0; m.h_step[1] = 0; m.h_step[2] = 1;
   CKM(cudaMemcpy(m.d_step, m.h_step, 12, cudaMemcpyHostToDevice));
-  body();
-  CKM(cudaStreamSynchronize(m.capture_stream));
-
-  CKM(cudaStreamBeginCapture(m.capture_stream, cudaStreamCaptureModeThreadLocal));
-  body();
-  CKM(cudaStreamEndCapture(m.capture_stream, &m.graph));
-  CKM(cudaGraphInstantiate(&m.graph_exec, m.graph, nullptr, nullptr, 0));
+  for (int g = 0; g < m.n_graphs; ++g) {
+    m.graph_splits = m.graph_splits_of[g];
+    // Warm up OUTSIDE capture: the one-shot cudaFuncSetAttribute opt-ins and any
+    // lazy cuBLAS workspace allocation must not happen during capture, or the
+    // graph records an allocation it cannot replay.
+    body();
+    CKM(cudaStreamSynchronize(m.capture_stream));
+    CKM(cudaStreamBeginCapture(m.capture_stream, cudaStreamCaptureModeThreadLocal));
+    body();
+    CKM(cudaStreamEndCapture(m.capture_stream, &m.graph[g]));
+    CKM(cudaGraphInstantiate(&m.graph_exec[g], m.graph[g], nullptr, nullptr, 0));
+  }
 
   m.stream = saved;
   cublasSetStream(m.cublas, saved);
   size_t nodes = 0;
-  cudaGraphGetNodes(m.graph, nullptr, &nodes);
-  printf("CUDA graph captured: %zu nodes, splits fixed at %d\n", nodes, m.graph_splits);
+  cudaGraphGetNodes(m.graph[0], nullptr, &nodes);
+  printf("CUDA graphs captured: %d buckets, %zu nodes each (ctx<=", m.n_graphs, nodes);
+  for (int g = 0; g < m.n_graphs; ++g)
+    printf("%d:s%d%s", m.graph_ctx[g], m.graph_splits_of[g], g + 1 < m.n_graphs ? ", " : ")\n");
 }
 
 void model_decode(Model& m, int32_t id, int position) {
-  if (m.use_graph && m.graph_exec) {
+  if (m.use_graph && m.n_graphs) {
+    const int g = model_graph_bucket(m, position + 1);
+    m.graph_splits = m.graph_splits_of[g];
     m.h_step[0] = id; m.h_step[1] = position; m.h_step[2] = position + 1;
     CKM(cudaMemcpy(m.d_step, m.h_step, 12, cudaMemcpyHostToDevice));
-    CKM(cudaGraphLaunch(m.graph_exec, 0));
+    CKM(cudaGraphLaunch(m.graph_exec[g], m.stream));
     m.ctx_len = position + 1;
     return;
   }
+  // Eager path must pick the SAME split count the graph would, or the two are
+  // not bitwise identical (gate_graph).
+  if (m.n_graphs) m.graph_splits = m.graph_splits_of[model_graph_bucket(m, position + 1)];
   model_prefill(m, &id, 1, position);
 }
 
