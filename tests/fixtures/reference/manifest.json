@@ -1,0 +1,204 @@
+{
+  "model_dir": "/home/patrickd/qwen38-weights/Qwen3.8-27B-BF16-from-INT4",
+  "num_hidden_layers": 64,
+  "hidden_size": 5120,
+  "vocab_size": 248320,
+  "layer_types": [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention"
+  ],
+  "dflash2_taps": [
+    5,
+    19,
+    33,
+    47,
+    61
+  ],
+  "greedy_tokens": 32,
+  "prompts": {
+    "p0_factual": {
+      "text": "The capital of France is",
+      "ids": [
+        760,
+        6511,
+        314,
+        9338,
+        369
+      ],
+      "seq_len": 5,
+      "num_hidden_states": 65,
+      "hidden_shape": [
+        5,
+        5120
+      ],
+      "logits_shape": [
+        5,
+        248320
+      ],
+      "logits_topk": 1024,
+      "top1_last": 11751,
+      "top1_last_text": " Paris",
+      "logits_absmax": 18.25
+    },
+    "p1_code": {
+      "text": "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
+      "ids": [
+        727,
+        73111,
+        1393,
+        1590,
+        198,
+        262,
+        413,
+        307,
+        361,
+        220,
+        17,
+        25,
+        198,
+        285,
+        460,
+        307,
+        198,
+        262,
+        460
+      ],
+      "seq_len": 19,
+      "num_hidden_states": 65,
+      "hidden_shape": [
+        19,
+        5120
+      ],
+      "logits_shape": [
+        19,
+        248320
+      ],
+      "logits_topk": 1024,
+      "top1_last": 73111,
+      "top1_last_text": " fibonacci",
+      "logits_absmax": 25.875
+    },
+    "p2_math": {
+      "text": "If a train travels 60 miles in 1.5 hours, its average speed is",
+      "ids": [
+        2592,
+        264,
+        5257,
+        33060,
+        220,
+        21,
+        15,
+        8491,
+        303,
+        220,
+        16,
+        13,
+        20,
+        3979,
+        11,
+        1141,
+        5289,
+        4478,
+        369
+      ],
+      "seq_len": 19,
+      "num_hidden_states": 65,
+      "hidden_shape": [
+        19,
+        5120
+      ],
+      "logits_shape": [
+        19,
+        248320
+      ],
+      "logits_topk": 1024,
+      "top1_last": 220,
+      "top1_last_text": " ",
+      "logits_absmax": 25.0
+    },
+    "p3_cjk": {
+      "text": "人工智能的本质是",
+      "ids": [
+        109015,
+        122233,
+        95761
+      ],
+      "seq_len": 3,
+      "num_hidden_states": 65,
+      "hidden_shape": [
+        3,
+        5120
+      ],
+      "logits_shape": [
+        3,
+        248320
+      ],
+      "logits_topk": 1024,
+      "top1_last": 100041,
+      "top1_last_text": "模拟",
+      "logits_absmax": 16.0
+    }
+  }
+}
