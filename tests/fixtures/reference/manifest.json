@@ -76,7 +76,7 @@
     47,
     61
   ],
-  "greedy_tokens": 32,
+  "greedy_tokens": "varies (see greedy_len)",
   "prompts": {
     "p0_factual": {
       "text": "The capital of France is",
@@ -100,7 +100,8 @@
       "logits_topk": 1024,
       "top1_last": 11751,
       "top1_last_text": " Paris",
-      "logits_absmax": 18.25
+      "logits_absmax": 18.25,
+      "greedy_len": 96
     },
     "p1_code": {
       "text": "def fibonacci(n):\n    if n < 2:\n        return n\n    return",
@@ -138,7 +139,8 @@
       "logits_topk": 1024,
       "top1_last": 73111,
       "top1_last_text": " fibonacci",
-      "logits_absmax": 25.875
+      "logits_absmax": 25.875,
+      "greedy_len": 96
     },
     "p2_math": {
       "text": "If a train travels 60 miles in 1.5 hours, its average speed is",
@@ -176,7 +178,8 @@
       "logits_topk": 1024,
       "top1_last": 220,
       "top1_last_text": " ",
-      "logits_absmax": 25.0
+      "logits_absmax": 25.0,
+      "greedy_len": 96
     },
     "p3_cjk": {
       "text": "人工智能的本质是",
@@ -198,7 +201,8 @@
       "logits_topk": 1024,
       "top1_last": 100041,
       "top1_last_text": "模拟",
-      "logits_absmax": 16.0
+      "logits_absmax": 16.0,
+      "greedy_len": 96
     }
   }
 }

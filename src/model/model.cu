@@ -1,8 +1,10 @@
 #include "model.h"
 #include "../loader/safetensors.h"
 #include "../kernels/elementwise.cuh"
+#include "../spec/spec.h"
 
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -13,6 +15,62 @@ namespace {
 
 #define CKM(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); abort(); } } while(0)
+
+__global__ void k_capture_pre(__nv_bfloat16* __restrict__ dst,
+                              const __nv_bfloat16* __restrict__ src,
+                              int T, int conv_dim, int stride) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= size_t(T) * conv_dim) return;
+  dst[i] = src[(i / conv_dim) * stride + (i % conv_dim)];
+}
+
+void capture_pre_conv(__nv_bfloat16* dst, const __nv_bfloat16* src, int T, int conv_dim,
+                      int stride, cudaStream_t st) {
+  const size_t n = size_t(T) * conv_dim;
+  k_capture_pre<<<(n + 255) / 256, 256, 0, st>>>(dst, src, T, conv_dim, stride);
+}
+
+// Debug aid: QWEN_DEBUG_SYNC=1 synchronises after every stage of run_layer and
+// aborts at the first kernel that faults, instead of letting the sticky error
+// surface hundreds of launches later in an unrelated call.
+cudaStream_t g_dbg_stream = cudaStreamPerThread;
+
+// QWEN_DEBUG_SYNC=1 aborts at the first faulting stage. =2 turns the same hooks
+// into a per-stage wall-clock profile summed over all 64 layers, which is how
+// the "T>=2 costs a flat 40 ms" cliff was traced to a single kernel.
+struct DbgStage { const char* name; double ms; long n; };
+DbgStage g_dbg[32];
+int g_dbg_n = 0;
+double g_dbg_last = 0;
+
+double now_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void dsync(const char* where, int li = -1) {
+  static int on = -1;
+  if (on < 0) { const char* e = getenv("QWEN_DEBUG_SYNC"); on = e ? atoi(e) : 0; }
+  if (!on) return;
+  // cudaDeviceSynchronize is illegal mid-capture; the debug sweep has to sit out
+  // the graph build.
+  cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(g_dbg_stream, &cs) == cudaSuccess &&
+      cs != cudaStreamCaptureStatusNone) { cudaGetLastError(); return; }
+  cudaError_t e = cudaDeviceSynchronize();
+  if (e != cudaSuccess) {
+    fprintf(stderr, "QWEN_DEBUG_SYNC: fault at layer %d stage %s -> %s\n", li, where,
+            cudaGetErrorString(e));
+    abort();
+  }
+  if (on < 2) return;
+  const double t = now_ms();
+  int slot = -1;
+  for (int i = 0; i < g_dbg_n; ++i) if (g_dbg[i].name == where) { slot = i; break; }
+  if (slot < 0 && g_dbg_n < 32) { slot = g_dbg_n++; g_dbg[slot] = {where, 0.0, 0}; }
+  if (slot >= 0 && g_dbg_last > 0) { g_dbg[slot].ms += t - g_dbg_last; g_dbg[slot].n++; }
+  g_dbg_last = t;
+}
 
 void* dalloc(Model& m, size_t bytes) {
   void* p = nullptr;
@@ -270,7 +328,11 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.logits   = static_cast<__nv_bfloat16*>(dalloc(m, size_t(S.vocab_size) * 2));
   m.pos_buf  = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
   m.id_buf   = static_cast<int32_t*>(dalloc(m, size_t(B) * 4));
-  m.argmax_scratch = static_cast<int32_t*>(dalloc(m, 256 * 8));
+  // 256 partial indices + 256 partial values = 512 ints, then room for the
+  // chosen id and slack. The previous 256*8 allocation was EXACTLY 512 ints and
+  // callers wrote the result at +512, one past the end -- it happened to work
+  // until an adjacent allocation moved.
+  m.argmax_scratch = static_cast<int32_t*>(dalloc(m, 4096));
   m.graph_splits = attn_decode_splits(m.max_ctx);
   const int maxsp = m.graph_splits;
   m.attn_ws  = static_cast<float*>(dalloc(m, attn_decode_workspace_bytes(m.attn, maxsp)));
@@ -310,17 +372,61 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
 // ================================================================= forward
 namespace {
 
+// Which linear path to use for T rows.
+//   T == 1        : the GEMV, 807 GB/s
+//   2 <= T <= 16  : the tensor-core W4A16 GEMM. Flat in T (0.21 ms at T=1 to
+//                   0.22 at T=16 on the dominant tensor), which is what makes
+//                   verifying a speculative block cost about one decode step.
+//   T > 16        : dequantize to bf16 and hand it to cuBLAS, which is worth
+//                   its extra traffic only once the arithmetic dominates.
+enum class LinPath { Gemv, Mma, Cublas };
+static LinPath lin_path(int T) {
+  static int mode = -1;
+  if (mode < 0) { const char* e = getenv("QWEN_LINPATH"); mode = e ? atoi(e) : 0; }
+  if (T == 1) return LinPath::Gemv;
+  if (mode == 1) return LinPath::Cublas;          // debug: no MMA
+  if (T <= 16) return LinPath::Mma;
+  return LinPath::Cublas;
+}
+
+static void linear(Model& m, __nv_bfloat16* out, const W4A16Weights& w,
+                   const __nv_bfloat16* in, int T) {
+  { static int on = -1;
+    if (on < 0) { const char* e = getenv("QWEN_DEBUG_SYNC"); on = e && atoi(e); }
+    if (on) fprintf(stderr, "  linear T=%d in=%d out=%d group=%d path=%d\n",
+                    T, w.in_f, w.out_f, w.group_size, int(lin_path(T))); }
+  switch (lin_path(T)) {
+    case LinPath::Gemv:   gemv_w4a16(out, w, in, m.gemv, m.stream); break;
+    case LinPath::Mma:    gemm_mma_w4a16(out, w, in, T, m.gemv, m.stream); break;
+    case LinPath::Cublas: gemm_w4a16(out, w, in, T, m.gemm, m.stream); break;
+  }
+}
+
 void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos = false) {
   LayerWeights& L = m.layers[li];
   const ModelShape& S = m.shape;
   const int H = S.hidden_size;
+  g_dbg_stream = m.stream;
+  // Timing probe only: force the T=1 attention/GDN kernels at T>1. The result is
+  // numerically wrong (attention sees one query row), but it isolates how much
+  // of the T>=2 block cost is the prefill-shaped attention path.
+  { static int f = -1;
+    if (f < 0) { const char* e = getenv("QWEN_FORCE_DECODE"); f = e && atoi(e); }
+    if (f) {
+      static bool warned = false;
+      if (!warned) { warned = true;
+        fprintf(stderr, "*** QWEN_FORCE_DECODE=1: attention sees ONE query row at T>1. "
+                        "Output is WRONG. Timing probe only. ***\n"); }
+      prefill = false;
+    } }
 
   // ---- token mixer ----
   rmsnorm(m.h2, m.h, L.input_ln, T, H, S.rms_norm_eps, m.stream);
+  dsync("input_ln", li);
   if (L.is_attn) {
     const int qkv_w = int(m.attn.q_proj_out() + 2 * m.attn.kv_proj_out());
-    if (prefill) gemm_w4a16(m.proj, L.attn_qkv, m.h2, T, m.gemm, m.stream);
-    else         gemv_w4a16(m.proj, L.attn_qkv, m.h2, m.gemv, m.stream);
+    linear(m, m.proj, L.attn_qkv, m.h2, T);
+    dsync("attn_qkv", li);
     uint8_t* kcw = m.k_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
     uint8_t* vcw = m.v_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
     if (dev_pos)
@@ -329,6 +435,7 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
     else
       attn_prepare(m.q_buf, m.gate_buf, kcw, vcw, m.proj, L.q_norm, L.k_norm,
                    m.cos_tab, m.sin_tab, T, position, m.max_ctx, m.attn, m.stream);
+    dsync("attn_prepare", li);
     const uint8_t* kc = m.k_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
     const uint8_t* vc = m.v_cache + size_t(L.attn_slot) * m.max_ctx * m.attn.kv_proj_out();
     if (prefill) {
@@ -348,11 +455,12 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
                   m.attn_ws, m.graph_splits, m.stream);
     }
     attn_output_gate(m.attn_out, m.gate_buf, T * int(m.attn.o_proj_in()), m.stream);
-    if (prefill) gemm_w4a16(m.h2, L.attn_o, m.attn_out, T, m.gemm, m.stream);
-    else         gemv_w4a16(m.h2, L.attn_o, m.attn_out, m.gemv, m.stream);
+    dsync("attn_gate", li);
+    linear(m, m.h2, L.attn_o, m.attn_out, T);
+    dsync("attn_o", li);
   } else {
-    if (prefill) gemm_w4a16(m.proj, L.gdn_in_qkvz, m.h2, T, m.gemm, m.stream);
-    else         gemv_w4a16(m.proj, L.gdn_in_qkvz, m.h2, m.gemv, m.stream);
+    linear(m, m.proj, L.gdn_in_qkvz, m.h2, T);
+    dsync("gdn_in", li);
     // in_proj_a and in_proj_b are tiny bf16 tensors, so cuBLAS is fine
     const float one = 1.f, zero = 0.f;
     const int NV = S.linear_num_value_heads;
@@ -372,27 +480,47 @@ void run_layer(Model& m, int li, int T, int position, bool prefill, bool dev_pos
              // position-dependent bool would make the graph position-specific.
              m.proj, L.gdn_conv_w, int(m.gdn.conv_dim()), m.gdn.conv_k, T,
              dev_pos ? true : (position > 0), fused_w, m.stream);
+    dsync("gdn_conv", li);
     gdn_gates(m.gdn_g, m.gdn_beta, m.gdn_ab, m.gdn_ab + size_t(T) * NV,
               L.gdn_A_log, L.gdn_dt_bias, T, NV, m.stream);
+    dsync("gdn_gates", li);
+    if (m.spec && m.spec->capturing && T <= m.spec->block) {
+      // Capture BEFORE the scan advances the state: the replay needs the same
+      // inputs the forward saw, and the projections must not be redone.
+      const int CD = int(m.gdn.conv_dim());
+      capture_pre_conv(m.spec->pre_conv + size_t(gdn_idx) * m.spec->block * CD,
+                       m.proj, T, CD, fused_w, m.stream);
+      CKM(cudaMemcpyAsync(m.spec->post_conv + size_t(gdn_idx) * m.spec->block * CD,
+                          m.gdn_qkv, size_t(T) * CD * 2, cudaMemcpyDeviceToDevice, m.stream));
+      CKM(cudaMemcpyAsync(m.spec->g + size_t(gdn_idx) * m.spec->block * NV,
+                          m.gdn_g, size_t(T) * NV * 4, cudaMemcpyDeviceToDevice, m.stream));
+      CKM(cudaMemcpyAsync(m.spec->beta + size_t(gdn_idx) * m.spec->block * NV,
+                          m.gdn_beta, size_t(T) * NV * 4, cudaMemcpyDeviceToDevice, m.stream));
+    }
     gdn_scan(m.gdn_core, m.gdn_state + size_t(gdn_idx) * NV * m.gdn.head_k * m.gdn.head_v,
              m.gdn_qkv, m.gdn_g, m.gdn_beta, m.gdn, T, m.stream);
+    dsync("gdn_scan", li);
     // z is the second half of the fused in_proj output, so it is at column
     // conv_dim of a row that is conv_dim + val_dim wide.
     gdn_norm_gate(m.gdn_core, m.gdn_core, m.proj + m.gdn.conv_dim(), L.gdn_norm, T, NV,
                   m.gdn.head_v, S.rms_norm_eps, fused_w, m.stream);
-    if (prefill) gemm_w4a16(m.h2, L.gdn_out, m.gdn_core, T, m.gemm, m.stream);
-    else         gemv_w4a16(m.h2, L.gdn_out, m.gdn_core, m.gemv, m.stream);
+    dsync("gdn_norm_gate", li);
+    linear(m, m.h2, L.gdn_out, m.gdn_core, T);
+    dsync("gdn_out", li);
     (void)gi;
   }
+  dsync("mixer_residual", li);
   residual_add(m.h, m.h2, T * H, m.stream);
 
   // ---- mlp ----
   rmsnorm(m.h2, m.h, L.post_ln, T, H, S.rms_norm_eps, m.stream);
-  if (prefill) gemm_w4a16(m.proj, L.mlp_gate_up, m.h2, T, m.gemm, m.stream);
-  else         gemv_w4a16(m.proj, L.mlp_gate_up, m.h2, m.gemv, m.stream);
+  dsync("post_ln", li);
+  linear(m, m.proj, L.mlp_gate_up, m.h2, T);
+  dsync("mlp_gate_up", li);
   swiglu(m.mlp_tmp, m.proj, T, S.intermediate_size, m.stream);
-  if (prefill) gemm_w4a16(m.h2, L.mlp_down, m.mlp_tmp, T, m.gemm, m.stream);
-  else         gemv_w4a16(m.h2, L.mlp_down, m.mlp_tmp, m.gemv, m.stream);
+  dsync("swiglu", li);
+  linear(m, m.h2, L.mlp_down, m.mlp_tmp, T);
+  dsync("mlp_down", li);
   residual_add(m.h, m.h2, T * H, m.stream);
 }
 
@@ -506,6 +634,33 @@ void model_graph_capture(Model& m) {
     printf("%d:s%d%s", m.graph_ctx[g], m.graph_splits_of[g], g + 1 < m.n_graphs ? ", " : ")\n");
 }
 
+void model_forward_all_logits(Model& m, const int32_t* ids, int T, int position,
+                              __nv_bfloat16* logits_out) {
+  const ModelShape& S = m.shape;
+  CKM(cudaMemcpyAsync(m.id_buf, ids, size_t(T) * 4, cudaMemcpyHostToDevice, m.stream));
+  std::vector<int32_t> pos(T);
+  for (int i = 0; i < T; ++i) pos[i] = position + i;
+  CKM(cudaMemcpyAsync(m.pos_buf, pos.data(), size_t(T) * 4, cudaMemcpyHostToDevice, m.stream));
+  if (m.embed_quantized) embed_int8(m.h, m.embed_q, m.embed_scale, m.id_buf, T, S.hidden_size, m.stream);
+  else                   embed_bf16(m.h, m.embed_bf, m.id_buf, T, S.hidden_size, m.stream);
+  rope_tables(m.cos_tab, m.sin_tab, m.pos_buf, m.pos_buf, m.pos_buf, T,
+              S.rotary_dims, float(S.rope_theta), m.stream);
+  for (int i = 0; i < S.num_hidden_layers; ++i) run_layer(m, i, T, position, T > 1);
+  rmsnorm(m.h2, m.h, m.final_norm, T, S.hidden_size, S.rms_norm_eps, m.stream);
+  if (m.lm_head_bits == 4)      gemm_mma_w4a16(logits_out, m.lm_head_q, m.h2, T, m.gemv, m.stream);
+  else if (m.lm_head_bits == 8) gemm_small_w8a16(logits_out, m.lm_head_q8, m.h2, T, m.gemv, m.stream);
+  else {
+    const float one = 1.f, zero = 0.f;
+    cublasSetStream(m.cublas, m.stream);
+    cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N, S.vocab_size, T, S.hidden_size,
+                 &one, m.lm_head_bf16, CUDA_R_16BF, S.hidden_size,
+                 m.h2, CUDA_R_16BF, S.hidden_size, &zero,
+                 logits_out, CUDA_R_16BF, S.vocab_size,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+  m.ctx_len = position + T;
+}
+
 void model_decode(Model& m, int32_t id, int position) {
   if (m.use_graph && m.n_graphs) {
     const int g = model_graph_bucket(m, position + 1);
@@ -536,6 +691,19 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
     if (i + 1 < max_new) model_decode(m, tok, int(prompt.size()) + i);
   }
   return out;
+}
+
+void dbg_profile_report(const char* tag) {
+  if (!g_dbg_n) return;
+  double tot = 0;
+  for (int i = 0; i < g_dbg_n; ++i) tot += g_dbg[i].ms;
+  printf("\n--- stage profile [%s]  total %.2f ms ---\n", tag, tot);
+  for (int i = 0; i < g_dbg_n; ++i)
+    printf("  %-14s %9.3f ms  %5ld calls  %7.3f ms/call  %5.1f%%\n",
+           g_dbg[i].name, g_dbg[i].ms, g_dbg[i].n,
+           g_dbg[i].n ? g_dbg[i].ms / g_dbg[i].n : 0.0, 100.0 * g_dbg[i].ms / tot);
+  for (int i = 0; i < g_dbg_n; ++i) { g_dbg[i].ms = 0; g_dbg[i].n = 0; }
+  g_dbg_last = 0;
 }
 
 }  // namespace qwen

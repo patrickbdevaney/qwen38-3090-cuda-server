@@ -86,6 +86,11 @@ struct Model {
   // hidden_states list so a divergence localises to one layer.
   __nv_bfloat16* dbg_hidden = nullptr;   // [num_layers+1][max_batch][hidden]
 
+  // Speculative-decoding capture hook. When set and armed, each GDN layer
+  // records the recurrence inputs for the block so a partial acceptance can
+  // replay them instead of redoing the forward.
+  struct SpecState* spec = nullptr;
+
   // ---- CUDA graph for the decode step ----------------------------------
   // A decode step issues ~1400 kernels; at 2-3 us of launch latency each that
   // is ~4 ms against a ~18 ms budget, which measured as exactly the gap between
@@ -136,6 +141,9 @@ void model_load(Model& m, const std::string& model_dir, const LoadOptions& opt);
 void model_decode(Model& m, int32_t token_id, int position);
 // Prefill T tokens starting at `position`; logits are produced for the last one.
 void model_prefill(Model& m, const int32_t* ids, int T, int position);
+// Same, but writes logits for EVERY position, which block verification needs.
+void model_forward_all_logits(Model& m, const int32_t* ids, int T, int position,
+                              __nv_bfloat16* logits_out);
 
 // Capture the decode step as a CUDA graph. Call once after load.
 void model_graph_capture(Model& m);
@@ -144,5 +152,8 @@ int  model_graph_bucket(const Model& m, int ctx);
 // Greedy generation; returns the generated ids.
 std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>& prompt,
                                            int max_new, int eos_id);
+
+// QWEN_DEBUG_SYNC=2: print and reset the per-stage wall-clock profile.
+void dbg_profile_report(const char* tag);
 
 }  // namespace qwen

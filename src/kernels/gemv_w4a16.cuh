@@ -94,17 +94,20 @@ void awq_free(W4A16Weights& w);
 struct GemvScratch {
   float* xf     = nullptr;   // [in_f]
   float* xgsum  = nullptr;   // [num_groups]
-  float* partial= nullptr;   // [max_splits][out_f]
+  float* partial= nullptr;   // [splits][M][out_f], capacity partial_elems
   int    max_in = 0, max_groups = 0, max_out = 0, max_splits = 0, max_m = 1;
+  size_t partial_elems = 0;
   size_t bytes() const {
-    return (size_t(max_in) + size_t(max_groups) +
-            size_t(max_splits) * max_out) * size_t(max_m) * 4;
+    return (size_t(max_in) + size_t(max_groups)) * size_t(max_m) * 4
+           + partial_elems * 4;
   }
 };
 
 void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group,
                         int max_m = 1);
 void gemv_scratch_free(GemvScratch& s);
+// Aborts with a readable message if splits*M*out_f exceeds the partial capacity.
+void gemv_partial_check(const GemvScratch& s, int splits, int out_f, int M);
 
 // Skinny GEMM: Y[M, out] = X[M, in] @ W^T, for small M (the speculative block).
 //
@@ -155,6 +158,33 @@ void quantize_w8a16(W8A16Weights& dst, const __nv_bfloat16* src, int out_f, int 
                     int group_size, cudaStream_t stream = 0);
 void gemv_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
                 GemvScratch& s, cudaStream_t stream = 0);
+// M-row variant for the speculative block. lm_head is the one tensor that must
+// stay at 8 bits (INT4 measured a KL of 1.8e-2 against 7.8e-4), so the block
+// needs an 8-bit multi-row path of its own.
+void gemm_small_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
+                      int M, GemvScratch& s, cudaStream_t stream = 0);
 void w8a16_free(W8A16Weights& w);
+
+}  // namespace qwen
+
+namespace qwen {
+
+// Tensor-core W4A16 GEMM for the speculative block: Y[M,out] = X[M,in] @ W^T.
+//
+// WHY THIS EXISTS. The scalar M-row kernel is ISSUE bound, not memory bound: at
+// M=8 each lane runs ~96 instructions per 4-byte weight word, about 20 per byte,
+// against a memory roofline that allows roughly one. Measured M=8 at 3.5x the
+// cost of M=1 when the weight stream says it should be ~1.0x.
+//
+// In the MMA formulation the dequant is amortised across all M rows (it happens
+// once per weight, into shared memory) and the multiply-accumulates move to the
+// tensor cores, where one mma.sync.m16n8k16 does 2048 MACs. That takes the
+// instruction count per 256 bytes of weight from thousands of warp-instructions
+// to about twenty, which puts M=8 back on the memory roofline.
+//
+// M is padded to 16 internally; rows >= M are computed and discarded, which is
+// free because the weight stream dominates.
+void gemm_mma_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,
+                    int M, GemvScratch& s, cudaStream_t stream = 0);
 
 }  // namespace qwen

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cmath>
+#include <cstring>
 #include "../src/loader/safetensors.h"
 #include "../src/kernels/gemv_w4a16.cuh"
 #define CK(x) do{cudaError_t e=(x); if(e!=cudaSuccess){printf("CUDA %s\n",cudaGetErrorString(e));return 1;}}while(0)
@@ -47,8 +49,32 @@ int main(int argc, char** argv) {
   CK(cudaMalloc(&y, size_t(16) * W.out_f * 2));
 
   const double bytes = double(W.total_bytes());
-  printf("%dx%d, %.1f MB of weights\n", W.out_f, W.in_f, bytes / 1e6);
-  printf("%4s %10s %12s %10s %14s\n", "M", "ms", "GB/s", "vs M=1", "eff tok/s/layer");
+  printf("%dx%d, %.1f MB of weights   (memory roofline %.3f ms at 914 GB/s)\n",
+         W.out_f, W.in_f, bytes / 1e6, bytes / 914e9 * 1e3);
+
+  // correctness of the MMA path against the scalar path, on the same inputs
+  {
+    const int M = 8;
+    __nv_bfloat16* y2; CK(cudaMalloc(&y2, size_t(M) * W.out_f * 2));
+    qwen::gemm_small_w4a16(y, W, x, M, S); CK(cudaDeviceSynchronize());
+    qwen::gemm_mma_w4a16(y2, W, x, M, S);     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    std::vector<uint16_t> a(size_t(M) * W.out_f), b2(a.size());
+    CK(cudaMemcpy(a.data(), y, a.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(b2.data(), y2, b2.size() * 2, cudaMemcpyDeviceToHost));
+    auto f = [](uint16_t h){ uint32_t u = uint32_t(h) << 16; float v; memcpy(&v, &u, 4); return v; };
+    double mx = 0, mag = 0; size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (!std::isfinite(f(b2[i]))) ++bad;
+      mx = std::max(mx, std::fabs(double(f(a[i])) - f(b2[i])));
+      mag = std::max(mag, std::fabs(double(f(a[i]))));
+    }
+    printf("MMA vs scalar at M=8: max|diff| %.3e, rel %.2e, non-finite %zu  -> %s\n",
+           mx, mag > 0 ? mx / mag : 0.0, bad,
+           (mag > 0 && mx / mag < 2e-2 && !bad) ? "OK" : "MISMATCH");
+    cudaFree(y2);
+  }
+
+  printf("\n%4s %10s %12s %10s %12s %10s\n", "M", "scalar ms", "GB/s", "vs M=1", "MMA ms", "MMA x");
   double base = 0;
   for (int M : {1, 2, 4, 8, 16}) {
     for (int i = 0; i < 5; ++i) qwen::gemm_small_w4a16(y, W, x, M, S);
@@ -60,8 +86,14 @@ int main(int argc, char** argv) {
     cudaEventRecord(b); cudaEventSynchronize(b);
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= IT;
     if (!base) base = ms;
-    printf("%4d %10.3f %12.1f %9.2fx %14.1f\n", M, ms, bytes / (ms * 1e-3) / 1e9,
-           ms / base, M / (ms * 1e-3) / 1000.0);
+    for (int i = 0; i < 5; ++i) qwen::gemm_mma_w4a16(y, W, x, M, S);
+    CK(cudaDeviceSynchronize());
+    cudaEventRecord(a);
+    for (int i = 0; i < IT; ++i) qwen::gemm_mma_w4a16(y, W, x, M, S);
+    cudaEventRecord(b); cudaEventSynchronize(b);
+    float mms = 0; cudaEventElapsedTime(&mms, a, b); mms /= IT;
+    printf("%4d %10.3f %12.1f %9.2fx %12.3f %9.2fx\n", M, ms, bytes / (ms * 1e-3) / 1e9,
+           ms / base, mms, mms / base);
     cudaEventDestroy(a); cudaEventDestroy(b);
   }
   printf("\nIf verify-8 were 8x decode-1 there would be no point speculating.\n");

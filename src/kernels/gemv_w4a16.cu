@@ -1,9 +1,14 @@
 #include "gemv_w4a16.cuh"
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace qwen {
+
+#define CKG(x) do { cudaError_t e_=(x); if(e_!=cudaSuccess){ \
+  fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e_)); abort(); } } while(0)
+
 namespace {
 
 constexpr int WARP  = 32;
@@ -328,13 +333,36 @@ void awq_free(W4A16Weights& w) {
   w = W4A16Weights{};
 }
 
+// The partial buffer holds splits*M*out_f floats. Sizing it as
+// max_splits*max_out*max_m is wildly wrong: max_splits (sm*16) and max_out
+// (the 248320-row lm_head) never co-occur, and the product with max_m=16 came
+// to 20 GB -- which cudaMalloc refused, leaving a null pointer that every GEMV
+// then dereferenced. gemv_choose_splits stops as soon as splits*ceil(out/ROWS)
+// reaches sm*waves, so splits*out_f is bounded by that target times ROWS, not
+// by out_f itself; the only case needing max_out is splits==1. Allocate the
+// larger of the two with headroom, and CHECK the malloc.
 void gemv_scratch_alloc(GemvScratch& s, int max_in, int max_out, int min_group, int max_m) {
   s.max_in = max_in; s.max_out = max_out; s.max_m = max_m;
   s.max_groups = max_in / min_group;
   s.max_splits = sm_count() * 16;
-  cudaMalloc(&s.xf, size_t(max_in) * max_m * 4);
-  cudaMalloc(&s.xgsum, size_t(s.max_groups) * max_m * 4);
-  cudaMalloc(&s.partial, size_t(s.max_splits) * max_out * max_m * 4);
+  // 4x the split target covers the divisor-loop overshoot (splits must divide
+  // G, so the loop can step past the target by one divisor).
+  const size_t split_bound = size_t(4 * s.max_splits) * ROWS_PER_BLOCK;
+  s.partial_elems = (std::max(split_bound, size_t(max_out))) * size_t(max_m);
+  CKG(cudaMalloc(&s.xf, size_t(max_in) * max_m * 4));
+  CKG(cudaMalloc(&s.xgsum, size_t(s.max_groups) * max_m * 4));
+  CKG(cudaMalloc(&s.partial, s.partial_elems * 4));
+}
+
+// Every caller that writes s.partial must fit. A silent overrun here is exactly
+// the failure this file already paid for once.
+void gemv_partial_check(const GemvScratch& s, int splits, int out_f, int M) {
+  const size_t need = size_t(splits) * size_t(out_f) * size_t(M);
+  if (need > s.partial_elems) {
+    fprintf(stderr, "gemv partial overflow: splits=%d out=%d M=%d needs %zu, have %zu\n",
+            splits, out_f, M, need, s.partial_elems);
+    abort();
+  }
 }
 
 void gemv_scratch_free(GemvScratch& s) {
@@ -352,6 +380,7 @@ void run(const W4A16Weights& w, const __nv_bfloat16* x, GemvScratch& s,
   k_prep<<<G, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size);
 
   dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
+  if (!(splits == 1 && direct)) gemv_partial_check(s, splits, w.out_f, 1);
   float* dst = (splits == 1 && direct) ? direct : s.partial;
   const int wpg = w.group_size / 8;
   if (wpg == 16)
@@ -370,26 +399,51 @@ void gemm_small_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat
   const int G = w.num_groups, wpr = w.in_f / 8;
   const int splits = gemv_choose_splits(w.out_f, G);
   const int gps = G / splits;
+  gemv_partial_check(s, splits, w.out_f, M);
   k_prep_m<<<G * M, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size, w.in_f, G);
   dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
   const int wpg = w.group_size / 8;
   const size_t sm = size_t(M) * w.group_size * sizeof(float);
+  // Every M in [2,16] is instantiated: a block of k drafts verifies k+1 rows,
+  // so the reachable set is not just the powers of two.
   #define LAUNCH(WPG, MR) k_gemm_small<WPG, MR><<<grid, BLOCK, sm, st>>>( \
       s.partial, w.qweight, w.scale, w.zp, s.xf, s.xgsum, w.out_f, wpr, G, gps, \
       w.group_size, w.in_f)
   if (wpg == 16) {
     switch (M) {
-      case 2:  LAUNCH(16, 2);  break;
-      case 4:  LAUNCH(16, 4);  break;
-      case 8:  LAUNCH(16, 8);  break;
+      case 2: LAUNCH(16, 2); break;
+      case 3: LAUNCH(16, 3); break;
+      case 4: LAUNCH(16, 4); break;
+      case 5: LAUNCH(16, 5); break;
+      case 6: LAUNCH(16, 6); break;
+      case 7: LAUNCH(16, 7); break;
+      case 8: LAUNCH(16, 8); break;
+      case 9: LAUNCH(16, 9); break;
+      case 10: LAUNCH(16, 10); break;
+      case 11: LAUNCH(16, 11); break;
+      case 12: LAUNCH(16, 12); break;
+      case 13: LAUNCH(16, 13); break;
+      case 14: LAUNCH(16, 14); break;
+      case 15: LAUNCH(16, 15); break;
       case 16: LAUNCH(16, 16); break;
       default: fprintf(stderr, "gemm_small: unsupported M %d\n", M); abort();
     }
   } else if (wpg == 4) {
     switch (M) {
-      case 2:  LAUNCH(4, 2);  break;
-      case 4:  LAUNCH(4, 4);  break;
-      case 8:  LAUNCH(4, 8);  break;
+      case 2: LAUNCH(4, 2); break;
+      case 3: LAUNCH(4, 3); break;
+      case 4: LAUNCH(4, 4); break;
+      case 5: LAUNCH(4, 5); break;
+      case 6: LAUNCH(4, 6); break;
+      case 7: LAUNCH(4, 7); break;
+      case 8: LAUNCH(4, 8); break;
+      case 9: LAUNCH(4, 9); break;
+      case 10: LAUNCH(4, 10); break;
+      case 11: LAUNCH(4, 11); break;
+      case 12: LAUNCH(4, 12); break;
+      case 13: LAUNCH(4, 13); break;
+      case 14: LAUNCH(4, 14); break;
+      case 15: LAUNCH(4, 15); break;
       case 16: LAUNCH(4, 16); break;
       default: fprintf(stderr, "gemm_small: unsupported M %d\n", M); abort();
     }
@@ -472,7 +526,84 @@ __global__ __launch_bounds__(BLOCK) void k_gemv8(
   partial[size_t(blockIdx.y) * out_f + o] = acc;
 }
 
+template <int GROUP, int MROWS>
+__global__ __launch_bounds__(BLOCK) void k_gemm8_small(
+    float* __restrict__ partial, const int8_t* __restrict__ qw,
+    const __nv_bfloat16* __restrict__ sc, const float* __restrict__ xf,
+    int out_f, int in_f, int G, int groups_per_split) {
+  extern __shared__ float sx8[];            // [MROWS][GROUP]
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int o = blockIdx.x * ROWS_PER_BLOCK + warp * WARP + lane;
+  if (o >= out_f) return;
+  const int b = o >> 5;
+  const int g0 = blockIdx.y * groups_per_split;
+  const int g1 = min(g0 + groups_per_split, G);
+
+  float acc[MROWS];
+  #pragma unroll
+  for (int r = 0; r < MROWS; ++r) acc[r] = 0.f;
+
+  for (int g = g0; g < g1; ++g) {
+    for (int i = threadIdx.x; i < MROWS * GROUP; i += BLOCK)
+      sx8[i] = xf[size_t(i / GROUP) * in_f + size_t(g) * GROUP + (i % GROUP)];
+    __syncthreads();
+    const float s = __bfloat162float(sc[(size_t(b) * G + g) * 32 + lane]);
+    const int8_t* wp = qw + (size_t(b) * in_f + size_t(g) * GROUP) * 32 + lane;
+    float pg[MROWS];
+    #pragma unroll
+    for (int r = 0; r < MROWS; ++r) pg[r] = 0.f;
+    QWEN_UNROLL(8)
+    for (int t = 0; t < GROUP; ++t) {
+      const float wv = float(wp[size_t(t) * 32]);
+      #pragma unroll
+      for (int r = 0; r < MROWS; ++r) pg[r] = fmaf(wv, sx8[r * GROUP + t], pg[r]);
+    }
+    #pragma unroll
+    for (int r = 0; r < MROWS; ++r) acc[r] = fmaf(s, pg[r], acc[r]);
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int r = 0; r < MROWS; ++r)
+    partial[(size_t(blockIdx.y) * MROWS + r) * out_f + o] = acc[r];
+}
+
 }  // namespace
+
+void gemm_small_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
+                      int M, GemvScratch& s, cudaStream_t st) {
+  if (M == 1) { gemv_w8a16(y, w, x, s, st); return; }
+  const int G = w.num_groups;
+  const int splits = gemv_choose_splits(w.out_f, G);
+  const int gps = G / splits;
+  gemv_partial_check(s, splits, w.out_f, M);
+  k_prep_m<<<G * M, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size, w.in_f, G);
+  dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
+  const size_t sm = size_t(M) * w.group_size * sizeof(float);
+  #define L8(MR) k_gemm8_small<128, MR><<<grid, BLOCK, sm, st>>>( \
+      s.partial, w.qweight, w.scale, s.xf, w.out_f, w.in_f, G, gps)
+  if (w.group_size != 128) { fprintf(stderr, "gemm8: group %d\n", w.group_size); abort(); }
+  switch (M) {
+    case 2: L8(2); break;
+    case 3: L8(3); break;
+    case 4: L8(4); break;
+    case 5: L8(5); break;
+    case 6: L8(6); break;
+    case 7: L8(7); break;
+    case 8: L8(8); break;
+    case 9: L8(9); break;
+    case 10: L8(10); break;
+    case 11: L8(11); break;
+    case 12: L8(12); break;
+    case 13: L8(13); break;
+    case 14: L8(14); break;
+    case 15: L8(15); break;
+    case 16: L8(16); break;
+    default: fprintf(stderr, "gemm8: unsupported M %d\n", M); abort();
+  }
+  #undef L8
+  const int n = w.out_f * M;
+  k_reduce_bf16_m<<<(n + 255) / 256, 256, 0, st>>>(y, s.partial, w.out_f, splits, M);
+}
 
 void quantize_w8a16(W8A16Weights& dst, const __nv_bfloat16* src, int out_f, int in_f,
                     int group, cudaStream_t st) {
@@ -494,11 +625,243 @@ void gemv_w8a16(__nv_bfloat16* y, const W8A16Weights& w, const __nv_bfloat16* x,
   const int gps = G / splits;
   k_prep<<<G, min(w.group_size, 256), 0, st>>>(s.xf, s.xgsum, x, w.group_size);
   dim3 grid((w.out_f + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, splits);
+  gemv_partial_check(s, splits, w.out_f, 1);
   if (w.group_size == 128)
     k_gemv8<128><<<grid, BLOCK, 0, st>>>(s.partial, w.qweight, w.scale, s.xf,
                                          w.out_f, w.in_f, G, gps);
   else { fprintf(stderr, "gemv_w8a16: unsupported group %d\n", w.group_size); abort(); }
   k_reduce_bf16<<<(w.out_f + 255) / 256, 256, 0, st>>>(y, s.partial, w.out_f, splits);
+}
+
+}  // namespace qwen
+
+// ================================================================ MMA W4A16
+namespace qwen {
+namespace {
+
+#ifndef MMA_BK_CFG
+#define MMA_BK_CFG 64
+#endif
+#ifndef MMA_BN_CFG
+#define MMA_BN_CFG 128
+#endif
+constexpr int MMA_BN = MMA_BN_CFG;   // output rows per block
+constexpr int MMA_BK = MMA_BK_CFG;   // k per stage
+constexpr int MMA_PAD = 8;    // shared stride padding, in bf16 elements
+constexpr int MMA_SK = MMA_BK + MMA_PAD;
+constexpr int MMA_THREADS = MMA_BN * (MMA_BK / 32);  // 16 output rows per warp
+
+// Fragment layouts for mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32,
+// straight from the PTX ISA tables:
+//   A (16x16): a0 -> (row g,   col t*2 + {0,1})     g = lane>>2, t = lane&3
+//              a1 -> (row g+8, col t*2 + {0,1})
+//              a2 -> (row g,   col t*2 + {8,9})
+//              a3 -> (row g+8, col t*2 + {8,9})
+//   B (16x8):  b0 -> (row t*2 + {0,1}, col g)
+//              b1 -> (row t*2 + {8,9}, col g)
+//   C (16x8):  c0,c1 -> (row g,   col t*2 + {0,1})
+//              c2,c3 -> (row g+8, col t*2 + {0,1})
+__device__ __forceinline__ void mma_m16n8k16(float& c0, float& c1, float& c2, float& c3,
+                                             uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+template <int GROUP>
+__global__ __launch_bounds__(MMA_THREADS) void k_gemm_mma(
+    __nv_bfloat16* __restrict__ y,
+    const uint32_t* __restrict__ qw,
+    const __nv_bfloat16* __restrict__ sc,
+    const uint8_t* __restrict__ zp,
+    const __nv_bfloat16* __restrict__ x,
+    int M, int out_f, int in_f, int G,
+    float* __restrict__ part, int splits) {
+  __shared__ __nv_bfloat16 sA[16 * MMA_SK];
+  __shared__ __nv_bfloat16 sW[MMA_BN * MMA_SK];
+
+  const int n0 = blockIdx.x * MMA_BN;
+  const int tid = threadIdx.x;
+  // Split the k dimension across blocks. THIS is what the kernel was missing:
+  // at out_f=34816 there are only 544 n-blocks of 4 warps = 2176 warps, against
+  // the GEMV's 8704, and with nothing but outstanding loads to hide DRAM latency
+  // the warp count IS the bandwidth. Each split accumulates a private fp32
+  // partial and a reduce pass sums them, exactly as the GEMV already does.
+  const int sp = blockIdx.y;
+  int kbeg = 0, kend = in_f;
+  if (splits > 1) {
+    const int chunks = in_f / MMA_BK;
+    const int per = (chunks + splits - 1) / splits;
+    kbeg = min(sp * per, chunks) * MMA_BK;
+    kend = min((sp + 1) * per, chunks) * MMA_BK;
+  }
+  const int warp = tid >> 5, lane = tid & 31;
+  const int g_ = lane >> 2, t_ = lane & 3;
+
+  float c[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+
+  // MEMORY-LEVEL PARALLELISM IS THE WHOLE GAME HERE. With the loads issued
+  // inside the dequant, a warp had exactly 4 u32 loads outstanding before it hit
+  // __syncthreads; the GEMV, which reaches 820 GB/s at 33% occupancy against
+  // this kernel's 411 at 67%, keeps 16. Stubbing out the MMAs changed nothing
+  // and stubbing out the dequant changed nothing -- the kernel was waiting on
+  // DRAM with too few requests in flight. So issue iteration i+1's weight loads
+  // BEFORE doing iteration i's dequant and MMAs.
+  const int nrow_p = tid & (MMA_BN - 1);
+  const int koff_p = (tid / MMA_BN) * 32;
+  const int o_p = n0 + nrow_p;
+  const int b_p = o_p >> 5, l_p = o_p & 31;
+  const bool live = o_p < out_f;
+
+  uint32_t pf[4];
+  float pfs = 0.f, pfz = 0.f;
+  #define MMA_ISSUE(K) do {                                                     \
+    if (live && (K) < kend) {                                                   \
+      const int g_p = ((K) + koff_p) / GROUP;                                   \
+      pfs = __bfloat162float(sc[(size_t(b_p) * G + g_p) * 32 + l_p]);            \
+      pfz = float(zp[(size_t(b_p) * G + g_p) * 32 + l_p]);                       \
+      const uint32_t* wp_ = qw + (size_t(b_p) * (in_f / 8) + ((K) + koff_p) / 8) * 32 + l_p; \
+      _Pragma("unroll")                                                          \
+      for (int j_ = 0; j_ < 4; ++j_) pf[j_] = wp_[size_t(j_) * 32];             \
+    }                                                                            \
+  } while (0)
+
+  MMA_ISSUE(kbeg);
+
+  for (int k0 = kbeg; k0 < kend; k0 += MMA_BK) {
+    uint32_t cur[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) cur[j] = pf[j];
+    const float s = pfs, z = pfz;
+    MMA_ISSUE(k0 + MMA_BK);          // in flight across the dequant and the MMAs
+
+    // ---- stage activations [16][MMA_BK] --------------------------------
+    // k INSIDE EACH GROUP OF 8 IS PERMUTED to [0,4,1,5,2,6,3,7]. The magic-number
+    // dequant naturally produces the bf16x2 pair (nibble p, nibble p+4), so the
+    // weight tile is cheapest to build in exactly that order; putting it back in
+    // natural order cost 8 extracts and 4 packs per 32-bit word. A dot product
+    // does not care about the order of k, so permute the ACTIVATIONS to match --
+    // 16 rows of staging against 64 rows of weights.
+    for (int i = tid; i < 16 * MMA_BK; i += MMA_THREADS) {
+      const int r = i / MMA_BK, kk = i % MMA_BK;
+      const int ks = ((kk & 1) << 2) | ((kk & 7) >> 1);   // slot -> nibble
+      sA[r * MMA_SK + kk] =
+          (r < M) ? x[size_t(r) * in_f + k0 + (kk & ~7) + ks] : __float2bfloat16(0.f);
+    }
+
+    // ---- dequantize the weight tile [MMA_BN][MMA_BK] --------------------
+    {
+      uint32_t* dst = reinterpret_cast<uint32_t*>(&sW[nrow_p * MMA_SK + koff_p]);
+      if (live) {
+        //   w = (q - z) * s, with f = 128 + q from the bf16 magic number.
+        //
+        // ORDER MATTERS. Writing this as fma(f, s, -(128+z)*s) forms 128*s in
+        // bf16 first and the cancellation destroys the result (measured 1.6
+        // relative error). Subtracting FIRST is exact: f and 128+z are both
+        // integers in [128,143], which bf16 represents exactly at that exponent
+        // because its ulp there is 1, and their difference q-z is in [-15,15].
+        const __nv_bfloat162 s2 = __bfloat162bfloat162(__float2bfloat16(s));
+        const __nv_bfloat162 c2 = __bfloat162bfloat162(__float2bfloat16(128.0f + z));
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t w = cur[j];
+          #pragma unroll
+          for (int sh = 0; sh < 4; ++sh) {
+            const uint32_t t = ((w >> (4 * sh)) & 0x000F000Fu) | 0x43004300u;
+            __nv_bfloat162 f2;
+            *reinterpret_cast<uint32_t*>(&f2) = t;
+            const __nv_bfloat162 r2 = __hmul2(__hsub2(f2, c2), s2);
+            dst[j * 4 + sh] = *reinterpret_cast<const uint32_t*>(&r2);
+          }
+        }
+      } else {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) dst[j] = 0u;
+      }
+    }
+    __syncthreads();
+
+    // ---- 4 k-substeps of 16 -------------------------------------------
+    #pragma unroll
+    for (int ks = 0; ks < MMA_BK / 16; ++ks) {
+      const int kb = ks * 16;
+      uint32_t a0, a1, a2, a3;
+      a0 = *reinterpret_cast<const uint32_t*>(&sA[(g_)     * MMA_SK + kb + t_ * 2]);
+      a1 = *reinterpret_cast<const uint32_t*>(&sA[(g_ + 8) * MMA_SK + kb + t_ * 2]);
+      a2 = *reinterpret_cast<const uint32_t*>(&sA[(g_)     * MMA_SK + kb + t_ * 2 + 8]);
+      a3 = *reinterpret_cast<const uint32_t*>(&sA[(g_ + 8) * MMA_SK + kb + t_ * 2 + 8]);
+      #pragma unroll
+      for (int nn = 0; nn < 2; ++nn) {
+        const int nbase = warp * 16 + nn * 8 + g_;    // the output row this lane's B column is
+        uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sW[nbase * MMA_SK + kb + t_ * 2]);
+        uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sW[nbase * MMA_SK + kb + t_ * 2 + 8]);
+        mma_m16n8k16(c[nn][0], c[nn][1], c[nn][2], c[nn][3], a0, a1, a2, a3, b0, b1);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- write out ------------------------------------------------------
+  #pragma unroll
+  for (int nn = 0; nn < 2; ++nn) {
+    const int ncol = n0 + warp * 16 + nn * 8 + t_ * 2;
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int row = g_ + half * 8;
+      if (row >= M) continue;
+      #pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int col = ncol + e;
+        if (col >= out_f) continue;
+        if (splits > 1) part[(size_t(sp) * M + row) * out_f + col] = c[nn][half * 2 + e];
+        else            y[size_t(row) * out_f + col] = __float2bfloat16(c[nn][half * 2 + e]);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+// Splits are chosen so the launch fills the machine in warps, not blocks: each
+// block is only 4 warps, so it takes ~8x as many blocks as the GEMV needs to
+// reach the same warp count.
+int gemm_mma_splits(int out_f, int in_f) {
+  static int sms = 0, waves = 0;
+  if (!sms) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+  if (!waves) { const char* e = getenv("QWEN_MMA_WAVES"); waves = e ? atoi(e) : 8; }
+  const int bn = (out_f + MMA_BN - 1) / MMA_BN;
+  const int chunks = in_f / MMA_BK;
+  int s = (sms * waves + bn - 1) / bn;
+  if (s < 1) s = 1;
+  if (s > chunks) s = chunks;
+  return s;
+}
+
+void gemm_mma_w4a16(__nv_bfloat16* y, const W4A16Weights& w, const __nv_bfloat16* x,
+                    int M, GemvScratch& sc, cudaStream_t st) {
+  const int blocks = (w.out_f + MMA_BN - 1) / MMA_BN;
+  int splits = gemm_mma_splits(w.out_f, w.in_f);
+  // Fold the scratch capacity into the choice rather than asserting on it: a
+  // wide out_f (lm_head is 248320) at M=16 simply does not get to split.
+  while (splits > 1 && size_t(splits) * w.out_f * M > sc.partial_elems) --splits;
+  float* part = nullptr;
+  if (splits > 1) { gemv_partial_check(sc, splits, w.out_f, M); part = sc.partial; }
+  const dim3 grid(blocks, splits);
+  if (w.group_size == 128)
+    k_gemm_mma<128><<<grid, MMA_THREADS, 0, st>>>(y, w.qweight, w.scale, w.zp, x,
+                                                  M, w.out_f, w.in_f, w.num_groups,
+                                                  part, splits);
+  else if (w.group_size == 32)
+    k_gemm_mma<32><<<grid, MMA_THREADS, 0, st>>>(y, w.qweight, w.scale, w.zp, x,
+                                                 M, w.out_f, w.in_f, w.num_groups,
+                                                 part, splits);
+  else { fprintf(stderr, "gemm_mma: unsupported group %d\n", w.group_size); abort(); }
+  if (splits > 1) {
+    const int n = w.out_f * M;
+    k_reduce_bf16_m<<<(n + 255) / 256, 256, 0, st>>>(y, part, w.out_f, splits, M);
+  }
 }
 
 }  // namespace qwen

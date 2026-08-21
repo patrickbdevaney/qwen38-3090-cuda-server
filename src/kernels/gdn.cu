@@ -398,7 +398,8 @@ void gdn_scan(__nv_bfloat16* out, float* state, const __nv_bfloat16* qkv,
       const cudaError_t e = cudaFuncSetAttribute(
           fn, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
       if (e != cudaSuccess || sm > size_t(want)) {
-        fprintf(stderr, "gdn_scan: shared memory opt-in failed (%zu needed, %d available)\n",
+        fprintf(stderr, "gdn_scan: shared memory opt-in failed (%s) (%zu needed, %d available)\n",
+                cudaGetErrorString(e),
                 sm, want);
         abort();
       }

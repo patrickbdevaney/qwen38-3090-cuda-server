@@ -135,11 +135,28 @@ target_link_libraries(bench_decode PRIVATE qwen_model)
 add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
+# ---------------------------------------------------------------- spec
+add_library(qwen_spec STATIC src/spec/spec.cu)
+target_link_libraries(qwen_spec PUBLIC qwen_model)
+
+add_executable(gate_spec tests/gate_spec.cu)
+target_link_libraries(gate_spec PRIVATE qwen_spec)
+add_test(NAME spec_lossless COMMAND gate_spec ${QWEN38_MODEL_DIR} 7 96)
+
+add_executable(bench_block bench/bench_block.cu)
+target_link_libraries(bench_block PRIVATE qwen_model)
+
+add_executable(bench_verify bench/bench_verify.cu)
+target_link_libraries(bench_verify PRIVATE qwen_core qwen_kernels)
+
+add_executable(bench_spec bench/bench_spec.cu)
+target_link_libraries(bench_spec PRIVATE qwen_spec)
+
 # ---------------------------------------------------------------- server
 add_library(qwen_server STATIC
   src/server/server.cpp
   src/server/reasoning_parser.cpp)
-target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer)
+target_link_libraries(qwen_server PUBLIC qwen_model qwen_tokenizer qwen_spec)
 target_include_directories(qwen_server PUBLIC src third_party)
 
 add_executable(cuda_server src/main.cpp)
