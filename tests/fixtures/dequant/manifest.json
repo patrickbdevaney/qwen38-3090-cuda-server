@@ -1,0 +1,202 @@
+{
+  "group_size": 128,
+  "num_bits": 4,
+  "tensors": [
+    {
+      "name": "model.language_model.layers.0.mlp.gate_proj",
+      "out_features": 17408,
+      "in_features": 5120,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        17408,
+        640
+      ],
+      "scale_shape": [
+        17408,
+        40
+      ],
+      "zp_shape": [
+        2176,
+        40
+      ],
+      "deq_file": "layers_0_mlp_gate_proj.f32",
+      "q_file": "layers_0_mlp_gate_proj.q8",
+      "deq_absmax": 0.06072998046875,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -4,
+      "zp_max": 2
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.down_proj",
+      "out_features": 5120,
+      "in_features": 17408,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        5120,
+        2176
+      ],
+      "scale_shape": [
+        5120,
+        136
+      ],
+      "zp_shape": [
+        640,
+        136
+      ],
+      "deq_file": "layers_0_mlp_down_proj.f32",
+      "q_file": "layers_0_mlp_down_proj.q8",
+      "deq_absmax": 0.0494384765625,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -4,
+      "zp_max": 2
+    },
+    {
+      "name": "model.language_model.layers.3.self_attn.q_proj",
+      "out_features": 12288,
+      "in_features": 5120,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        12288,
+        640
+      ],
+      "scale_shape": [
+        12288,
+        40
+      ],
+      "zp_shape": [
+        1536,
+        40
+      ],
+      "deq_file": "layers_3_self_attn_q_proj.f32",
+      "q_file": "layers_3_self_attn_q_proj.q8",
+      "deq_absmax": 0.061431884765625,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -6,
+      "zp_max": 5
+    },
+    {
+      "name": "model.language_model.layers.3.self_attn.k_proj",
+      "out_features": 1024,
+      "in_features": 5120,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        1024,
+        640
+      ],
+      "scale_shape": [
+        1024,
+        40
+      ],
+      "zp_shape": [
+        128,
+        40
+      ],
+      "deq_file": "layers_3_self_attn_k_proj.f32",
+      "q_file": "layers_3_self_attn_k_proj.q8",
+      "deq_absmax": 0.1153564453125,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -7,
+      "zp_max": 6
+    },
+    {
+      "name": "model.language_model.layers.0.linear_attn.in_proj_qkv",
+      "out_features": 10240,
+      "in_features": 5120,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        10240,
+        640
+      ],
+      "scale_shape": [
+        10240,
+        40
+      ],
+      "zp_shape": [
+        1280,
+        40
+      ],
+      "deq_file": "layers_0_linear_attn_in_proj_qkv.f32",
+      "q_file": "layers_0_linear_attn_in_proj_qkv.q8",
+      "deq_absmax": 0.070831298828125,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -4,
+      "zp_max": 3
+    },
+    {
+      "name": "model.language_model.layers.0.linear_attn.in_proj_z",
+      "out_features": 6144,
+      "in_features": 5120,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        6144,
+        640
+      ],
+      "scale_shape": [
+        6144,
+        40
+      ],
+      "zp_shape": [
+        768,
+        40
+      ],
+      "deq_file": "layers_0_linear_attn_in_proj_z.f32",
+      "q_file": "layers_0_linear_attn_in_proj_z.q8",
+      "deq_absmax": 0.056732177734375,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -4,
+      "zp_max": 2
+    },
+    {
+      "name": "model.language_model.layers.0.linear_attn.out_proj",
+      "out_features": 5120,
+      "in_features": 6144,
+      "group_size": 128,
+      "num_bits": 4,
+      "rows": 64,
+      "cols": 512,
+      "packed_shape": [
+        5120,
+        768
+      ],
+      "scale_shape": [
+        5120,
+        48
+      ],
+      "zp_shape": [
+        640,
+        48
+      ],
+      "deq_file": "layers_0_linear_attn_out_proj.f32",
+      "q_file": "layers_0_linear_attn_out_proj.q8",
+      "deq_absmax": 0.10137939453125,
+      "q_min": -8,
+      "q_max": 7,
+      "zp_min": -4,
+      "zp_max": 2
+    }
+  ]
+}

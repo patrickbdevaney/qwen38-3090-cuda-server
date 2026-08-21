@@ -31,6 +31,12 @@ target_link_libraries(microbench PRIVATE CUDA::cudart)
 add_library(qwen_tokenizer STATIC src/tokenizer/bpe.cpp src/tokenizer/chat_template.cpp)
 target_include_directories(qwen_tokenizer PUBLIC src third_party)
 
+# ---------------------------------------------------------------- config + loader
+add_library(qwen_core STATIC
+  src/config/model_shape.cpp
+  src/loader/safetensors.cpp)
+target_include_directories(qwen_core PUBLIC src third_party)
+
 # ---------------------------------------------------------------- gates
 # Every gate is a standalone executable returning 0 on pass. `ctest` runs them
 # all; each also runs on its own for debugging.
@@ -52,6 +58,15 @@ target_link_libraries(gate_chat_template PRIVATE qwen_tokenizer)
 add_test(NAME chat_template COMMAND gate_chat_template
          ${CMAKE_SOURCE_DIR}/tests/fixtures/chat/fixtures.jsonl
          $ENV{QWEN38_MODEL_DIR}/tokenizer.json)
+
+add_executable(gate_config tests/gate_config.cpp)
+target_link_libraries(gate_config PRIVATE qwen_core)
+add_test(NAME config COMMAND gate_config $ENV{QWEN38_MODEL_DIR}/config.json)
+
+add_executable(gate_dequant tests/gate_dequant.cpp)
+target_link_libraries(gate_dequant PRIVATE qwen_core)
+add_test(NAME dequant COMMAND gate_dequant $ENV{QWEN38_MODEL_DIR}
+         ${CMAKE_SOURCE_DIR}/tests/fixtures/dequant)
 
 # ---------------------------------------------------------------- server
 # Sources are added per phase as each gate passes.
