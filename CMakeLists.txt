@@ -143,7 +143,7 @@ target_include_directories(qwen_gguf PUBLIC src third_party)
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
 target_link_libraries(gguf_inspect PRIVATE qwen_gguf)
 
-add_library(qwen_gguf_dequant STATIC src/gguf/dequant.cu)
+add_library(qwen_gguf_dequant STATIC src/gguf/dequant.cu src/gguf/gemv.cu)
 target_link_libraries(qwen_gguf_dequant PUBLIC qwen_gguf)
 
 # Oracle: links llama.cpp's own ggml so the goldens are ggml's, not a
@@ -156,6 +156,16 @@ if(LLAMA_CPP_DIR AND EXISTS "${LLAMA_CPP_DIR}/ggml/include/ggml.h")
   target_link_libraries(gguf_dequant_ref PRIVATE qwen_gguf ggml ggml-base)
   set_target_properties(gguf_dequant_ref PROPERTIES
                         BUILD_RPATH ${LLAMA_CPP_DIR}/build/bin)
+endif()
+
+add_executable(bench_gguf bench/bench_gguf.cu)
+target_link_libraries(bench_gguf PRIVATE qwen_gguf_dequant)
+
+add_executable(gate_gguf_gemv tests/gate_gguf_gemv.cu)
+target_link_libraries(gate_gguf_gemv PRIVATE qwen_gguf_dequant)
+set(QWEN38_GGUF_Q3 "${QWEN38_GGUF_Q3}" CACHE FILEPATH "UD-Q3_K_XL GGUF checkpoint")
+if(QWEN38_GGUF_Q3)
+  add_test(NAME gguf_gemv COMMAND gate_gguf_gemv ${QWEN38_GGUF_Q3} 256)
 endif()
 
 add_executable(gate_gguf tests/gate_gguf.cu)

@@ -116,6 +116,48 @@ fixes it.
 | AWQ + INT4 KV | 13.06 GiB | 4.5 GiB |
 | Q3_K_XL + INT4 KV | 11.72 GiB | 4.5 GiB |
 
+## The Q3_K_XL fused GEMV: built, correct, and NOT competitive
+
+The fused GEMV over GGUF blocks is done and gated -- all 14 block types produce
+values bit-identical to the ggml-verified dequantiser, and the dot products land
+at the bf16 output floor (~1.6e-03 relative). It reads the quantised blocks
+directly, with no dequantised round trip.
+
+It is also **2.2x less efficient per byte than the AWQ path**, which more than
+cancels Q3_K_XL's 8% smaller body:
+
+| | GB/s | of 914.2 |
+|---|---|---|
+| AWQ INT4 g128 (ours today) | **769.8** | 84.2% |
+| GGUF fused, dequant stubbed out | 646.0 | 70.7% |
+| GGUF fused, as built | **347.3** | 38.0% |
+
+Sweeping warps per block from 2 to 16 moved nothing (353 / 353 / 340 / 353), so
+it is structural rather than occupancy. The stub isolates two separate deficits:
+
+1. **Layout, ~16%.** GGUF stores blocks row-major, so a warp streaming one row
+   reads 110-176 contiguous bytes at a time. AWQ is repacked so 32 lanes read
+   128 contiguous bytes with each lane owning a different ROW -- one transaction
+   instead of a small one.
+2. **Dequant ALU, the other ~46%.** Each lane owns 8 of a 256-element run, so
+   the block header and sub-block scale work is repeated up to 32x per block.
+   The per-type spread shows it directly: Q3_K, whose deq8 unpacks 12 scale
+   bytes into 16 six-bit scales on every lane, is worst at 172 GB/s; Q5_K, whose
+   scale extraction is two shifts, is best at 383.
+
+What it would cost to fix: a per-type repack into a lane-friendly layout (1),
+plus cooperative per-warp scale computation broadcast by shuffle (2). Best case
+is parity with AWQ's 84%, which buys 8% faster decode and 0.95 GiB.
+
+**That prize is no longer worth it, because INT4 KV already freed 3.58 GiB** --
+3.7x more than Q3_K_XL would, at a measured KL of 3.69e-04 that leaves needle
+retrieval intact at 131k tokens. The headroom problem is solved on the other
+axis.
+
+So: the GGUF stack stays in the tree, complete and verified, as the foundation
+for a future quant that actually pays. Q3_K_XL is not that quant at this kernel
+efficiency, and that is a measurement rather than an opinion.
+
 ## Why this matters beyond the numbers
 
 The point of the headroom is **RoPE-extended context**. 262144 is the trained

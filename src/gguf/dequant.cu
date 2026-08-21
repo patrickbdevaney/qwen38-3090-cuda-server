@@ -28,6 +28,7 @@ struct BIQ4XS { uint16_t d; uint16_t scales_h; uint8_t scales_l[QK_K / 64]; uint
 struct BIQ2XS { uint16_t d; uint16_t qs[QK_K / 8]; uint8_t scales[QK_K / 32]; };
 struct BIQ2S { uint16_t d; uint8_t qs[QK_K / 4]; uint8_t qh[QK_K / 32];
                uint8_t scales[QK_K / 32]; };
+struct BIQ2XXS { uint16_t d; uint16_t qs[QK_K / 8]; };
 struct BIQ3XXS { uint16_t d; uint8_t qs[3 * QK_K / 8]; };
 struct BIQ3S { uint16_t d; uint8_t qs[QK_K / 4]; uint8_t qh[QK_K / 32];
                uint8_t signs[QK_K / 8]; uint8_t scales[QK_K / 64]; };
@@ -249,6 +250,34 @@ __global__ void k_iq2xs(Out* out, const BIQ2XS* x, int64_t nb,
   }
 }
 
+// IQ2_XXS: the grid index and the sign/scale word are packed into two uint32s
+// per 32-element group -- aux32[0]'s four bytes are the grid indices, aux32[1]
+// carries four 7-bit sign selectors and a 4-bit scale in its top nibble.
+template <class Out>
+__global__ void k_iq2xxs(Out* out, const BIQ2XXS* x, int64_t nb,
+                         const uint64_t* grid, const uint8_t* ksigns, const uint8_t* kmask) {
+  const int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nb) return;
+  Out* y = out + i * QK_K;
+  const float d = h2f(x[i].d);
+  int o = 0;
+  for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+    const uint16_t* q16 = x[i].qs + 4 * ib32;
+    uint32_t a0 = uint32_t(q16[0]) | (uint32_t(q16[1]) << 16);
+    uint32_t a1 = uint32_t(q16[2]) | (uint32_t(q16[3]) << 16);
+    const uint8_t* a8 = reinterpret_cast<const uint8_t*>(&a0);
+    const float db = d * (0.5f + float(a1 >> 28)) * 0.25f;
+    for (int l = 0; l < 4; ++l) {
+      const uint64_t g = grid[a8[l]];
+      const uint8_t* gp = reinterpret_cast<const uint8_t*>(&g);
+      const uint8_t sg = ksigns[(a1 >> (7 * l)) & 127];
+      for (int j = 0; j < 8; ++j)
+        put(y, o + j, db * float(gp[j]) * ((sg & kmask[j]) ? -1.f : 1.f));
+      o += 8;
+    }
+  }
+}
+
 // IQ2_S: like IQ2_XS but the grid index gets 2 extra bits from qh, and the sign
 // bytes live INSIDE qs (at qs + QK_K/8) rather than being packed into the index.
 template <class Out>
@@ -371,6 +400,7 @@ __global__ void k_bf16(Out* out, const uint16_t* x, int64_t n) {
 struct Tables {
   int8_t* kv4nl = nullptr;
   uint64_t* iq2xs = nullptr;
+  uint64_t* iq2xxs = nullptr;
   uint64_t* iq2s = nullptr;
   uint32_t* iq3xxs = nullptr;
   uint32_t* iq3s = nullptr;
@@ -393,6 +423,7 @@ T* upload(const T* h, size_t n) {
 void ensure_tables() {
   if (g_tab.kv4nl) return;
   g_tab.kv4nl  = upload(kvalues_iq4nl, 16);
+  g_tab.iq2xxs = upload(iq2xxs_grid, 256);
   g_tab.iq2xs  = upload(iq2xs_grid, 512);
   g_tab.iq2s   = upload(iq2s_grid, 1024);
   g_tab.iq3xxs = upload(iq3xxs_grid, 256);
@@ -425,6 +456,8 @@ void dispatch(Out* dst, const void* src, GgmlType t, int64_t n, cudaStream_t st)
     case GgmlType::IQ4_XS: k_iq4xs<<<G, TH, 0, st>>>(dst, (const BIQ4XS*)src, nb, g_tab.kv4nl); break;
     case GgmlType::IQ2_XS: k_iq2xs<<<G, TH, 0, st>>>(dst, (const BIQ2XS*)src, nb,
                                                      g_tab.iq2xs, g_tab.ksigns, g_tab.kmask); break;
+    case GgmlType::IQ2_XXS: k_iq2xxs<<<G, TH, 0, st>>>(dst, (const BIQ2XXS*)src, nb,
+                                                       g_tab.iq2xxs, g_tab.ksigns, g_tab.kmask); break;
     case GgmlType::IQ2_S: k_iq2s<<<G, TH, 0, st>>>(dst, (const BIQ2S*)src, nb,
                                                    g_tab.iq2s, g_tab.kmask); break;
     case GgmlType::IQ3_XXS: k_iq3xxs<<<G, TH, 0, st>>>(dst, (const BIQ3XXS*)src, nb,
@@ -445,7 +478,7 @@ bool gguf_dequant_supported(GgmlType t) {
     case GgmlType::Q8_0: case GgmlType::Q2_K: case GgmlType::Q3_K:
     case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K:
     case GgmlType::IQ4_NL: case GgmlType::IQ4_XS: case GgmlType::IQ2_XS:
-    case GgmlType::IQ2_S:
+    case GgmlType::IQ2_S: case GgmlType::IQ2_XXS:
     case GgmlType::IQ3_XXS: case GgmlType::IQ3_S:
       return true;
     default: return false;
