@@ -322,6 +322,14 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
         pos = spos;
         r.spec_rounds += 1;
         r.spec_committed += committed;
+        // The three /metrics counters below were declared and exported but never
+        // incremented, so qwen_spec_* always read 0 while the per-request
+        // `timings` object reported the truth. A round proposes block_size - 1
+        // tokens and commits `committed` including the always-free one, so the
+        // drafted tokens the target ACCEPTED is committed - 1.
+        g_metrics.verify_steps += 1;
+        g_metrics.drafted += uint64_t(g_draft->sh.block_size - 1);
+        g_metrics.accepted += uint64_t(committed > 0 ? committed - 1 : 0);
       }
     }
     const int32_t tok = pending.front();

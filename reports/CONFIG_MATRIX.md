@@ -237,6 +237,38 @@ remaining gap is dominated by the two i-quant types: IQ4_XS at 405 and IQ3_S at
 293 against Q5_K's 620, and their grid/codebook lookups still go to global
 memory rather than shared. That is the next lever, and it is untried.
 
+### Codebook staging, and a measurement lesson that matters more
+
+The i-quants are codebook quants: the stored index selects an entry from a fixed
+grid in global memory, indexed once per value. Those grids are 1-8 KiB and every
+warp in a block hits the same entries, so `k_gemv` now stages the grid its type
+needs into shared memory once per block.
+
+Measured warm, same session, same binary switched by a stash:
+
+| type | share of file | global | shared | |
+|---|---:|---:|---:|---|
+| IQ3_S | 26.9% | 294.1 | **329.2** | +12% |
+| IQ4_NL | 0.3% | 365.9 | 372.8 | +1.9% |
+| IQ4_XS | 37.9% | 407.8 | 408.5 | -- |
+| IQ2_S | 3.1% | 270.0 | 258.1 | **-4.4%** |
+| **composition-weighted** | | **356.9** | **371.7** | **+4.1%** |
+
+IQ4_XS gains nothing: its table is `kvalues_iq4nl`, sixteen bytes, which was
+already resident in L1. IQ2_S *loses*: its grid is 8 KiB, four times the next
+biggest, and the occupancy it takes costs more than the loads it saves. IQ2_S is
+therefore not staged -- the measurement decided it, not the symmetry.
+
+**The lesson that matters more than the +4%:** the first A/B run showed every
+type slower, *including Q5_K and Q3_K, whose code did not change*. Two
+consecutive runs of the identical binary measured 317.7 and 356.9 GB/s -- 12%
+apart -- because the first run catches the card mid-clock-ramp. This box does
+not permit `nvidia-smi --lock-gpu-clocks`, so **every GB/s figure in this repo is
+only meaningful against another figure taken warm in the same session**, and a
+cross-session comparison of two kernels can invent or hide a 12% effect. The
+per-type numbers recorded earlier in this file were taken that way and hold up;
+the discipline is now written down.
+
 This does not change the *headroom* conclusion above -- INT4 KV still frees 3.7x
 more than Q3_K_XL would. It does mean the GGUF path is no longer embarrassing,
 but "AWQ and GGUF are viable substitutes" is not yet true and should not be

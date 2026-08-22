@@ -143,10 +143,44 @@ The headline finding is the *shape*: median KL 5e-05, p99 4.26. Quantisation
 error concentrates on a few positions and is invisible in an average, so any
 future quant decision on this repo should be made on the tail, not the mean.
 
-**Still open: a GGUF row.** It needs a GGUF loader in `model.cu`, which does not
-exist — the container, dequantiser and fused GEMV are all gated in isolation but
-nothing runs end to end. Comparing llama.cpp against a BF16 GGUF instead would
-measure llama.cpp, not us, so the row is left empty rather than faked.
+### DONE: the GGUF row
+
+The loader exists now, so the row is measured the same way as the others rather
+than left empty:
+
+| | KL mean | KL p99 | top-1 | weights |
+|---|---:|---:|---:|---:|
+| ours, AWQ INT4 + INT8 head | 1.495e-01 | 4.263 | 98.56% | 13.06 GiB |
+| **ours, GGUF UD-Q3_K_XL** | **1.432e-01** | 4.274 | **98.57%** | **11.36 GiB** |
+| EXL3 3.50bpw (VRAM-matched) | 1.308e-01 | 3.493 | 98.51% | ~14.5 GiB |
+
+**AWQ and UD-Q3_K_XL are the same model to within noise, and the GGUF is 1.70
+GiB lighter** — 99K more tokens of INT4 KV. That is the first result in this
+project that moves the frontier rather than locating a point on it, and it
+reverses the prediction recorded in `reports/CONFIG_MATRIX.md`, which had
+Q3_K_XL as "a genuinely different point on the curve". See
+`reports/GGUF_LOADER.md` for what the loader had to undo to get there.
+
+### Still open: EXL3 as a backend
+
+The measurement side is done and is in `reports/QUANT_ACCURACY.md`: EXL3 3.50bpw
+is the most accurate of the four at matched VRAM, and loses about 11% of decode
+at 262K plus 1.7 GiB. What does not exist is a kernel.
+
+Scoped honestly rather than hand-waved: exllamav3's `exllamav3_ext/quant/` is
+about 8600 lines, of which the decode GEMV (`exl3_gemv_kernel.cuh` 402 +
+`exl3_dq.cuh` 292 + `hadamard_inner.cuh` 473) and the prefill GEMM
+(`exl3_gemm_inner.cuh` 733 + `exl3_gemm_kernel.cuh` 292) are the load-bearing
+parts. EXL3 is a trellis quant: decoding a weight is a multiply-shift hash into
+a Gaussian codebook, and the activations need a Hadamard transform first, so
+none of the GGUF or AWQ machinery transfers — only the `Linear` abstraction and
+the strided kernel plumbing, which is exactly what the GGUF work generalised.
+
+One thing worth knowing before anyone starts: exllamav3's fast paths are guarded
+on `__CUDA_ARCH__ > 890`, so **the EXL3 numbers measured on this box already come
+from its generic fallback**, not from a tuned sm_86 kernel. That cuts both ways
+— the comparison is fair to what a 3090 user actually gets today, and a
+hand-written sm_86 kernel might beat it by more than the 11% gap suggests.
 
 ## DFlash2 transfers to any quant, unchanged
 

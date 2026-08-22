@@ -364,10 +364,75 @@ template <> struct Deq<GgmlType::BF16> {
 constexpr int GEMV_WARPS = 4;
 constexpr int GEMV_THREADS = GEMV_WARPS * 32;
 
+// ---------------------------------------------------------------- codebooks
+//
+// The i-quants are CODEBOOK quants: the stored index selects an entry from a
+// fixed grid. Those grids live in global memory and were being indexed once per
+// value -- eight dependent global loads per lane per 256-run, on top of the
+// weight stream itself. They are tiny (1-8 KiB) and every warp in the block
+// hits the same entries, so staging them in shared memory once per block turns
+// each lookup into an LDS. This is the largest remaining share of the gap
+// against llama.cpp: IQ4_XS and IQ3_S together are 65% of UD-Q3_K_XL's bytes
+// and were the two slowest types in the sweep.
+//
+// Types with no codebook stage nothing and pay one predicated branch.
+template <GgmlType T> struct Stage {
+  static constexpr int BYTES = 1;   // zero-size __shared__ arrays are illegal
+  __device__ static Tab go(uint8_t*, Tab t, int) { return t; }
+};
+
+// Copy `n` bytes cooperatively and hand back a pointer into shared.
+__device__ __forceinline__ void* sm_copy(uint8_t*& sp, const void* src, int n, int tid,
+                                         int nthreads) {
+  uint8_t* dst = sp;
+  const uint8_t* s8 = static_cast<const uint8_t*>(src);
+  for (int i = tid * 4; i < n; i += nthreads * 4)
+    *reinterpret_cast<uint32_t*>(dst + i) = *reinterpret_cast<const uint32_t*>(s8 + i);
+  sp += n;
+  return dst;
+}
+
+#define QWEN_STAGE(TYPE, BYTES_, BODY)                                        \
+  template <> struct Stage<GgmlType::TYPE> {                                  \
+    static constexpr int BYTES = BYTES_;                                      \
+    __device__ static Tab go(uint8_t* sp, Tab t, int tid) { BODY return t; }  \
+  };
+
+// kvalues_iq4nl is 16 bytes; it is read eight times per lane per run.
+QWEN_STAGE(IQ4_XS, 16,
+  t.kv4nl = (const int8_t*)sm_copy(sp, t.kv4nl, 16, tid, GEMV_THREADS);)
+QWEN_STAGE(IQ4_NL, 16,
+  t.kv4nl = (const int8_t*)sm_copy(sp, t.kv4nl, 16, tid, GEMV_THREADS);)
+QWEN_STAGE(IQ3_S, 512 * 4,
+  t.iq3s = (const uint32_t*)sm_copy(sp, t.iq3s, 512 * 4, tid, GEMV_THREADS);)
+QWEN_STAGE(IQ3_XXS, 256 * 4 + 128,
+  t.iq3xxs = (const uint32_t*)sm_copy(sp, t.iq3xxs, 256 * 4, tid, GEMV_THREADS);
+  t.ksigns = (const uint8_t*)sm_copy(sp, t.ksigns, 128, tid, GEMV_THREADS);)
+QWEN_STAGE(IQ2_XS, 512 * 8 + 128,
+  t.iq2xs = (const uint64_t*)sm_copy(sp, t.iq2xs, 512 * 8, tid, GEMV_THREADS);
+  t.ksigns = (const uint8_t*)sm_copy(sp, t.ksigns, 128, tid, GEMV_THREADS);)
+QWEN_STAGE(IQ2_XXS, 256 * 8 + 128,
+  t.iq2xxs = (const uint64_t*)sm_copy(sp, t.iq2xxs, 256 * 8, tid, GEMV_THREADS);
+  t.ksigns = (const uint8_t*)sm_copy(sp, t.ksigns, 128, tid, GEMV_THREADS);)
+// IQ2_S is deliberately NOT staged. Its grid is 8 KiB -- four times the next
+// biggest -- and measured warm, staging it cost 4.4% (270.0 -> 258.1 GB/s)
+// where IQ3_S gained 12%. The table is big enough that the occupancy it takes
+// costs more than the loads it saves.
+#undef QWEN_STAGE
+
 template <GgmlType T, int MROWS>
 __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
     __nv_bfloat16* __restrict__ y, const uint8_t* __restrict__ w,
     const __nv_bfloat16* __restrict__ x, int out_f, int in_f, int ldy, Tab tab) {
+  // Stage the codebook BEFORE the out-of-range return: every thread in the
+  // block has to reach the barrier, and the tail block has threads that do not
+  // own a row.
+  __shared__ __align__(8) uint8_t sm[Stage<T>::BYTES];
+  if (Stage<T>::BYTES > 1) {
+    tab = Stage<T>::go(sm, tab, threadIdx.x);
+    __syncthreads();
+  }
+
   const int warp = (blockIdx.x * GEMV_WARPS) + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   if (warp >= out_f) return;
