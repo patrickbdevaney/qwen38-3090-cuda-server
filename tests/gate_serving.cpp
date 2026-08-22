@@ -127,15 +127,31 @@ static void check_liveness() {
 }
 
 static void check_greedy_determinism() {
+  // What IS a contract: the same request down the same path is bit-identical.
+  // Calls 2 and 3 both hit the prefix cache in full, so both take the plain
+  // decode path, and they must agree exactly.
   const json b = greedy(user_msg("Name the capital of France. One word."), 24);
-  const json a1 = post(b), a2 = post(b);
-  const std::string s1 = content_of(a1), s2 = content_of(a2);
-  // The second call is served from the prefix cache and therefore takes the
-  // NON-speculative path (a full hit leaves no prefill to prime the drafter).
-  // Identical output across that boundary is the strongest single statement
-  // this gate makes: two different execution paths, same greedy tokens.
-  check("greedy is deterministic across a cache hit", !s1.empty() && s1 == s2,
-        s1.empty() ? "empty output" : ("'" + s1.substr(0, 40) + "'"));
+  post(b);
+  const std::string s2 = content_of(post(b)), s3 = content_of(post(b));
+  check("greedy repeats exactly on the same path", !s2.empty() && s2 == s3,
+        s2.empty() ? "empty output" : ("'" + s2.substr(0, 40) + "'"));
+
+  // What is NOT a contract, and must not be asserted as one: greedy output is
+  // not guaranteed identical BETWEEN the speculative and plain paths. The
+  // acceptance rule is lossless, but the verify forward runs at T = block_size
+  // through the tensor-core path while decode runs the GEMV at T = 1, and the
+  // two sum in different orders -- so a pair of tokens whose logits sit within
+  // a bf16 ulp of each other can swap. gate_spec measures this directly and
+  // fails only when a divergence has a real logit gap. What this gate checks is
+  // that the ESCAPE HATCH works, because a harness that needs reproducibility
+  // across retries has to be able to ask for it.
+  json ns = greedy(user_msg("Name three colours, comma separated."), 32);
+  ns["speculative"] = false;
+  const json r1 = post(ns), r2 = post(ns);
+  check("speculative:false is honoured",
+        r1.value("timings", json::object()).value("draft_rounds", 0) == 0, "");
+  check("speculative:false repeats exactly",
+        !content_of(r1).empty() && content_of(r1) == content_of(r2), "");
 }
 
 static void check_prefix_cache() {
@@ -221,13 +237,19 @@ static void check_seed_reproducibility() {
 
 static void check_streaming() {
   const json msgs = user_msg("List three primary colours, comma separated.");
-  const json nonstream = post(greedy(msgs, 48));
+  // Both sides run with speculation off, so this compares the two RESPONSE
+  // ENCODERS rather than two decode paths -- see check_greedy_determinism.
+  json b = greedy(msgs, 48);
+  b["speculative"] = false;
+  const json nonstream = post(b);
   const std::string want = content_of(nonstream);
 
   auto c = mk(180);
   std::string acc, finish;
   bool saw_done = false, saw_usage = false;
-  const std::string body = greedy(msgs, 48, true).dump();
+  json sb = greedy(msgs, 48, true);
+  sb["speculative"] = false;
+  const std::string body = sb.dump();
   std::string buf;
   auto res = c.Post("/v1/chat/completions", httplib::Headers{}, body, "application/json",
                     [&](const char* data, size_t len) {
@@ -342,7 +364,11 @@ static void check_text_completions() {
     text = r["choices"][0].value("text", "");
   }
   check("/v1/completions responds", st == 200 && shaped, "status=" + std::to_string(st));
-  check("/v1/completions returns text", !text.empty(), "'" + text.substr(0, 32) + "'");
+  // A raw completion has no chat template, so there is no enable_thinking to
+  // set and the model may spend the whole budget reasoning. The contract is
+  // that tokens were produced and accounted for, not that `text` is non-empty.
+  const int n = r.contains("usage") ? r["usage"].value("completion_tokens", 0) : 0;
+  check("/v1/completions generates", n > 0, std::to_string(n) + " tokens");
 }
 
 // Source code is not ASCII. A JSON or tokenizer round trip that mangles it
@@ -398,9 +424,11 @@ static void check_bad_requests() {
   check("missing messages returns 4xx", st >= 400 && st < 500, std::to_string(st));
 
   // A prompt past --max-context must be refused, not truncated and not fatal.
-  auto mm = mk(20).Get("/v1/models");
   int max_ctx = 0;
-  try { max_ctx = json::parse(mm->body)["data"][0].value("max_context", 0); } catch (...) {}
+  { auto mm = mk(20).Get("/v1/models");
+    try { max_ctx = json::parse(mm->body)["data"][0].value("max_context", 0); } catch (...) {}
+    if (max_ctx == 0) { auto h = mk(20).Get("/health");
+      try { max_ctx = json::parse(h->body).value("max_context", 0); } catch (...) {} } }
   if (max_ctx > 0 && max_ctx <= 65536) {
     const std::string huge = long_prompt(max_ctx, "overflow");
     post(greedy(user_msg(huge), 8), 300, "/v1/chat/completions", &st);

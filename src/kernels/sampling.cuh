@@ -24,6 +24,10 @@ struct SamplingParams {
   float frequency_penalty = 0.0f;
   float repetition_penalty = 1.0f;
   uint64_t seed = 0;
+  // Request-level policy rather than a sampling knob, but it travels with the
+  // request and the speculation decision is made from this struct: a client can
+  // set "speculative": false to force the plain decode path.
+  bool speculative = true;
 };
 
 struct SamplerState {

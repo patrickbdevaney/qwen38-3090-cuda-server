@@ -148,6 +148,21 @@ SamplingParams parse_sampling(const json& b, bool thinking) {
   // Directive 8.6 defaults, which differ by mode.
   if (thinking) { p.temperature = 1.0f; p.top_p = 0.95f; p.top_k = 20; p.presence_penalty = 0.0f; }
   else          { p.temperature = 0.7f; p.top_p = 0.80f; p.top_k = 20; p.presence_penalty = 1.5f; }
+  // Those are recommended defaults for OPEN-ENDED sampling, and applying them to
+  // a request that asked for greedy decoding is wrong twice over. A presence
+  // penalty changes which token is the argmax -- on code, where `)`, newline and
+  // the same identifiers recur constantly, a default of 1.5 quietly degrades
+  // exactly the output a coding harness cares about -- and because the
+  // speculative acceptance rule is argmax equality, any active penalty also
+  // silently turns speculation off. A request with temperature 0 or top_k 1 is
+  // asking for greedy; the penalties default to neutral there, and an explicit
+  // penalty in the body still wins below.
+  const bool asked_greedy =
+      (b.contains("temperature") && !b["temperature"].is_null() &&
+       b["temperature"].get<float>() <= 0.f) ||
+      (b.contains("top_k") && !b["top_k"].is_null() && b["top_k"].get<int>() == 1);
+  if (asked_greedy) { p.presence_penalty = 0.f; p.frequency_penalty = 0.f;
+                      p.repetition_penalty = 1.f; }
   if (b.contains("temperature") && !b["temperature"].is_null()) p.temperature = b["temperature"].get<float>();
   if (b.contains("top_p") && !b["top_p"].is_null())             p.top_p = b["top_p"].get<float>();
   if (b.contains("top_k") && !b["top_k"].is_null())             p.top_k = b["top_k"].get<int>();
@@ -165,6 +180,8 @@ SamplingParams parse_sampling(const json& b, bool thinking) {
   // had done first. `step` is now the token index within the request, which
   // makes (seed, step) a function of the request alone, and a request that does
   // NOT ask for a seed gets a fresh one here so it still varies.
+  if (b.contains("speculative") && b["speculative"].is_boolean())
+    p.speculative = b["speculative"].get<bool>();
   if (b.contains("seed") && !b["seed"].is_null()) p.seed = b["seed"].get<uint64_t>();
   else {
     static std::atomic<uint64_t> nonce{0};
@@ -226,7 +243,13 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   if (g_prefix) reuse = prefix_lookup(*g_prefix, key, &slot);
   const bool full_hit = reuse >= int(ids.size());
 
-  const bool use_spec = g_draft && g_spec && greedy && !full_hit;
+  // A harness that needs bitwise-reproducible greedy output across retries can
+  // turn speculation off per request. Verification is lossless by construction,
+  // but the verify forward runs at T = block_size through the tensor-core path
+  // while plain decode runs the GEMV at T = 1, and the two sum in different
+  // orders -- so a pair of tokens whose logits are within a bf16 ulp can swap.
+  // Every speculative decoder has this property; this is the escape hatch.
+  const bool use_spec = g_draft && g_spec && greedy && !full_hit && sp.speculative;
   if (use_spec) {
     model_enable_taps(m, g_draft->sh.target_layer_ids);
     // The drafter's context cache is not part of the prefix snapshot yet, so on
@@ -326,6 +349,22 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
 
   int i = 0;
   uint64_t step = 0;            // per REQUEST, not per server lifetime
+  bool hit_stop = false;
+  // Search for a stop sequence INSIDE what was just appended, not only as a
+  // suffix. The reasoning splitter buffers text it cannot yet classify and
+  // releases several tokens' worth at once, so a stop string landing anywhere
+  // but the very end of a release used to be missed entirely. `before` is the
+  // content length prior to the append; the search starts far enough back to
+  // catch a match straddling that boundary.
+  auto scan_stops = [&](size_t before) {
+    for (const auto& st : stops) {
+      if (st.empty()) continue;
+      const size_t from = before >= st.size() ? before - st.size() + 1 : 0;
+      const size_t at = r.content.find(st, from);
+      if (at != std::string::npos) { r.content.resize(at); return true; }
+    }
+    return false;
+  };
   while (i < max_new) {
     if (pending.empty()) {
       if (!use_spec) {
@@ -365,6 +404,7 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     const std::string piece = g_tok->decode({tok});
     all += piece;
     std::string c, th;
+    const size_t content_before = r.content.size();
     sp_split.feed(piece, false, c, th);
     if (sp_split.in_think() || !th.empty()) r.reasoning_tokens += 1;
     r.content += c; r.reasoning += th;
@@ -372,14 +412,13 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
       r.finish_reason = "abort"; break;
     }
 
-    bool stopped = false;
-    for (const auto& st : stops)
-      if (!st.empty() && r.content.size() >= st.size() &&
-          r.content.compare(r.content.size() - st.size(), st.size(), st) == 0) {
-        r.content.erase(r.content.size() - st.size());
-        stopped = true; break;
-      }
-    if (stopped) { r.finish_reason = "stop"; break; }
+    // Stop sequences have to be searched INSIDE what was just appended, not
+    // only tested as a suffix. The reasoning splitter buffers while it is inside
+    // a <think> block and releases the whole tail at once when the block closes,
+    // so a stop string landing anywhere but the very end of that release was
+    // silently missed and the request over-generated. Start the search far
+    // enough back to catch a match that straddles the boundary.
+    if (scan_stops(content_before)) { hit_stop = true; r.finish_reason = "stop"; break; }
     ++i;
     if (i == max_new) { r.finish_reason = "length"; break; }
     // The speculative path already advanced the model past every committed
@@ -406,8 +445,19 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
 
   std::string c, th;
   sp_split.feed("", true, c, th);
-  r.content += c; r.reasoning += th;
-  if (on_delta && (!c.empty() || !th.empty())) on_delta(c, th);
+  // The flush releases whatever the splitter was still holding, and it used to
+  // append it AFTER the stop-sequence truncation -- so a request that stopped
+  // correctly had the text past its stop string put straight back on the end.
+  // With stop=["bravo"] on "alpha bravo charlie delta" that produced
+  // "alpha arlie delta": truncated at the match, then the buffered tail
+  // re-appended. The flush is scanned like any other append, and skipped
+  // entirely once a stop has already fired.
+  if (!hit_stop) {
+    const size_t before = r.content.size();
+    r.content += c; r.reasoning += th;
+    if (scan_stops(before)) { hit_stop = true; r.finish_reason = "stop"; c.clear(); }
+    if (on_delta && (!c.empty() || !th.empty())) on_delta(c, th);
+  }
   r.calls = sp_split.tool_calls();
 
   const auto t1 = std::chrono::steady_clock::now();
@@ -565,7 +615,12 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
                          {"data", json::array({json{{"id", g_cfg.model_alias},
                                                     {"object", "model"},
                                                     {"created", unix_now()},
-                                                    {"owned_by", "local"}}})}}.dump(),
+                                                    {"owned_by", "local"},
+                                                    // Non-standard but load-bearing: a harness
+                                                    // that has to decide when to compact cannot
+                                                    // discover the window any other way.
+                                                    {"max_context", g_cfg.max_ctx},
+                                                    {"context_length", g_cfg.max_ctx}}})}}.dump(),
                     "application/json");
   });
 
@@ -636,10 +691,25 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
           throw ChatTemplateError("`messages` is required and must be an array");
         ChatOptions opt;
         opt.add_generation_prompt = true;
-        if (b.contains("enable_thinking") && !b["enable_thinking"].is_null())
-          opt.enable_thinking = b["enable_thinking"].get<bool>();
-        if (b.contains("preserve_thinking") && !b["preserve_thinking"].is_null())
-          opt.preserve_thinking = b["preserve_thinking"].get<bool>();
+        // `chat_template_kwargs` is how vLLM, SGLang and llama.cpp all take
+        // template arguments, and it is what every Qwen-aware harness sends to
+        // turn thinking off. Only the top-level spelling was read here, so a
+        // client doing the standard thing got a reasoning block anyway -- and
+        // with a small max_tokens that means an empty `content` and a reply the
+        // harness cannot use. Both spellings are accepted; the top-level one
+        // wins, because it is the more specific.
+        const json* kw = (b.contains("chat_template_kwargs") &&
+                          b["chat_template_kwargs"].is_object())
+                             ? &b["chat_template_kwargs"] : nullptr;
+        auto flag = [&](const char* name, std::optional<bool>& dst) {
+          if (kw && kw->contains(name) && (*kw)[name].is_boolean())
+            dst = (*kw)[name].get<bool>();
+          if (b.contains(name) && !b[name].is_null()) dst = b[name].get<bool>();
+        };
+        flag("enable_thinking", opt.enable_thinking);
+        flag("preserve_thinking", opt.preserve_thinking);
+        if (kw && kw->contains("reasoning_effort") && (*kw)["reasoning_effort"].is_string())
+          opt.reasoning_effort = (*kw)["reasoning_effort"].get<std::string>();
         if (b.contains("reasoning_effort") && b["reasoning_effort"].is_string())
           opt.reasoning_effort = b["reasoning_effort"].get<std::string>();
         thinking = !opt.enable_thinking.has_value() || *opt.enable_thinking;
