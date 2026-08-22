@@ -334,6 +334,62 @@ of the model and silently assumed the rest behaved like the average of what was
 measured. It now picks the largest tensor of every type present -- which is how
 Q6_K's 163 GB/s came to light at all, at 2.6% of the bytes and 13% of the time.
 
+### FINAL per-type state, and where the ceiling actually is
+
+After the unroll, the affine split and the int8 activation path, measured warm
+against the 914.2 GB/s this card streams:
+
+| type | share | GB/s | of DRAM |
+|---|---:|---:|---:|
+| Q6_K | 2.6% | 820 | **90%** |
+| Q8_0 | 0.3% | 756 | 83% |
+| Q5_K | 8.9% | 667 | 73% |
+| IQ4_XS | 37.9% | 653 | 71% |
+| Q4_K | 4.9% | 643 | 70% |
+| IQ3_S | 26.9% | 608 | 67% |
+| IQ4_NL | 0.3% | 592 | 65% |
+| IQ2_S | 3.1% | 465 | 51% |
+| IQ3_XXS | 6.9% | 489 | 53% |
+| Q2_K | 0.5% | 492 | 54% |
+| IQ2_XS | 0.8% | 390 | 43% |
+| IQ2_XXS | 0.4% | 339 | 37% |
+| **composition-weighted** | | **598** | **65%** |
+
+**Q6_K at 90% is the load-bearing data point.** Its dequantiser is a shift and a
+subtract, and it reaches the streaming roofline in this exact kernel shape --
+same warp-per-row layout, same loads, same accumulation. So what holds the others
+back is not the kernel's structure; it is the arithmetic their formats require.
+The correlation is monotone in bits per weight: the fewer bytes a type reads per
+element, the more its fixed per-element dequantisation cost dominates, which is
+why IQ2_XXS at 2.06 bits sits at 37% and Q6_K at 6.56 bits sits at 90%.
+
+That also sets the ceiling. Two thirds of this file is IQ4_XS and IQ3_S; the
+weighted number is essentially theirs, and moving it means making a codebook
+lookup cheaper than a PRMT pair, or reading fewer bytes per element -- which is
+the file's choice, not the kernel's.
+
+### Things that were tried and measured WORSE
+
+Recorded because the measurement is the durable part, and because each of these
+is an idea a reader will have:
+
+| idea | result |
+|---|---|
+| four-way accumulator split, to break the FMA chain | 495 vs 503 GB/s |
+| activations staged in shared memory, M=1 | 445 vs 503 |
+| activations staged in shared memory, M=8 | 0.367 vs 0.181 ms |
+| warps per block 2 / 4 / 8 / 16 | 500 / 498 / 495 / 487 -- flat |
+| `-Xptxas=-dlcm=cg`, keep weights out of L1 | 578 vs 580 |
+| int8 activations for IQ3_S | 550 vs 617 |
+| affine split for the remaining zero-min types | inside noise |
+| multi-row GEMV instead of the tensor cores (AWQ, T>=4) | 73.1 vs 44.5 ms at T=8 |
+
+The activation-staging result is worth dwelling on: every warp reads the whole
+activation vector, which for a 17408x5120 tensor is 174 MB against 36 MB of
+weights. That ratio looks decisive and is not, because the vector is 10 KiB and
+lives in L1. Two separate attempts to fix a problem that a byte count said
+existed and a measurement said did not.
+
 ### What is still on the table, and why it is worth taking
 
 At 504 GB/s the GEMV is at 55% of measured DRAM, against the AWQ path's 84%. The

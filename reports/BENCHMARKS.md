@@ -256,6 +256,47 @@ because the speculative acceptance rule IS argmax equality, it also disabled
 speculation entirely. The standard coding-agent request got penalty-distorted
 output at 43 tok/s where it should have had greedy output at 146.
 
+## FINAL: autoregressive and speculative decode, both weight paths
+
+Measured on the HTTP endpoint, INT4 KV, DFlash2 drafter, `enable_thinking:false`,
+`temperature: 0`, 192 tokens. This supersedes the table below it, which was taken
+before the GGUF kernel work.
+
+| prompt | AWQ AR | AWQ spec | acc/rd | GGUF AR | GGUF spec | acc/rd |
+|---|---:|---:|---:|---:|---:|---:|
+| count to 60 | 45.9 | **148.8** | 8.00 | 35.5 | **93.7** | 8.00 |
+| reverse a linked list (code) | 45.6 | **142.0** | 7.58 | 35.2 | **88.8** | 7.58 |
+| explain quicksort (prose) | 45.6 | 49.0 | 2.71 | 35.1 | 32.8 | 2.40 |
+
+Against the same measurement at the start of the kernel work: GGUF
+autoregressive decode 23.8 -> 35.5 tok/s (+49%) and GGUF speculative decode on
+code 82.2 -> 88.8. AWQ is unchanged, which is the point -- its GEMV was already
+at 84% of measured DRAM and nothing here moved it.
+
+**The prose row is the adaptive routing working.** At 2.4 accepted tokens per
+round speculation is a net loss on the GGUF path, and it used to be taken anyway:
+27.9 tok/s against 30.1 plain. The server now measures both rates and switches,
+which is why that row shows 15 rounds instead of 57 and 32.8 tok/s instead of
+27.9. It is still a little under the 35.1 plain rate, because the first eight
+rounds run speculatively to gather the evidence.
+
+### How the routing decides
+
+A speculative round costs a fixed multiple of an autoregressive step -- one target
+forward at T = block_size plus a drafter forward, against one target forward at
+T = 1 -- so it wins exactly when acceptance exceeds that multiple. Rather than
+hardcode a threshold that would go stale the moment the round gets cheaper, the
+server measures both: it accumulates the observed cost per committed token, and
+compares it against a per-context-scale EMA of the plain decode rate learned from
+requests that actually decode plainly. Eight rounds of evidence and a 5% margin
+before it moves, and once moved it stays. `timings.draft_abandoned` reports it.
+
+The switch is only taken where `pending` is empty. Everywhere else that deque
+holds tokens the verify forward has already fed through the model, and the plain
+path would feed them a second time; at an empty deque both modes share the same
+invariant -- `m.logits` holds the distribution for position `pos`, and `pos` is
+the number of tokens in the KV cache -- so either can take over.
+
 ## Autoregressive and speculative decode, measured through the server
 
 Both weight formats, INT4 KV, DFlash2 drafter, `enable_thinking: false`,
@@ -300,7 +341,11 @@ ceiling it implies against the 914.2 GB/s this card was MEASURED at in Phase 0.
 | | bytes/token @4K | roofline | measured | of roofline |
 |---|---:|---:|---:|---:|
 | AWQ INT4 g128 | 13.424 GiB | 63.4 tok/s | 45.6 | **72%** |
-| GGUF UD-Q3_K_XL | 11.727 GiB | 72.6 tok/s | 30.6 | **42%** |
+| GGUF UD-Q3_K_XL | 11.727 GiB | 72.6 tok/s | **35.5** | **49%** |
+
+(GGUF was 30.6 tok/s / 42% when this section was first written and 23.8 / 33%
+before any of the kernel work. See `reports/CONFIG_MATRIX.md` for the per-type
+breakdown and the list of things that were tried and did not work.)
 
 **GGUF's ceiling is HIGHER than AWQ's**, because it reads 1.7 GiB fewer bytes per
 token. That is the whole case for finishing its kernel: at AWQ's 72% efficiency
