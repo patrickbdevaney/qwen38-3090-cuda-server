@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 namespace qwen {
 namespace {
@@ -57,6 +58,21 @@ struct Tab {
 // Produce the 8 values at [o0, o0+8) of a 256-element run. o0 is always a
 // multiple of 8, which is what keeps every lane inside one sub-block and one
 // scale.
+// AFFINE SPLIT.
+//
+// Every format here is affine: a value is `dl * code - ml` for a small integer
+// code and a per-sub-block scale. Applying dl inside the dequantiser costs one
+// multiply PER ELEMENT; hoisting it out costs one per eight, because
+//     sum_i (dl * q_i) * x_i  ==  dl * sum_i q_i x_i.
+// Types that declare AFFINE fill y[] with raw codes and return dl, and the
+// kernel scales once per group. The summation order changes, so the dot product
+// is not bit-identical -- it is a slightly more accurate association -- but the
+// per-value dequantisation the gate checks is untouched, because get8() still
+// applies the scale itself.
+//
+// Only the ml == 0 formats gain. Where a minimum is subtracted, `dl*q - ml` is
+// already a single FMA per element and factoring would need sum(x) as well,
+// which costs exactly what it saves.
 template <GgmlType T> struct Deq;
 
 template <> struct Deq<GgmlType::Q4_K> {
@@ -245,7 +261,8 @@ __device__ __forceinline__ float s8(uint32_t packed, int k) {
 
 template <> struct Deq<GgmlType::IQ4_XS> {
   static constexpr int RUN_BYTES = 136;
-  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+  static constexpr bool AFFINE = true;
+  __device__ static float get8a(const uint8_t* p, int o0, float* y, const Tab& t) {
     const BIQ4XS* b = reinterpret_cast<const BIQ4XS*>(p);
     const int ib = o0 / 32, within = o0 % 32;
     const int ls = ((b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
@@ -261,9 +278,15 @@ template <> struct Deq<GgmlType::IQ4_XS> {
     const uint32_t p1 = lut16_x4((qv.y >> lsh) & 0x0F0F0F0Fu);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      y[i]     = dl * s8(p0, i);
-      y[i + 4] = dl * s8(p1, i);
+      y[i]     = s8(p0, i);
+      y[i + 4] = s8(p1, i);
     }
+    return dl;
+  }
+  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+    const float d_ = get8a(p, o0, y, t);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) y[i] *= d_;
   }
 };
 
@@ -341,7 +364,8 @@ template <> struct Deq<GgmlType::IQ3_XXS> {
 
 template <> struct Deq<GgmlType::IQ3_S> {
   static constexpr int RUN_BYTES = 110;
-  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+  static constexpr bool AFFINE = true;
+  __device__ static float get8a(const uint8_t* p, int o0, float* y, const Tab& t) {
     const BIQ3S* b = reinterpret_cast<const BIQ3S*>(p);
     const int s = o0 / 32, l = (o0 % 32) / 8;
     const float db = h2f(b->d) *
@@ -361,9 +385,15 @@ template <> struct Deq<GgmlType::IQ3_S> {
     for (int i = 0; i < 4; ++i) {
       const int v1 = int((g1 >> (8 * i)) & 0xFF);
       const int v2 = int((g2 >> (8 * i)) & 0xFF);
-      y[i]     = db * float((sg >> i)       & 1 ? -v1 : v1);
-      y[i + 4] = db * float((sg >> (i + 4)) & 1 ? -v2 : v2);
+      y[i]     = float((sg >> i)       & 1 ? -v1 : v1);
+      y[i + 4] = float((sg >> (i + 4)) & 1 ? -v2 : v2);
     }
+    return db;
+  }
+  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+    const float d_ = get8a(p, o0, y, t);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) y[i] *= d_;
   }
 };
 
@@ -382,7 +412,8 @@ template <> struct Deq<GgmlType::Q8_0> {
 
 template <> struct Deq<GgmlType::IQ4_NL> {
   static constexpr int RUN_BYTES = 8 * 18;
-  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+  static constexpr bool AFFINE = true;
+  __device__ static float get8a(const uint8_t* p, int o0, float* y, const Tab& t) {
     const BIQ4NL* b = reinterpret_cast<const BIQ4NL*>(p) + (o0 / 32);
     const float d = h2f(b->d);
     const int w = o0 % 32;
@@ -401,9 +432,15 @@ template <> struct Deq<GgmlType::IQ4_NL> {
     const uint32_t p1 = lut16_x4((w1 >> lsh) & 0x0F0F0F0Fu);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      y[i]     = d * s8(p0, i);
-      y[i + 4] = d * s8(p1, i);
+      y[i]     = s8(p0, i);
+      y[i + 4] = s8(p1, i);
     }
+    return d;
+  }
+  __device__ static void get8(const uint8_t* p, int o0, float* y, const Tab& t) {
+    const float d_ = get8a(p, o0, y, t);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) y[i] *= d_;
   }
 };
 
@@ -500,6 +537,11 @@ QWEN_STAGE(IQ2_XXS, 256 * 8 + 128,
 __device__ __forceinline__ float xlo(uint32_t u) { return __uint_as_float(u << 16); }
 __device__ __forceinline__ float xhi(uint32_t u) { return __uint_as_float(u & 0xFFFF0000u); }
 
+// Types without an AFFINE member are detected, not annotated, so adding the
+// split to another format is a two-line change to that format alone.
+template <class D, class = void> struct HasAffine : std::false_type {};
+template <class D> struct HasAffine<D, decltype((void)D::AFFINE)> : std::true_type {};
+
 template <GgmlType T, int MROWS>
 __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
     __nv_bfloat16* __restrict__ y, const uint8_t* __restrict__ w,
@@ -532,7 +574,8 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   // (header, then scale, then data) and there is only one of them outstanding
   // per lane at a time. Decoding two super-blocks per iteration gives the
   // scheduler two independent chains to interleave.
-  auto body = [&](int i, const float* v) {
+  constexpr bool AF = HasAffine<Deq<T>>::value;
+  auto body = [&](int i, const float* v, float dl) {
     const int base = (i << 8) + o0;
     #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
@@ -542,14 +585,18 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
       // halves are unpacked with bit ops rather than through a local array,
       // which would spill the vector to local memory and undo the point.
       const uint4 xv = *reinterpret_cast<const uint4*>(x + size_t(m) * in_f + base);
-      acc[m] = fmaf(v[0], xlo(xv.x), acc[m]);
-      acc[m] = fmaf(v[1], xhi(xv.x), acc[m]);
-      acc[m] = fmaf(v[2], xlo(xv.y), acc[m]);
-      acc[m] = fmaf(v[3], xhi(xv.y), acc[m]);
-      acc[m] = fmaf(v[4], xlo(xv.z), acc[m]);
-      acc[m] = fmaf(v[5], xhi(xv.z), acc[m]);
-      acc[m] = fmaf(v[6], xlo(xv.w), acc[m]);
-      acc[m] = fmaf(v[7], xhi(xv.w), acc[m]);
+      // With the affine split the scale multiplies the GROUP sum, not each
+      // element: eight multiplies per eight values become one.
+      float a = AF ? 0.f : acc[m];
+      a = fmaf(v[0], xlo(xv.x), a);
+      a = fmaf(v[1], xhi(xv.x), a);
+      a = fmaf(v[2], xlo(xv.y), a);
+      a = fmaf(v[3], xhi(xv.y), a);
+      a = fmaf(v[4], xlo(xv.z), a);
+      a = fmaf(v[5], xhi(xv.z), a);
+      a = fmaf(v[6], xlo(xv.w), a);
+      a = fmaf(v[7], xhi(xv.w), a);
+      acc[m] = AF ? fmaf(dl, a, acc[m]) : a;
     }
   };
 
@@ -562,21 +609,28 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   // composition-weighted), and warps per block barely matters (2 -> 553,
   // 4 -> 545, 8 -> 535), which is itself evidence the kernel is latency bound
   // rather than occupancy bound.
+  // Also tried and rejected: -Xptxas=-dlcm=cg on this translation unit, to keep
+  // the streamed weights out of L1 and leave it to the activation vector. No
+  // change (578 vs 580 GB/s composition-weighted), so the default policy stays.
   constexpr int U = QWEN_GGUF_UNROLL;
   constexpr int UU = U;
   int i = 0;
   for (; i + UU <= runs; i += UU) {
-    float v[UU][8];
+    float v[UU][8], dl[UU];
     #pragma unroll
-    for (int u = 0; u < UU; ++u)
-      Deq<T>::get8(wr + size_t(i + u) * Deq<T>::RUN_BYTES, o0, v[u], tab);
+    for (int u = 0; u < UU; ++u) {
+      if constexpr (AF)
+        dl[u] = Deq<T>::get8a(wr + size_t(i + u) * Deq<T>::RUN_BYTES, o0, v[u], tab);
+      else { dl[u] = 1.f; Deq<T>::get8(wr + size_t(i + u) * Deq<T>::RUN_BYTES, o0, v[u], tab); }
+    }
     #pragma unroll
-    for (int u = 0; u < UU; ++u) body(i + u, v[u]);
+    for (int u = 0; u < UU; ++u) body(i + u, v[u], dl[u]);
   }
   for (; i < runs; ++i) {
-    float v[8];
-    Deq<T>::get8(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, v, tab);
-    body(i, v);
+    float v[8], d1 = 1.f;
+    if constexpr (AF) d1 = Deq<T>::get8a(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, v, tab);
+    else Deq<T>::get8(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, v, tab);
+    body(i, v, d1);
   }
   #pragma unroll
   for (int m = 0; m < MROWS; ++m) {
