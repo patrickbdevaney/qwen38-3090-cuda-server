@@ -242,3 +242,40 @@ more than Q3_K_XL would. It does mean the GGUF path is no longer embarrassing,
 but "AWQ and GGUF are viable substitutes" is not yet true and should not be
 claimed: the kernel is at 61% of the reference implementation, and `model.cu`
 still has no GGUF loader, so nothing runs end to end.
+
+## CORRECTION: the loader exists, and it changes the verdict above
+
+Everything from "The Q3_K_XL fused GEMV: built, correct, and NOT competitive"
+down was written with no way to run a GGUF end to end, so it could only compare
+*kernel efficiency* and had to assume the accuracy question away. Both halves of
+that turn out to be wrong in ways that matter.
+
+**The prediction in this file was that AWQ and a Q4-class GGUF would be within
+noise, and that Q3_K_XL was "a genuinely different point on the curve".** The
+first half is right and the second is not. Measured through this server against
+the original BF16 weights, over 15520 teacher-forced positions:
+
+| | KL mean | KL p99 | top-1 | weights |
+|---|---:|---:|---:|---:|
+| AWQ INT4 g128 + INT8 head | 1.495e-01 | 4.263 | 98.56% | 13.06 GiB |
+| **GGUF UD-Q3_K_XL** | **1.432e-01** | 4.274 | **98.57%** | **11.36 GiB** |
+
+Q3_K_XL is not a different point on the accuracy curve. It is the *same* point,
+1.70 GiB lighter. The reason to expect otherwise -- 3 bits against 4 -- does not
+survive contact with a dynamic quant that spends its bits per tensor: two thirds
+of this file is IQ4_XS and IQ3_S, and the head is Q5_K.
+
+**"That prize is no longer worth it, because INT4 KV already freed 3.58 GiB"**
+was also the wrong frame. The two are not alternatives, they compose. INT4 KV
+and Q3_K_XL together free 3.58 + 1.70 GiB, and the 1.70 is worth 99K tokens of
+context on top of what the KV format already bought. The argument that only one
+of them was needed came from treating headroom as a threshold to clear rather
+than a budget to spend.
+
+What survives unchanged is the *speed* half: the GGUF decode kernel is still at
+about 61% of llama.cpp's effective bandwidth, so the smaller model decodes
+slower than AWQ despite reading fewer bytes. That is the trade the two formats
+now present -- see `reports/BENCHMARKS.md` for the measured curve -- and it is a
+real choice for the user rather than a defect in one of them: AWQ for
+throughput, GGUF for context. Closing the 61% is what would make the choice
+one-sided, and it is still the highest-value open kernel item in the project.

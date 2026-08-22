@@ -188,7 +188,24 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   const bool greedy = (sp.temperature <= 0.f || sp.top_k == 1) &&
                       sp.presence_penalty == 0.f && sp.frequency_penalty == 0.f &&
                       sp.repetition_penalty == 1.0f;
-  const bool use_spec = g_draft && g_spec && greedy;
+
+  // The prefix lookup has to happen BEFORE the speculation decision, because a
+  // hit that covers the ENTIRE prompt leaves no prefill to run -- and the
+  // drafter is primed only by taps that the prefill emits. Speculating there
+  // walked into `dflash: cache ends at 0 but block starts at N` and aborted the
+  // server. Fall back to plain decode for that one request instead. A partial
+  // hit is fine: the remaining chunks still push taps, and the drafter simply
+  // sees a shorter window than its 2048 until enough tokens commit.
+  // <|image_pad|> tokens carry no image content, so two different images with
+  // the same grid tokenise identically. The cache key replaces each image span
+  // with a hash of the image bytes; without that the cache would happily serve
+  // one picture's KV for another.
+  const std::vector<int32_t>& key = cache_key ? *cache_key : ids;
+  int reuse = 0, slot = -1;
+  if (g_prefix) reuse = prefix_lookup(*g_prefix, key, &slot);
+  const bool full_hit = reuse >= int(ids.size());
+
+  const bool use_spec = g_draft && g_spec && greedy && !full_hit;
   if (use_spec) {
     model_enable_taps(m, g_draft->sh.target_layer_ids);
     // The drafter's context cache is not part of the prefix snapshot yet, so on
@@ -204,15 +221,8 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
           ? std::max<int>(0, int(ids.size()) - g_draft->sh.sliding_window + 1) : 0;
 
   // Prefix reuse. The recurrent state cannot be truncated to an arbitrary
-  // position, only restored at one that was snapshotted, so this either finds a
-  // snapshot covering a prefix of this request or starts cold.
-  // <|image_pad|> tokens carry no image content, so two different images with
-  // the same grid tokenise identically. The cache key replaces each image span
-  // with a hash of the image bytes; without that the cache would happily serve
-  // one picture's KV for another.
-  const std::vector<int32_t>& key = cache_key ? *cache_key : ids;
-  int reuse = 0, slot = -1;
-  if (g_prefix) reuse = prefix_lookup(*g_prefix, key, &slot);
+  // position, only restored at one that was snapshotted, so the lookup above
+  // either found a snapshot covering a prefix of this request or starts cold.
   if (reuse > 0) {
     prefix_restore(*g_prefix, m, slot);
     r.cached_tokens = reuse;
@@ -523,6 +533,14 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     add("qwen_completion_tokens_total", "Tokens generated.", "counter", double(g_metrics.completion_tokens));
     add("qwen_reasoning_tokens_total", "Tokens inside <think>.", "counter", double(g_metrics.reasoning_tokens));
     add("qwen_cached_prefix_tokens_total", "Prompt tokens served from the prefix cache.", "counter", double(g_metrics.cached_prefix_tokens));
+    // The prefix cache is invisible without these: a snapshot that never gets
+    // reused looks exactly like one that does from every other counter here.
+    if (g_prefix) {
+      add("qwen_prefix_hits_total", "Lookups that found a usable snapshot.", "counter", double(g_prefix->hits));
+      add("qwen_prefix_misses_total", "Lookups that found none.", "counter", double(g_prefix->misses));
+      add("qwen_prefix_restore_seconds_total", "Time spent restoring snapshots.", "counter", g_prefix->restore_ms / 1000.0);
+      add("qwen_prefix_store_seconds_total", "Time spent taking snapshots.", "counter", g_prefix->store_ms / 1000.0);
+    }
     add("qwen_queue_depth", "Requests waiting for the single engine slot.", "gauge", double(g_metrics.queue_depth));
     add("qwen_decode_tokens_per_second", "Decode rate of the last request.", "gauge", g_metrics.last_decode_tok_s);
     add("qwen_prefill_tokens_per_second", "Prefill rate of the last request.", "gauge", g_metrics.last_prefill_tok_s);
@@ -739,7 +757,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
                    {"choices", json::array({json{{"index", 0}, {"text", r.content},
                                                  {"finish_reason", r.finish_reason}}})}};
       }
-      out["usage"] = usage_json(r, 0);
+      out["usage"] = usage_json(r, r.cached_tokens);
       out["timings"] = timings_json(r);
       res.set_content(out.dump(), "application/json");
       return;
@@ -798,7 +816,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
           if (alive && want_usage) {
             json u{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created},
                    {"model", g_cfg.model_alias}, {"choices", json::array()},
-                   {"usage", usage_json(r, 0)}, {"timings", timings_json(r)}};
+                   {"usage", usage_json(r, r.cached_tokens)}, {"timings", timings_json(r)}};
             emit(u);
           }
           if (alive) { const std::string d = "data: [DONE]\n\n"; sink.write(d.data(), d.size()); }

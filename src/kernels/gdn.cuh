@@ -39,10 +39,22 @@ struct GdnDims {
   int head_v      = 128;
   int conv_k      = 4;
   float rms_eps   = 1e-6f;
+  // How the 48 value heads map onto the 16 key heads. HF groups them
+  // (k = v / 3); llama.cpp's GGUF conversion re-orders the v heads into a tiled
+  // layout so ggml_repeat can broadcast (k = v % 16), and every per-v-head
+  // tensor in the file -- the v rows of qkv, the z gate, alpha, beta, the v
+  // channels of conv1d, A_log, dt_bias, and the COLUMNS of out_proj -- is
+  // permuted to match. Undoing that at load would mean a column permutation of
+  // a quantised out_proj, which cannot be done in block format; carrying the
+  // pairing as a flag costs one modulo per block instead.
+  bool v_tiled    = false;
   int key_dim()  const { return num_k_heads * head_k; }      // 2048
   int val_dim()  const { return num_v_heads * head_v; }      // 6144
   int conv_dim() const { return key_dim() * 2 + val_dim(); } // 10240
   int hv_ratio() const { return num_v_heads / num_k_heads; } // 3
+  // hk = (h / hk_div()) % hk_mod(): grouped -> h/3, tiled -> h%16.
+  int hk_div() const { return v_tiled ? 1 : hv_ratio(); }
+  int hk_mod() const { return v_tiled ? num_k_heads : num_v_heads; }
 };
 
 // Causal depthwise conv over the concatenated q|k|v, then SiLU.
@@ -61,8 +73,9 @@ void gdn_gates(float* g, float* beta, const __nv_bfloat16* a, const __nv_bfloat1
                int T, int num_v_heads, cudaStream_t stream = 0);
 
 // The recurrence. `qkv` is the post-conv [T, conv_dim] tensor; q and k are read
-// with 16 heads and broadcast to 48 by index (k head = v head / 3), which avoids
-// materialising the reference's repeat_interleave.
+// with 16 heads and broadcast to 48 by index (k head = v head / 3, or v head %
+// 16 for a tiled GGUF checkpoint), which avoids materialising the reference's
+// repeat_interleave.
 void gdn_scan(__nv_bfloat16* out,        // [T, val_dim]
               float* state,              // [num_v_heads, head_k, head_v] fp32, in/out
               const __nv_bfloat16* qkv,  // [T, conv_dim]

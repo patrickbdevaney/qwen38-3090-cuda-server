@@ -20,14 +20,37 @@
 
 static float b2f(uint16_t h){ uint32_t u=uint32_t(h)<<16; float f; memcpy(&f,&u,4); return f; }
 
-// Snapshot the SMALL bf16 tensors of one layer. These are the ones both loaders
-// should agree on almost exactly: GGUF stores them as F32 and AWQ as bf16, so
-// the only difference is a rounding. A large difference here is a mis-mapped
-// tensor name, which is the most likely wiring mistake and the cheapest to
-// check -- far cheaper than reasoning backwards from a wrong residual.
+// Snapshot the SMALL bf16 tensors of one layer.
+//
+// Only SOME of them can be compared across the two loaders, and knowing which
+// is the whole lesson of this file. AWQ's activation-aware scaling folds a
+// per-input-channel scale s out of every quantised linear and INTO the norm
+// that feeds it, so `input_layernorm` in an AWQ checkpoint is legitimately
+// (1 + w) / s and the alpha/beta projections are legitimately W * s. Those
+// tensors cannot agree with a GGUF and are not compared here; the oracle for
+// them is the original BF16 checkpoint, via tools/cmp_gguf_conventions.py.
+//
+// What CAN be compared is everything AWQ leaves alone -- the conv kernel, A_log,
+// dt_bias and the gated norm -- once the GGUF side is un-tiled back into HF's
+// grouped v-head order. A difference there is a mis-mapped tensor name, which
+// is the most likely wiring mistake and the cheapest to check.
 struct Smalls {
   std::vector<uint16_t> input_ln, post_ln, a, b, conv_w, A_log, dt_bias, gnorm;
 };
+
+// GGUF tiled v-head order -> HF grouped order. `hd` is the number of elements
+// one v head owns; `off` skips a leading q|k region that is not permuted.
+static std::vector<uint16_t> untile(const std::vector<uint16_t>& g, int off,
+                                    int nv, int nk, int hd) {
+  const int r = nv / nk;
+  std::vector<uint16_t> o = g;
+  for (int p = 0; p < nv; ++p) {          // p is the GGUF v-head slot
+    const int rr = p / nk, kh = p % nk;   // tiled: [r][k]
+    const int hfp = kh * r + rr;          // grouped: [k][r]
+    for (int i = 0; i < hd; ++i) o[off + size_t(hfp) * hd + i] = g[off + size_t(p) * hd + i];
+  }
+  return o;
+}
 
 static std::vector<uint16_t> grab(const __nv_bfloat16* d, int n) {
   std::vector<uint16_t> h(n);
@@ -108,15 +131,14 @@ int main(int argc, char** argv) {
   std::vector<uint16_t> a = run(md, "", ids, &NL, &H, &sa, 0);
   std::vector<uint16_t> g = run(md, gg, ids, &NL2, &H2, &sg, 0);
 
-  printf("\nlayer 0 small tensors, AWQ vs GGUF:\n");
-  cmp("input_ln", sa.input_ln, sg.input_ln);
-  cmp("post_ln",  sa.post_ln,  sg.post_ln);
-  cmp("gdn_a",    sa.a,        sg.a);
-  cmp("gdn_b",    sa.b,        sg.b);
-  cmp("conv_w",   sa.conv_w,   sg.conv_w);
-  cmp("A_log",    sa.A_log,    sg.A_log);
-  cmp("dt_bias",  sa.dt_bias,  sg.dt_bias);
+  const int NV = 48, NK = 16, HV = 128, CK = 4, QK = 2 * NK * HV * CK;
+  printf("\nlayer 0 small tensors, AWQ vs GGUF (GGUF un-tiled):\n");
+  cmp("conv_w",   sa.conv_w,   untile(sg.conv_w, QK, NV, NK, HV * CK));
+  cmp("A_log",    sa.A_log,    untile(sg.A_log, 0, NV, NK, 1));
+  cmp("dt_bias",  sa.dt_bias,  untile(sg.dt_bias, 0, NV, NK, 1));
   cmp("gdn_norm", sa.gnorm,    sg.gnorm);
+  printf("  (input_ln, post_ln, gdn_a, gdn_b are not comparable: AWQ folds its\n"
+         "   per-channel scales into them. See tools/cmp_gguf_conventions.py.)\n");
   if (NL != NL2 || H != H2) { printf("shape mismatch\n"); return 2; }
 
   printf("\n%6s %12s %12s %12s\n", "layer", "rel diff", "|awq|", "|gguf|");

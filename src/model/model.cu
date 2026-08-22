@@ -539,15 +539,45 @@ static LinPath lin_path(int T) {
 // GGUF projection. The fused kernels take M in {1,2,4,8}, so T is walked in
 // descending power-of-two chunks; each of the (up to three) GGUF tensors writes
 // its own column range of the [T, out_f] output through the ldy stride.
+// Above this many rows, dequantise the whole projection once and let cuBLAS do
+// the GEMM. Below it, read the blocks directly.
+//
+// The fused GEMV is worth its 2.2x-per-byte handicap only because it reads the
+// quantised bytes and nothing else. That stops being true the moment one pass
+// cannot cover T: at 8 rows per pass a 4096-token prefill chunk streams every
+// weight 512 times, which measured as 42 tok/s of prefill -- an hour to fill
+// 200K context. The dequantised path reads the blocks once, writes bf16 once
+// and reads it back once, so its traffic is ~3x the tensor rather than T/8
+// times it. Break-even is around 50-120 rows depending on the quant's bit rate;
+// 32 is safely inside the region where the dequantised path wins, and every
+// caller is either 1-8 rows (decode, speculation) or a full prefill chunk.
+static constexpr int kGgufGemmMinRows = 32;
+
 static void linear_gguf(Model& m, __nv_bfloat16* out, const Linear& L,
                         const __nv_bfloat16* in, int T) {
   int col = 0;
   for (int p = 0; p < L.n_part; ++p) {
     const GgufWeight& w = L.part[p];
+    if (T >= kGgufGemmMinRows) {
+      const size_t n = size_t(w.out_f) * size_t(w.in_f);
+      if (n > m.gguf_deq_elems) {
+        fprintf(stderr, "gguf prefill: scratch holds %zu elements, need %zu\n",
+                m.gguf_deq_elems, n);
+        abort();
+      }
+      gguf_dequant_bf16(m.gguf_deq, w.data, w.type, int64_t(n), m.stream);
+      const float one = 1.f, zero = 0.f;
+      cublasSetStream(m.cublas, m.stream);
+      cublasGemmEx(m.cublas, CUBLAS_OP_T, CUBLAS_OP_N, w.out_f, T, w.in_f, &one,
+                   m.gguf_deq, CUDA_R_16BF, w.in_f, in, CUDA_R_16BF, L.in_f,
+                   &zero, out + col, CUDA_R_16BF, L.out_f,
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      col += w.out_f;
+      continue;
+    }
     int done = 0;
     while (done < T) {
-      int chunk = 8;
-      while (chunk > 1 && done + chunk > T) chunk >>= 1;
+      const int chunk = std::min(8, T - done);   // the kernel takes any M <= 8
       __nv_bfloat16* y = out + size_t(done) * L.out_f + col;
       const __nv_bfloat16* x = in + size_t(done) * L.in_f;
       if (chunk == 1) gguf_gemv(y, w, x, m.stream, L.out_f);
@@ -933,8 +963,7 @@ void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int 
     // kernel's ceiling is 8 rows rather than gemv.max_m.
     int done = 0;
     while (done < T) {
-      int chunk = 8;
-      while (chunk > 1 && done + chunk > T) chunk >>= 1;
+      const int chunk = std::min(8, T - done);   // the kernel takes any M <= 8
       __nv_bfloat16* o = out + size_t(done) * size_t(S.vocab_size);
       const __nv_bfloat16* xi = x + size_t(done) * size_t(S.hidden_size);
       if (chunk == 1) gguf_gemv(o, m.lm_head_gg.part[0], xi, m.stream);
@@ -971,7 +1000,8 @@ void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int 
   }
 }
 
-void embed_rows_host(Model& m, const int32_t* ids, int T) {
+void embed_rows_host_into(Model& m, const int32_t* ids, int T, __nv_bfloat16* dst,
+                          cudaStream_t st) {
   const int H = m.shape.hidden_size;
   if (T > m.max_batch) { fprintf(stderr, "embed_rows_host: T %d > max_batch\n", T); abort(); }
   for (int i = 0; i < T; ++i) {
@@ -982,7 +1012,11 @@ void embed_rows_host(Model& m, const int32_t* ids, int T) {
     }
     memcpy(m.embed_stage + size_t(i) * H, m.embed_host_bf + size_t(id) * H, size_t(H) * 2);
   }
-  CKM(cudaMemcpyAsync(m.h, m.embed_stage, size_t(T) * H * 2, cudaMemcpyHostToDevice, m.stream));
+  CKM(cudaMemcpyAsync(dst, m.embed_stage, size_t(T) * H * 2, cudaMemcpyHostToDevice, st));
+}
+
+void embed_rows_host(Model& m, const int32_t* ids, int T) {
+  embed_rows_host_into(m, ids, T, m.h, m.stream);
 }
 
 void model_enable_taps(Model& m, const std::vector<int>& layer_ids) {

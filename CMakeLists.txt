@@ -174,6 +174,11 @@ endif()
 
 add_executable(gate_gguf_model tests/gate_gguf_model.cu)
 target_link_libraries(gate_gguf_model PRIVATE qwen_model qwen_tokenizer)
+# Loads two 12 GiB bodies in turn, so it needs both checkpoints and a free card.
+if(QWEN38_GGUF_Q3 AND QWEN38_MODEL_DIR)
+  add_test(NAME gguf_model COMMAND gate_gguf_model ${QWEN38_MODEL_DIR} ${QWEN38_GGUF_Q3})
+  set_tests_properties(gguf_model PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+endif()
 
 add_executable(gate_gguf tests/gate_gguf.cu)
 target_link_libraries(gate_gguf PRIVATE qwen_gguf_dequant)

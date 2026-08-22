@@ -265,7 +265,11 @@ int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
   nids[0] = t0;
   CKS(cudaMemcpy(d.ids_buf, nids.data(), size_t(BS) * 4, cudaMemcpyHostToDevice));
   // The drafter has no embedding table: the noise comes from the TARGET's.
-  if (m.embed_quantized)
+  // With --embed-host (and always under --gguf) that table is in host memory
+  // and m.embed_bf/m.embed_q are null, so the gather has to run on the host.
+  if (m.embed_on_host)
+    embed_rows_host_into(m, nids.data(), BS, d.noise, 0);
+  else if (m.embed_quantized)
     embed_int8(d.noise, m.embed_q, m.embed_scale, d.ids_buf, BS, m.shape.hidden_size, 0);
   else
     embed_bf16(d.noise, m.embed_bf, d.ids_buf, BS, m.shape.hidden_size, 0);
@@ -351,7 +355,11 @@ std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
     nids[0] = t0;
     CKS(cudaMemcpy(d.ids_buf, nids.data(), size_t(BS) * 4, cudaMemcpyHostToDevice));
     // The drafter has no embedding table: the noise comes from the TARGET's.
-    if (m.embed_quantized)
+    // With --embed-host (and always under --gguf) that table is in host memory
+    // and m.embed_bf/m.embed_q are null, so the gather has to run on the host.
+    if (m.embed_on_host)
+      embed_rows_host_into(m, nids.data(), BS, d.noise, 0);
+    else if (m.embed_quantized)
       embed_int8(d.noise, m.embed_q, m.embed_scale, d.ids_buf, BS, m.shape.hidden_size, 0);
     else
       embed_bf16(d.noise, m.embed_bf, d.ids_buf, BS, m.shape.hidden_size, 0);

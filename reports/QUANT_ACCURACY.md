@@ -83,6 +83,11 @@ three:
 | peak VRAM @ 262144 | 19910 MiB | 21481 MiB | **19749 MiB** |
 | KL vs BF16 | 1.672e-01 | **1.308e-01** | 1.495e-01 |
 
+(The 19749 MiB is model plus KV in isolation. With the DFlash2 drafter, which is
+not optional in this server, the real figure is 21862 MiB. The EXL3 columns
+carry no drafter either, so the comparison is like-for-like, but neither number
+is what the server actually occupies.)
+
 At 3.00bpw it loses on all three. At 3.50bpw it wins on accuracy and loses on
 both speed and VRAM. Neither configuration is the "accurate *and* fastest" the
 condition asked for, so **no EXL3 backend** — but the accuracy result is real
@@ -129,13 +134,36 @@ difference is a tail effect on a distribution whose median is already 5e-05. But
 it is a defensible preference in the other direction, and it is the reason the
 harness that produced these numbers is committed rather than thrown away.
 
-## Not covered
+## GGUF, measured through this server
 
-GGUF has no number here, because this server still cannot run a GGUF checkpoint
-end to end — `model.cu` has no GGUF loader, only the container parser, the
-dequantiser and the fused GEMV, all gated in isolation. Producing a GGUF row
-means either writing that loader or comparing llama.cpp against a BF16 GGUF,
-which measures llama.cpp rather than us. Left open rather than faked.
+The GGUF row was left open in an earlier revision of this report because the
+server could not run a GGUF checkpoint end to end. It can now, so the row is
+filled the same way as the others: `tools/quantcmp_dump.cu` with a `--gguf`
+weights path, same prompts, same scorer, same BF16 reference.
+
+| | KL mean | KL median | KL p99 | top-1 | top-5 |
+|---|---:|---:|---:|---:|---:|
+| ours, AWQ INT4 g128 + INT8 head | 1.495e-01 | 5.21e-05 | 4.263 | 98.56% | 99.39% |
+| **ours, GGUF UD-Q3_K_XL** | **1.432e-01** | 5.92e-05 | 4.274 | **98.57%** | 99.39% |
+| EXL3 3.50bpw | 1.308e-01 | 4.86e-05 | 3.493 | 98.51% | 99.43% |
+
+**AWQ and UD-Q3_K_XL are the same model to within noise** — mean KL 1.432e-01
+against 1.495e-01, p99 4.274 against 4.263, top-1 within 0.01 points — while
+the GGUF carries 11.36 GiB of weights against AWQ's 13.06. Both numbers come
+from the same kernels and the same head treatment, which is what makes them
+comparable at all: the AWQ column pays for an INT8 lm_head on top of its INT4
+body, and the GGUF column runs the file's own Q5_K head through the fused GEMV
+rather than re-quantising it.
+
+That 1.70 GiB is 99K more tokens of INT4 KV, bought at no measurable accuracy
+cost. It is the first result in this report that moves the frontier rather than
+just locating a point on it. What it does NOT buy is speed — see
+`reports/BENCHMARKS.md`; the GGUF decode kernel is still at about 61% of
+llama.cpp's effective bandwidth, so the smaller model decodes slower.
+
+Unsloth's UD-Q3_K_XL is a *dynamic* quant: it picks a type per tensor, and this
+file uses eleven of them. The row above is a statement about that specific file,
+not about "Q3 GGUF" in general.
 
 ### One asymmetry, and it runs against us
 

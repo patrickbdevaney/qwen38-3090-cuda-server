@@ -24,8 +24,12 @@ int main(int argc, char** argv) {
     o.kv_k = (kv == 2) ? qwen::KvFmt::INT4 : qwen::KvFmt::FP8;
     o.kv_v = (kv >= 1) ? qwen::KvFmt::INT4 : qwen::KvFmt::FP8; }
   o.lm_head_bits = quant_lm; o.quantize_embed = true;
+  // argv[8]: GGUF weights. `md` still supplies config.json. The head comes from
+  // the file's own blocks, so lm_head_bits is not a choice there.
+  if (argc > 8) { o.gguf = argv[8]; o.lm_head_bits = 0; o.embed_host = true; }
   qwen::model_load(m, md, o);
-  printf("\nlm_head %d-bit, max_ctx %d\n", o.lm_head_bits, max_ctx);
+  printf("\n%s, lm_head %d-bit, max_ctx %d\n",
+         o.gguf.empty() ? "AWQ INT4 g128" : o.gguf.c_str(), o.lm_head_bits, max_ctx);
   const bool use_graph = (argc > 4) ? atoi(argv[4]) != 0 : true;
   if (use_graph) qwen::model_graph_capture(m);
   m.use_graph = use_graph;

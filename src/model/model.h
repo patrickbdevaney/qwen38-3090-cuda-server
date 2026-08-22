@@ -104,6 +104,15 @@ struct Model {
   int      max_ctx = 0;
   int      ctx_len = 0;
 
+  // Prefill scratch for GGUF weights: one dequantised bf16 projection.
+  // Decode reads the blocks directly, but prefill cannot -- the fused GEMV tops
+  // out at 8 rows, so a 4096-token chunk would stream every weight 512 times.
+  // Dequantising one tensor into this buffer and handing it to cuBLAS reads it
+  // ONCE. Sized for the largest single part in the file (5120 x 17408 = 178 MiB
+  // in this checkpoint) and allocated only when a GGUF is loaded.
+  __nv_bfloat16* gguf_deq = nullptr;
+  size_t         gguf_deq_elems = 0;
+
   // scratch
   GemvScratch  gemv;
   GemmWorkspace gemm;
@@ -243,6 +252,11 @@ std::vector<int32_t> model_generate_greedy(Model& m, const std::vector<int32_t>&
 // Gather T embedding rows from the host table into m.h. Only valid when
 // m.embed_on_host.
 void embed_rows_host(Model& m, const int32_t* ids, int T);
+// Same gather, into an arbitrary destination. The drafter needs it: its "noise"
+// input is a row of the TARGET's embedding table, and with --embed-host that
+// table is not on the device at all.
+void embed_rows_host_into(Model& m, const int32_t* ids, int T, __nv_bfloat16* dst,
+                          cudaStream_t st);
 
 // A run of precomputed embedding rows (image tokens) to drop into the hidden
 // state after the token embedding, replacing whatever the placeholder id

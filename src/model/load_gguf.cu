@@ -21,6 +21,20 @@
 //    quantised original is dropped. They are a few MB in total; only the big
 //    projections stay in block format.
 //
+//  * CONVENTIONS. llama.cpp's converter rewrites three things on the way in,
+//    and every one of them is silent -- the tensor loads, runs, and produces
+//    fluent nonsense. All three were confirmed element-for-element against the
+//    true BF16 checkpoint (tools/cmp_gguf_conventions.py), not guessed:
+//
+//      norms   every *norm.weight EXCEPT linear_attn.norm gets +1, because HF's
+//              RMSNorm for this model is (1 + w) * x and ggml's is w * x. Our
+//              k_rmsnorm follows HF, so the +1 has to come back off. ssm_norm
+//              is the exception at both ends and is used raw.
+//      ssm_a   holds -exp(A_log), not A_log. gdn_gates wants A_log, so this is
+//              log(-x). Exact: bf16(log(-x)) recovers the original bf16 A_log.
+//      v heads reordered from grouped to tiled -- see GdnDims::v_tiled. Handled
+//              by the scan's head pairing rather than by permuting here.
+//
 //  * NEXTN. GGUF files for this model carry an extra blk.<n_layer> holding the
 //    MTP/next-token head (nextn.*). This server drafts with DFlash2, so those
 //    tensors are skipped.
@@ -58,6 +72,18 @@ GgufWeight gguf_upload_weight(Model& m, const GgufTensor& t) {
 
 namespace {
 
+// GGUF norms carry llama.cpp's +1; k_rmsnorm applies it itself.
+__global__ void k_sub1(__nv_bfloat16* w, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) w[i] = __float2bfloat16(__bfloat162float(w[i]) - 1.0f);
+}
+
+// ssm_a holds -exp(A_log); gdn_gates wants A_log.
+__global__ void k_log_neg(__nv_bfloat16* w, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) w[i] = __float2bfloat16(logf(-__bfloat162float(w[i])));
+}
+
 // Dequantise a small tensor to bf16 and keep only the bf16. Used for norms,
 // biases, conv kernels and the two tiny per-head projections.
 const __nv_bfloat16* upload_bf16(Model& m, const GgufTensor& t) {
@@ -81,6 +107,24 @@ const __nv_bfloat16* upload_bf16(Model& m, const GgufTensor& t) {
   CKL(cudaDeviceSynchronize());
   CKL(cudaFree(src));
   return dst;
+}
+
+// A norm as ggml stores it: strip the +1 the converter added.
+const __nv_bfloat16* upload_norm(Model& m, const GgufTensor& t) {
+  const __nv_bfloat16* w = upload_bf16(m, t);
+  const int n = int(t.numel());
+  k_sub1<<<(n + 255) / 256, 256>>>(const_cast<__nv_bfloat16*>(w), n);
+  CKL(cudaDeviceSynchronize());
+  return w;
+}
+
+// ssm_a -> A_log.
+const __nv_bfloat16* upload_a_log(Model& m, const GgufTensor& t) {
+  const __nv_bfloat16* w = upload_bf16(m, t);
+  const int n = int(t.numel());
+  k_log_neg<<<(n + 255) / 256, 256>>>(const_cast<__nv_bfloat16*>(w), n);
+  CKL(cudaDeviceSynchronize());
+  return w;
 }
 
 // Fill a Linear from the first spelling that exists. `names` is tried in order;
@@ -136,6 +180,7 @@ void need(bool ok, const char* what, int layer) {
 size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
   const ModelShape& S = m.shape;
   size_t body_bytes = 0;
+  m.gdn.v_tiled = true;   // see GdnDims::v_tiled
 
   m.layers.resize(S.num_hidden_layers);
   for (int i = 0; i < S.num_hidden_layers; ++i) {
@@ -144,8 +189,8 @@ size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
     L.is_attn = S.layer_types[i] == LayerKind::FullAttention;
     L.attn_slot = S.attn_layer_index[i];
 
-    L.input_ln = upload_bf16(m, f.get(b + "attn_norm.weight"));
-    L.post_ln  = upload_bf16(m, f.get(b + "post_attention_norm.weight"));
+    L.input_ln = upload_norm(m, f.get(b + "attn_norm.weight"));
+    L.post_ln  = upload_norm(m, f.get(b + "post_attention_norm.weight"));
 
     need(fill_linear(m, f, L.mlp_gate_up,
                      {b + "ffn_gate.weight+" + b + "ffn_up.weight"}, "ffn gate/up"), "ffn_gate/up", i);
@@ -158,8 +203,8 @@ size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
                        "attn qkv"), "attn qkv", i);
       need(fill_linear(m, f, L.attn_o,
                        {b + "attn_output.weight"}, "attn_output"), "attn_output", i);
-      L.q_norm = upload_bf16(m, f.get(b + "attn_q_norm.weight"));
-      L.k_norm = upload_bf16(m, f.get(b + "attn_k_norm.weight"));
+      L.q_norm = upload_norm(m, f.get(b + "attn_q_norm.weight"));
+      L.k_norm = upload_norm(m, f.get(b + "attn_k_norm.weight"));
     } else {
       // GDN borrows the attention names: attn_qkv is the qkv projection and
       // attn_gate is z. AWQ fuses them; here they stay two parts.
@@ -170,9 +215,9 @@ size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
       L.gdn_a       = upload_bf16(m, f.get(b + "ssm_alpha.weight"));
       L.gdn_b       = upload_bf16(m, f.get(b + "ssm_beta.weight"));
       L.gdn_conv_w  = upload_bf16(m, f.get(b + "ssm_conv1d.weight"));
-      L.gdn_A_log   = upload_bf16(m, f.get(b + "ssm_a"));
+      L.gdn_A_log   = upload_a_log(m, f.get(b + "ssm_a"));
       L.gdn_dt_bias = upload_bf16(m, f.get(b + "ssm_dt.bias"));
-      L.gdn_norm    = upload_bf16(m, f.get(b + "ssm_norm.weight"));
+      L.gdn_norm    = upload_bf16(m, f.get(b + "ssm_norm.weight"));  // raw at both ends
     }
     body_bytes += L.mlp_gate_up.total_bytes() + L.mlp_down.total_bytes();
     body_bytes += L.is_attn ? (L.attn_qkv.total_bytes() + L.attn_o.total_bytes())
@@ -182,7 +227,26 @@ size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
       fflush(stdout);
     }
   }
-  m.final_norm = upload_bf16(m, f.get("output_norm.weight"));
+  m.final_norm = upload_norm(m, f.get("output_norm.weight"));
+
+  // Prefill scratch: one dequantised copy of the largest single part. Sized from
+  // what was actually loaded rather than from a constant, so a differently
+  // quantised file of the same model needs no code change.
+  size_t max_elems = 0;
+  for (const LayerWeights& L : m.layers) {
+    const Linear* all[4] = {&L.mlp_gate_up, &L.mlp_down,
+                            L.is_attn ? &L.attn_qkv : &L.gdn_in_qkvz,
+                            L.is_attn ? &L.attn_o   : &L.gdn_out};
+    for (const Linear* q : all)
+      for (int i = 0; i < q->n_part; ++i)
+        max_elems = std::max(max_elems, size_t(q->part[i].out_f) * size_t(q->part[i].in_f));
+  }
+  CKL(cudaMalloc(&m.gguf_deq, max_elems * 2));
+  m.owned.push_back(m.gguf_deq);
+  m.gguf_deq_elems = max_elems;
+  if (verbose)
+    printf("  gguf prefill scratch: %.3f GiB (largest part %zu elements)\n",
+           double(max_elems * 2) / (1 << 30), max_elems);
   return body_bytes;
 }
 

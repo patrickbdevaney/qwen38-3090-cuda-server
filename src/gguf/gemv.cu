@@ -454,11 +454,18 @@ void launch(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x, int M
   const Tab tb = tables();
   const uint8_t* p = static_cast<const uint8_t*>(w.data);
   if (ldy <= 0) ldy = w.out_f;
+  // Every M from 1 to 8, not just the powers of two. The weight stream is the
+  // whole cost here, so a caller with M=7 that had to split into 4+2+1 read the
+  // tensor THREE times. That is exactly what speculative decoding asks for --
+  // the drafter proposes block_size-1 = 7 rows through the lm_head every round,
+  // and on a 0.814 GiB GGUF head the split cost about 2.4 GiB of reads per
+  // round instead of 0.8.
   switch (M) {
-    case 1: k_gemv<T, 1><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
-    case 2: k_gemv<T, 2><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
-    case 4: k_gemv<T, 4><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
-    case 8: k_gemv<T, 8><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+#define QWEN_M_CASE(N) \
+    case N: k_gemv<T, N><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+    QWEN_M_CASE(1) QWEN_M_CASE(2) QWEN_M_CASE(3) QWEN_M_CASE(4)
+    QWEN_M_CASE(5) QWEN_M_CASE(6) QWEN_M_CASE(7) QWEN_M_CASE(8)
+#undef QWEN_M_CASE
     default:
       fprintf(stderr, "gguf gemv: unsupported M %d\n", M);
       abort();

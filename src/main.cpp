@@ -77,14 +77,7 @@ int main(int argc, char** argv) {
     if (a == "--model") model_dir = next();
     // Weights from a GGUF file; --model still supplies config.json and
     // tokenizer.json, which this server's gated parsers already read.
-    else if (a == "--gguf") {
-      opt.gguf = next();
-      fprintf(stderr,
-        "WARNING: --gguf is INCOMPLETE. The weights load and the model runs, but\n"
-        "         llama.cpp's Qwen3.5 conversion permutes v-heads, stores ssm_a as\n"
-        "         -exp(A_log), and uses a norm convention this loader does not yet\n"
-        "         undo, so the output is nonsense. See reports/GGUF_LOADER.md.\n");
-    }
+    else if (a == "--gguf") opt.gguf = next();
     else if (a == "--host") cfg.host = next();
     else if (a == "--port") cfg.port = atoi(next());
     else if (a == "--alias") cfg.model_alias = next();
@@ -116,11 +109,14 @@ int main(int argc, char** argv) {
     else { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(argv[0]); return 2; }
   }
   if (model_dir.empty()) { usage(argv[0]); return 2; }
-  cfg.max_ctx = opt.max_ctx;
 
   qwen::g_model_dir = model_dir;
   qwen::Model m;
   qwen::model_load(m, model_dir, opt);
+  // AFTER the load: `--max-context auto` arrives here as 0 and only model_load
+  // knows what fitted. Reading opt.max_ctx before the load left the server
+  // advertising and enforcing a context of 0, so every request 400'd.
+  cfg.max_ctx = m.max_ctx;
 
   qwen::Tokenizer tok;
   tok.load(model_dir + "/tokenizer.json");

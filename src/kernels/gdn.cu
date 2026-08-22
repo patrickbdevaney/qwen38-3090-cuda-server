@@ -90,7 +90,8 @@ __global__ __launch_bounds__(THREADS) void k_scan(
     __nv_bfloat16* __restrict__ out, float* __restrict__ state,
     const __nv_bfloat16* __restrict__ qkv,
     const float* __restrict__ gs, const float* __restrict__ betas,
-    int T, int conv_dim, int key_dim, int val_dim, int num_v_heads, int hv_ratio,
+    int T, int conv_dim, int key_dim, int val_dim, int num_v_heads,
+    int hk_div, int hk_mod,
     int head_v, int v_blocks) {
   extern __shared__ float sm[];
   // Stride padded by 1: without it a thread reads S[k][v] at k*VPB + v, so the
@@ -105,7 +106,7 @@ __global__ __launch_bounds__(THREADS) void k_scan(
   const int h    = blockIdx.x / v_blocks;           // value head
   const int vb   = blockIdx.x % v_blocks;
   const int vbase = vb * V_PER_BLOCK;
-  const int hk   = h / hv_ratio;                    // the q/k head it shares
+  const int hk   = (h / hk_div) % hk_mod;           // the q/k head it shares
 
   constexpr int KG  = THREADS / V_PER_BLOCK;        // k-groups
   constexpr int KPT = HEAD_K / KG;                  // k-rows per thread
@@ -411,11 +412,11 @@ void gdn_scan(__nv_bfloat16* out, float* state, const __nv_bfloat16* qkv,
   if (T <= 8)
     k_scan<128, VPB, THREADS, 1><<<d.num_v_heads * v_blocks, THREADS, sm, st>>>(
         out, state, qkv, g, beta, T, d.conv_dim(), d.key_dim(), d.val_dim(),
-        d.num_v_heads, d.hv_ratio(), d.head_v, v_blocks);
+        d.num_v_heads, d.hk_div(), d.hk_mod(), d.head_v, v_blocks);
   else
     k_scan<128, VPB, THREADS, QWEN_GDN_TB><<<d.num_v_heads * v_blocks, THREADS, sm, st>>>(
         out, state, qkv, g, beta, T, d.conv_dim(), d.key_dim(), d.val_dim(),
-        d.num_v_heads, d.hv_ratio(), d.head_v, v_blocks);
+        d.num_v_heads, d.hk_div(), d.hk_mod(), d.head_v, v_blocks);
 }
 
 void gdn_norm_gate(__nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* z,
