@@ -390,6 +390,50 @@ weights. That ratio looks decisive and is not, because the vector is 10 KiB and
 lives in L1. Two separate attempts to fix a problem that a byte count said
 existed and a measurement said did not.
 
+## The attention kernel: where BOTH paths lose at long context
+
+Decode attention is 6% of a step at 4K and **39% at 131K**, because the KV cache
+is 4.5 GiB there against 13 GiB of weights. Measured (`bench_attn`, FP8 KV):
+
+| ctx | ms/token | KV GB/s | of 914 |
+|---:|---:|---:|---:|
+| 4096 | 0.79 | 151 | 17% |
+| 32768 | 3.30 | 326 | 36% |
+| 65536 | 5.30 | 405 | 44% |
+| 131072 | 10.44 | 411 | 45% |
+
+It is ALU bound, not bandwidth bound. Per KV position each lane loads 16 bytes
+and then does, across the twelve query heads sharing that KV head, ~60 warp
+shuffles (a five-step butterfly per head) and 24 SFU exponentials. Budgeting
+those against their pipe throughputs accounts for the measured time; the KV read
+itself is 4.4 ms of the 10.44.
+
+**Two things were tried here and neither is shipped.**
+
+*Carrying the softmax in base 2* -- fold log2(e) into the scale, use `exp2f`
+instead of `__expf`, which compiles to a multiply plus `ex2.approx` -- measured
+**411 -> 497 GB/s at 131K, a 23% win**, and `attn` and `kv_quant` both still
+passed. But `gate_forward` dropped to 98.44% teacher-forced top-1 with four of
+six mismatches outside a bf16 ulp. That is a real behavioural change, not a tie
+flip, so under this project's numerics-before-speed rule it is not taken. It is
+recorded here because it is the largest single decode win left on the table and
+because the trade is now quantified rather than unknown: 23% of the attention
+kernel, which is 9% of a decode step at 128K, against a measurable shift in which
+token wins a near-boundary argmax.
+
+*Skipping the rescale exponential when the running maximum does not move*
+(`corr = (mn == m[j]) ? 1.0f : __expf(m[j] - mn)`) is bit-exact -- `ex2.approx(0)`
+is exactly 1.0 and `fmaf(a, 1.0f, b)` is exactly `a + b` -- and the branch is
+warp-uniform because `s` has just been reduced across the warp. It measured
+**411 -> 325 GB/s**: predication evaluates the SFU op anyway and the comparison
+is pure overhead. A clean idea that the hardware does not reward.
+
+Every remaining win in this kernel is a reassociation of the same arithmetic, so
+the next step is not more micro-optimisation: it is deciding, with a
+generation-based accuracy measurement rather than a teacher-forced one, whether
+the reassociation is acceptable. Teacher forcing cannot answer it, because the
+prefill path uses a different softmax kernel and is unaffected.
+
 ### What is still on the table, and why it is worth taking
 
 At 504 GB/s the GEMV is at 55% of measured DRAM, against the AWQ path's 84%. The
