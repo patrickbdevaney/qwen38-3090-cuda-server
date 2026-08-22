@@ -244,6 +244,24 @@ size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose) {
   CKL(cudaMalloc(&m.gguf_deq, max_elems * 2));
   m.owned.push_back(m.gguf_deq);
   m.gguf_deq_elems = max_elems;
+
+  // INT8 activation scratch. The fused GEMV takes at most 8 rows and the
+  // dequantised path takes over at 32, so 32 rows of the widest input covers
+  // every caller.
+  m.gguf_qx_rows = 32;
+  m.gguf_qx_in = 17408;
+  for (const LayerWeights& L : m.layers) {
+    const Linear* all[4] = {&L.mlp_gate_up, &L.mlp_down,
+                            L.is_attn ? &L.attn_qkv : &L.gdn_in_qkvz,
+                            L.is_attn ? &L.attn_o   : &L.gdn_out};
+    for (const Linear* q : all)
+      for (int i = 0; i < q->n_part; ++i)
+        m.gguf_qx_in = std::max(m.gguf_qx_in, q->part[i].in_f);
+  }
+  CKL(cudaMalloc(&m.gguf_qx, size_t(m.gguf_qx_rows) * m.gguf_qx_in));
+  CKL(cudaMalloc(&m.gguf_xsc, size_t(m.gguf_qx_rows) * (m.gguf_qx_in / 32) * 4));
+  m.owned.push_back(m.gguf_qx);
+  m.owned.push_back(m.gguf_xsc);
   if (verbose)
     printf("  gguf prefill scratch: %.3f GiB (largest part %zu elements)\n",
            double(max_elems * 2) / (1 << 30), max_elems);

@@ -68,12 +68,20 @@ int main(int argc, char** argv) {
 
     qwen::GgufWeight w;
     w.data = d_w; w.type = t->type; w.out_f = out_f; w.in_f = in_f;
-    for (int i = 0; i < 3; ++i) qwen::gguf_gemv(d_y, w, d_x);
+    // Types that implement the int8 activation path are measured through it,
+    // because that is how the model will call them.
+    int8_t* d_qx = nullptr; float* d_xsc = nullptr;
+    if (qwen::gguf_wants_qx(t->type)) {
+      CK(cudaMalloc(&d_qx, size_t(in_f)));
+      CK(cudaMalloc(&d_xsc, size_t(in_f / 32) * 4));
+      qwen::gguf_quantize_x(d_qx, d_xsc, d_x, in_f, 1);
+    }
+    for (int i = 0; i < 3; ++i) qwen::gguf_gemv(d_y, w, d_x, 0, 0, d_qx, d_xsc);
     CK(cudaDeviceSynchronize());
     cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
     const int IT = 20;
     cudaEventRecord(a);
-    for (int i = 0; i < IT; ++i) qwen::gguf_gemv(d_y, w, d_x);
+    for (int i = 0; i < IT; ++i) qwen::gguf_gemv(d_y, w, d_x, 0, 0, d_qx, d_xsc);
     cudaEventRecord(b);
     CK(cudaEventSynchronize(b));
     float ms = 0; cudaEventElapsedTime(&ms, a, b); ms /= IT;
@@ -84,6 +92,7 @@ int main(int argc, char** argv) {
     tot_bytes += double(nb); tot_ms += ms;
     rate.emplace_back(t->type, gbs);
     cudaFree(d_w); cudaFree(d_x); cudaFree(d_y);
+    if (d_qx) { cudaFree(d_qx); cudaFree(d_xsc); }
   }
   // Does speculation compress the gap? At M rows the weight stream is read ONCE
   // and the dequantisation is amortised across M outputs, so an ALU-bound kernel

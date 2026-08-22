@@ -119,6 +119,11 @@ struct Model {
   // in this checkpoint) and allocated only when a GGUF is loaded.
   __nv_bfloat16* gguf_deq = nullptr;
   size_t         gguf_deq_elems = 0;
+  // INT8 activations for the GGUF types that take the __dp4a path. Quantised
+  // once per projection, shared by every part and every row chunk of it.
+  int8_t* gguf_qx = nullptr;
+  float*  gguf_xsc = nullptr;
+  int     gguf_qx_rows = 0, gguf_qx_in = 0;
 
   // scratch
   GemvScratch  gemv;

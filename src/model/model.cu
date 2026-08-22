@@ -526,12 +526,31 @@ namespace {
 //                   verifying a speculative block cost about one decode step.
 //   T > 16        : dequantize to bf16 and hand it to cuBLAS, which is worth
 //                   its extra traffic only once the arithmetic dominates.
-enum class LinPath { Gemv, Mma, Cublas };
+enum class LinPath { Gemv, GemvM, Mma, Cublas };
 static LinPath lin_path(int T) {
   static int mode = -1;
   if (mode < 0) { const char* e = getenv("QWEN_LINPATH"); mode = e ? atoi(e) : 0; }
   if (T == 1) return LinPath::Gemv;
   if (mode == 1) return LinPath::Cublas;          // debug: no MMA
+  if (mode == 2) return LinPath::Mma;             // debug: force the tensor cores
+  // The multi-row GEMV reads the weight stream ONCE for up to 16 rows, which is
+  // the same traffic as a decode step. The tensor-core path reads it once too,
+  // but bench_block measured a T=2 forward at 1.98x a T=1 forward and flat from
+  // there to T=16 -- so above T=1 the model was paying twice the decode cost for
+  // the same bytes, and speculative verification is exactly that shape. Since a
+  // verification block is at most block_size rows, this is the path that matters
+  // for it. MEASURED, bench_block, cost relative to a T=1 decode step:
+  //     T:        2      4      8     16
+  //     GemvM  1.75x  2.23x  3.35x  6.45x
+  //     Mma    1.92x  1.99x  2.06x  2.20x
+  // so the multi-row GEMV wins only at T=2 and the tensor-core path is far
+  // better from T=4 up. The default threshold is 2.
+  static int gemvm_max = -1;
+  if (gemvm_max < 0) {
+    const char* e = getenv("QWEN_GEMVM_MAX_T");
+    gemvm_max = e ? atoi(e) : 2;
+  }
+  if (T <= gemvm_max) return LinPath::GemvM;
   // The tensor-core path takes at most 16 rows per launch, but it is weight-
   // stream bound and nearly flat in M, so chunking it by 16 costs a pass over
   // the weights per chunk and nothing else. cuBLAS, by contrast, dequantises
@@ -564,6 +583,19 @@ static constexpr int kGgufGemmMinRows = 32;
 
 static void linear_gguf(Model& m, __nv_bfloat16* out, const Linear& L,
                         const __nv_bfloat16* in, int T) {
+  // Quantise the activations ONCE for the whole projection if any part wants
+  // them: the parts of a fused projection share an input, and so do the row
+  // chunks below.
+  const int8_t* qx = nullptr;
+  const float* xsc = nullptr;
+  if (T < kGgufGemmMinRows && m.gguf_qx) {
+    bool want = false;
+    for (int p = 0; p < L.n_part; ++p) want = want || gguf_wants_qx(L.part[p].type);
+    if (want && T <= m.gguf_qx_rows && L.in_f <= m.gguf_qx_in) {
+      gguf_quantize_x(m.gguf_qx, m.gguf_xsc, in, L.in_f, T, m.stream);
+      qx = m.gguf_qx; xsc = m.gguf_xsc;
+    }
+  }
   int col = 0;
   for (int p = 0; p < L.n_part; ++p) {
     const GgufWeight& w = L.part[p];
@@ -589,8 +621,10 @@ static void linear_gguf(Model& m, __nv_bfloat16* out, const Linear& L,
       const int chunk = std::min(8, T - done);   // the kernel takes any M <= 8
       __nv_bfloat16* y = out + size_t(done) * L.out_f + col;
       const __nv_bfloat16* x = in + size_t(done) * L.in_f;
-      if (chunk == 1) gguf_gemv(y, w, x, m.stream, L.out_f);
-      else            gguf_gemm_small(y, w, x, chunk, m.stream, L.out_f);
+      const int8_t* qc = qx ? qx + size_t(done) * L.in_f : nullptr;
+      const float* sc = xsc ? xsc + size_t(done) * (L.in_f / 32) : nullptr;
+      if (chunk == 1) gguf_gemv(y, w, x, m.stream, L.out_f, qc, sc);
+      else            gguf_gemm_small(y, w, x, chunk, m.stream, L.out_f, qc, sc);
       done += chunk;
     }
     col += w.out_f;
@@ -607,6 +641,13 @@ static void linear(Model& m, __nv_bfloat16* out, const Linear& L,
                     T, w.in_f, w.out_f, w.group_size, int(lin_path(T))); }
   switch (lin_path(T)) {
     case LinPath::Gemv:   gemv_w4a16(out, w, in, m.gemv, m.stream); break;
+    case LinPath::GemvM:
+      for (int i = 0; i < T; i += 16) {
+        const int n = std::min(16, T - i);
+        gemm_small_w4a16(out + size_t(i) * w.out_f, w, in + size_t(i) * w.in_f, n,
+                         m.gemv, m.stream);
+      }
+      break;
     case LinPath::Mma:
       for (int i = 0; i < T; i += 16) {
         const int n = std::min(16, T - i);

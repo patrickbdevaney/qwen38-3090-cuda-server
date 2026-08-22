@@ -44,13 +44,36 @@ struct GgufWeight {
 // separate tensors (q/k/v, or GDN's qkv and z) be written into consecutive
 // column ranges of one [T, total_out] buffer, which is the layout the AWQ path
 // gets for free from its single fused tensor.
+// INT8 ACTIVATIONS (W4A8).
+//
+// The i-quants are ALU bound, not bandwidth bound: Q6_K, whose dequantiser is
+// trivial, runs at 89% of measured DRAM while IQ4_XS and IQ3_S -- 65% of a
+// UD-Q3_K_XL file -- sit at 67% because every value costs a codebook lookup, an
+// int-to-float conversion and an FMA. Quantising the ACTIVATION vector to int8
+// once per projection turns the inner product into __dp4a: four multiply-adds
+// per instruction, against eight conversions plus eight FMAs.
+//
+// This changes the arithmetic, so it is opt-in per type (Deq<T>::DP4A) and its
+// effect on KL against the BF16 reference is measured, not assumed.
+//
+// `qx` holds in_f int8 values per row and `xsc` one fp32 scale per 32 of them.
+// A lane owns eight consecutive elements, which always lie inside one group.
+void gguf_quantize_x(int8_t* qx, float* xsc, const __nv_bfloat16* x, int in_f, int M,
+                     cudaStream_t stream = 0);
+// Scratch needed by gguf_quantize_x for in_f elements and M rows.
+inline size_t gguf_qx_bytes(int in_f, int M) { return size_t(in_f) * M + size_t(in_f / 32) * M * 4; }
+// True if any type in this build uses the int8 activation path.
+bool gguf_wants_qx(GgmlType t);
+
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-               cudaStream_t stream = 0, int ldy = 0);
+               cudaStream_t stream = 0, int ldy = 0,
+               const int8_t* qx = nullptr, const float* xsc = nullptr);
 
 // Y[M, out_f] = X[M, in_f] @ W^T for small M, same kernel with M accumulators
 // so the weight stream is read once rather than M times.
 void gguf_gemm_small(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-                     int M, cudaStream_t stream = 0, int ldy = 0);
+                     int M, cudaStream_t stream = 0, int ldy = 0,
+                     const int8_t* qx = nullptr, const float* xsc = nullptr);
 
 // True if the fused path implements this type.
 bool gguf_gemv_supported(GgmlType t);

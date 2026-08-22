@@ -288,6 +288,21 @@ template <> struct Deq<GgmlType::IQ4_XS> {
     #pragma unroll
     for (int i = 0; i < 8; ++i) y[i] *= d_;
   }
+  // lut16_x4 already produces four codebook values packed as signed bytes,
+  // which is exactly __dp4a's operand format, so the int8 path costs nothing
+  // extra here -- it only SKIPS the conversion to float and the eight FMAs.
+  static constexpr bool DP4A = true;
+  __device__ static float get8q(const uint8_t* p, int o0, uint32_t* q, const Tab&) {
+    const BIQ4XS* b = reinterpret_cast<const BIQ4XS*>(p);
+    const int ib = o0 / 32, within = o0 % 32;
+    const int ls = ((b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                   (((b->scales_h >> (2 * ib)) & 3) << 4);
+    const uint2 qv = *reinterpret_cast<const uint2*>(b->qs + ib * 16 + (within % 16));
+    const int lsh = (within >= 16) ? 4 : 0;
+    q[0] = lut16_x4((qv.x >> lsh) & 0x0F0F0F0Fu);
+    q[1] = lut16_x4((qv.y >> lsh) & 0x0F0F0F0Fu);
+    return h2f(b->d) * float(ls - 32);
+  }
 };
 
 // The i-quants all end the same way: eight grid bytes, a sign mask, one scale.
@@ -394,6 +409,32 @@ template <> struct Deq<GgmlType::IQ3_S> {
     const float d_ = get8a(p, o0, y, t);
     #pragma unroll
     for (int i = 0; i < 8; ++i) y[i] *= d_;
+  }
+  // MEASURED AND REJECTED for IQ3_S: 617 -> 550 GB/s. Unlike IQ4_XS, whose
+  // codebook lookup already yields four signed bytes in a word, this format has
+  // to negate each grid entry by its sign bit and then pack four of them --
+  // which costs more than the eight float conversions and FMAs it removes. Kept
+  // here because the next person will have the same idea.
+  __device__ static float get8q_unused(const uint8_t* p, int o0, uint32_t* q, const Tab& t) {
+    const BIQ3S* b = reinterpret_cast<const BIQ3S*>(p);
+    const int sb = o0 / 32, l = (o0 % 32) / 8;
+    const float db = h2f(b->d) *
+        (1.f + 2.f * float((b->scales[sb / 2] >> (4 * (sb % 2))) & 0xF));
+    const uint8_t qh = b->qh[sb];
+    const uint32_t q2 = *reinterpret_cast<const uint16_t*>(b->qs + 8 * sb + 2 * l);
+    const uint32_t g1 = t.iq3s[(q2 & 0xFF) | ((uint32_t(qh) << (8 - 2 * l)) & 256)];
+    const uint32_t g2 = t.iq3s[(q2 >> 8)   | ((uint32_t(qh) << (7 - 2 * l)) & 256)];
+    const uint32_t sg = b->signs[4 * sb + l];
+    uint32_t a = 0, c = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v1 = int((g1 >> (8 * i)) & 0xFF);
+      const int v2 = int((g2 >> (8 * i)) & 0xFF);
+      a |= uint32_t(uint8_t(int8_t((sg >> i)       & 1 ? -v1 : v1))) << (8 * i);
+      c |= uint32_t(uint8_t(int8_t((sg >> (i + 4)) & 1 ? -v2 : v2))) << (8 * i);
+    }
+    q[0] = a; q[1] = c;
+    return db;
   }
 };
 
@@ -541,11 +582,29 @@ __device__ __forceinline__ float xhi(uint32_t u) { return __uint_as_float(u & 0x
 // split to another format is a two-line change to that format alone.
 template <class D, class = void> struct HasAffine : std::false_type {};
 template <class D> struct HasAffine<D, decltype((void)D::AFFINE)> : std::true_type {};
+template <class D, class = void> struct HasDp4a : std::false_type {};
+template <class D> struct HasDp4a<D, decltype((void)D::DP4A)> : std::true_type {};
+
+// One block per 32-element group per row. absmax -> scale, round to int8.
+__global__ void k_quant_x(int8_t* __restrict__ qx, float* __restrict__ xsc,
+                          const __nv_bfloat16* __restrict__ x, int in_f) {
+  const int g = blockIdx.x;                 // group index within the flattened [M, in_f]
+  const size_t base = size_t(g) * 32;
+  const int lane = threadIdx.x;             // 32 threads
+  const float v = __bfloat162float(x[base + lane]);
+  float a = fabsf(v);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+  const float sc = a > 0.f ? a / 127.0f : 1.0f;
+  qx[base + lane] = int8_t(__float2int_rn(v / sc));
+  if (lane == 0) xsc[g] = sc;
+}
 
 template <GgmlType T, int MROWS>
 __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
     __nv_bfloat16* __restrict__ y, const uint8_t* __restrict__ w,
-    const __nv_bfloat16* __restrict__ x, int out_f, int in_f, int ldy, Tab tab) {
+    const __nv_bfloat16* __restrict__ x, int out_f, int in_f, int ldy, Tab tab,
+    const int8_t* __restrict__ qx, const float* __restrict__ xsc) {
   // Stage the codebook BEFORE the out-of-range return: every thread in the
   // block has to reach the barrier, and the tail block has threads that do not
   // own a row.
@@ -575,6 +634,9 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   // per lane at a time. Decoding two super-blocks per iteration gives the
   // scheduler two independent chains to interleave.
   constexpr bool AF = HasAffine<Deq<T>>::value;
+  // The int8 activation path is only taken when the caller supplied a quantised
+  // vector; otherwise this type falls back to its float dequantiser.
+  const bool DP = HasDp4a<Deq<T>>::value && qx != nullptr;
   auto body = [&](int i, const float* v, float dl) {
     const int base = (i << 8) + o0;
     #pragma unroll
@@ -614,6 +676,32 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   // change (578 vs 580 GB/s composition-weighted), so the default policy stays.
   constexpr int U = QWEN_GGUF_UNROLL;
   constexpr int UU = U;
+  if constexpr (HasDp4a<Deq<T>>::value) {
+    if (DP) {
+      for (int i = 0; i < runs; ++i) {
+        uint32_t qw[2];
+        const float dl = Deq<T>::get8q(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, qw, tab);
+        const int base = (i << 8) + o0;
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+          const size_t off = size_t(m) * in_f + base;
+          const uint2 xv = *reinterpret_cast<const uint2*>(qx + off);
+          int d = __dp4a(int(qw[0]), int(xv.x), 0);
+          d = __dp4a(int(qw[1]), int(xv.y), d);
+          // One group scale per 32 activations; a lane's eight elements always
+          // sit inside one group.
+          acc[m] = fmaf(dl * xsc[off >> 5], float(d), acc[m]);
+        }
+      }
+      #pragma unroll
+      for (int m = 0; m < MROWS; ++m) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], o);
+        if (lane == 0) y[size_t(m) * ldy + warp] = __float2bfloat16(acc[m]);
+      }
+      return;
+    }
+  }
   int i = 0;
   for (; i + UU <= runs; i += UU) {
     float v[UU][8], dl[UU];
@@ -691,7 +779,7 @@ void launch_dump(float* dst, const void* src, int64_t n, cudaStream_t st) {
 
 template <GgmlType T>
 void launch(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x, int M,
-            int ldy, cudaStream_t st) {
+            int ldy, cudaStream_t st, const int8_t* qx, const float* xsc) {
   const int blocks = (w.out_f + GEMV_WARPS - 1) / GEMV_WARPS;
   const Tab tb = tables();
   const uint8_t* p = static_cast<const uint8_t*>(w.data);
@@ -704,7 +792,7 @@ void launch(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x, int M
   // round instead of 0.8.
   switch (M) {
 #define QWEN_M_CASE(N) \
-    case N: k_gemv<T, N><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+    case N: k_gemv<T, N><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb, qx, xsc); break;
     QWEN_M_CASE(1) QWEN_M_CASE(2) QWEN_M_CASE(3) QWEN_M_CASE(4)
     QWEN_M_CASE(5) QWEN_M_CASE(6) QWEN_M_CASE(7) QWEN_M_CASE(8)
 #undef QWEN_M_CASE
@@ -775,20 +863,36 @@ static void check_align(const GgufWeight& w, const char* who) {
   }
 }
 
+void gguf_quantize_x(int8_t* qx, float* xsc, const __nv_bfloat16* x, int in_f, int M,
+                     cudaStream_t st) {
+  k_quant_x<<<(in_f / 32) * M, 32, 0, st>>>(qx, xsc, x, in_f);
+}
+
+bool gguf_wants_qx(GgmlType t) {
+  // Kill switch, so the int8 path can be A/B'd against the float one on the
+  // same binary and the same prompts.
+  static int off = -1;
+  if (off < 0) { const char* e = getenv("QWEN_GGUF_NO_DP4A"); off = e && atoi(e); }
+  if (off) return false;
+  // IQ3_S implements the int8 path too, but measured slower with it -- see the
+  // note on Deq<IQ3_S>::get8q_unused.
+  return t == GgmlType::IQ4_XS;
+}
+
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-               cudaStream_t st, int ldy) {
+               cudaStream_t st, int ldy, const int8_t* qx, const float* xsc) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemv: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
   check_align(w, "gguf_gemv");
-  DISPATCH(launch, y, w, x, 1, ldy, st);
+  DISPATCH(launch, y, w, x, 1, ldy, st, qx, xsc);
 }
 
 void gguf_gemm_small(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-                     int M, cudaStream_t st, int ldy) {
+                     int M, cudaStream_t st, int ldy, const int8_t* qx, const float* xsc) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemm: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
   check_align(w, "gguf_gemm_small");
-  DISPATCH(launch, y, w, x, M, ldy, st);
+  DISPATCH(launch, y, w, x, M, ldy, st, qx, xsc);
 }
 
 }  // namespace qwen
