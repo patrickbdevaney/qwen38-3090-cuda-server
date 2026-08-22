@@ -172,6 +172,13 @@ if(QWEN38_GGUF_Q3)
   add_test(NAME gguf_gemv COMMAND gate_gguf_gemv ${QWEN38_GGUF_Q3} 256)
 endif()
 
+# End-to-end gate against a LIVE server. Not registered with ctest: it needs a
+# running instance, which tools/run_serving_gates.sh provides for each weight
+# format in turn.
+add_executable(gate_serving tests/gate_serving.cpp)
+target_include_directories(gate_serving PRIVATE src third_party)
+target_link_libraries(gate_serving PRIVATE Threads::Threads)
+
 add_executable(gate_gguf_model tests/gate_gguf_model.cu)
 target_link_libraries(gate_gguf_model PRIVATE qwen_model qwen_tokenizer)
 # Loads two 12 GiB bodies in turn, so it needs both checkpoints and a free card.

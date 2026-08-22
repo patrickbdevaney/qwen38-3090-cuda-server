@@ -104,6 +104,13 @@ struct Model {
   int      max_ctx = 0;
   int      ctx_len = 0;
 
+  // Traffic accounting, filled at load, so a benchmark can state the roofline
+  // instead of a reader deriving it. Decode is bandwidth bound: every weight,
+  // every live KV entry and the whole recurrent state are read once per token.
+  size_t weight_bytes = 0;        // body + lm_head, in whatever format they are
+  size_t kv_bytes_per_token = 0;  // across the 16 attention layers
+  size_t recurrent_bytes = 0;     // GDN state + conv state, read AND written
+
   // Prefill scratch for GGUF weights: one dequantised bf16 projection.
   // Decode reads the blocks directly, but prefill cannot -- the fused GEMV tops
   // out at 8 rows, so a 4096-token chunk would stream every weight 512 times.

@@ -17,10 +17,26 @@ int main(int argc, char** argv) {
       : "/home/patrickd/qwen38-weights/Qwen3.8-27B-DFlash2";
   const int NGEN = argc > 3 ? atoi(argv[3]) : 192;
   const bool quant = argc > 4 ? atoi(argv[4]) != 0 : true;
+  // argv[5]: GGUF weights, so AR and speculative decode are measured on the
+  // same prompts through both runners. argv[6]: context, because acceptance and
+  // the AR baseline both move with it and 4096 is not where an agent lives.
+  const std::string gg = argc > 5 ? argv[5] : "";
+  const int MAXC = argc > 6 ? atoi(argv[6]) : 4096;
 
   qwen::Model m; qwen::LoadOptions o;
-  o.max_ctx = 4096; o.max_batch = 512; o.lm_head_bits = 8; o.verbose = false;
+  o.max_ctx = MAXC; o.max_batch = 512; o.lm_head_bits = 8; o.verbose = false;
+  o.kv_k = qwen::KvFmt::INT4; o.kv_v = qwen::KvFmt::INT4;
+  if (!gg.empty()) { o.gguf = gg; o.lm_head_bits = 0; o.embed_host = true; }
   qwen::model_load(m, md, o);
+  printf("%s, INT4 KV, max_ctx %d\n", gg.empty() ? "AWQ INT4 g128" : gg.c_str(), MAXC);
+  {
+    const double DRAM = 914.2e9;
+    const double bytes = double(m.weight_bytes) +
+                         double(m.kv_bytes_per_token) * double(MAXC) +
+                         2.0 * double(m.recurrent_bytes);
+    printf("AR roofline at this context: %.1f tok/s (%.3f GiB read per token)\n",
+           DRAM / bytes, bytes / (1 << 30));
+  }
 
   qwen::DraftModel d; qwen::DraftLoadOptions po;
   po.ctx_chunk = 512;

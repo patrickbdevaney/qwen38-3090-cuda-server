@@ -35,7 +35,18 @@ int main(int argc, char** argv) {
   m.use_graph = use_graph;
 
   int32_t* d_id = m.argmax_scratch + 512;
-  printf("\n%8s %12s %12s %12s %10s\n", "ctx", "median ms", "p95 ms", "tok/s", "vs 4K");
+  // The roofline. Decode reads every weight, every live KV entry and the whole
+  // recurrent state once per token, so the ceiling is that traffic divided by
+  // the DRAM read bandwidth this card was MEASURED at in Phase 0 -- 914.2 GB/s,
+  // not the 936 on the box. Printing it next to the measurement is the only way
+  // to tell "this kernel is done" from "this kernel is at a third of what the
+  // memory system would allow".
+  const double DRAM = 914.2e9;
+  printf("\n  per token: %.3f GiB weights + %.1f KiB/token KV + %.3f GiB recurrent (r+w)\n",
+         double(m.weight_bytes) / (1 << 30), double(m.kv_bytes_per_token) / 1024.0,
+         2.0 * double(m.recurrent_bytes) / (1 << 30));
+  printf("\n%8s %12s %12s %12s %10s %12s %9s\n", "ctx", "median ms", "p95 ms", "tok/s",
+         "vs 4K", "roofline", "of roof");
   double base = 0;
   for (int ctx : {4096, 16384, 32768, 65536, 131072, 262144}) {
     if (ctx > max_ctx) break;
@@ -66,8 +77,13 @@ int main(int argc, char** argv) {
     std::sort(ms.begin(), ms.end());
     const double med = ms[ms.size() / 2], p95 = ms[size_t(ms.size() * 0.95) - 1];
     if (!base) base = 1000.0 / med;
-    printf("%8d %12.2f %12.2f %12.1f %9.0f%%\n", ctx, med, p95, 1000.0 / med,
-           100.0 * (1000.0 / med) / base);
+    const double bytes = double(m.weight_bytes) +
+                         double(m.kv_bytes_per_token) * double(ctx) +
+                         2.0 * double(m.recurrent_bytes);
+    const double roof = DRAM / bytes;
+    printf("%8d %12.2f %12.2f %12.1f %9.0f%% %12.1f %8.0f%%\n", ctx, med, p95,
+           1000.0 / med, 100.0 * (1000.0 / med) / base, roof,
+           100.0 * (1000.0 / med) / roof);
   }
   {
     // G7 is a PEAK number, not a post-load one: CUDA graph instantiation and

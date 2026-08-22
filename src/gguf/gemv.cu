@@ -120,16 +120,24 @@ template <> struct Deq<GgmlType::Q6_K> {
     const uint8_t* qh = b->qh + n * 32;
     const int8_t* sc = b->scales + n * 8;
     const int is = l / 16;
+    // The sub-block selects a byte offset, a nibble and a scale -- none of which
+    // depend on i, so they come out of the loop, and what is left is eight
+    // consecutive bytes of ql and eight of qh. A Q6_K block is 210 bytes, so
+    // 64-bit loads are illegal and 16-bit ones are not: sixteen byte loads
+    // become eight.
+    const uint8_t* qlp = ql + l + ((sub & 1) ? 32 : 0);
+    const int lsh = (sub >= 2) ? 4 : 0;
+    const int hsh = 2 * sub;
+    const float ds = d * float(sc[is + 2 * sub]);
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(qlp);
+    const uint16_t* h16 = reinterpret_cast<const uint16_t*>(qh + l);
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int li = l + i;
-      const uint8_t h = qh[li];
-      int q, s;
-      if (sub == 0)      { q = int(ql[li]      & 0xF) | int(((h >> 0) & 3) << 4); s = sc[is + 0]; }
-      else if (sub == 1) { q = int(ql[li + 32] & 0xF) | int(((h >> 2) & 3) << 4); s = sc[is + 2]; }
-      else if (sub == 2) { q = int(ql[li]      >> 4)  | int(((h >> 4) & 3) << 4); s = sc[is + 4]; }
-      else               { q = int(ql[li + 32] >> 4)  | int(((h >> 6) & 3) << 4); s = sc[is + 6]; }
-      y[i] = d * float(s) * float(q - 32);
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t qv = q16[i], hv = h16[i];
+      const int q0 = int((qv >> lsh) & 0xF)       | int(((hv >> hsh) & 3) << 4);
+      const int q1 = int((qv >> (8 + lsh)) & 0xF) | int(((hv >> (8 + hsh)) & 3) << 4);
+      y[2 * i]     = ds * float(q0 - 32);
+      y[2 * i + 1] = ds * float(q1 - 32);
     }
   }
 };
@@ -162,11 +170,22 @@ template <> struct Deq<GgmlType::Q3_K> {
     const float dl = h2f(b->d) * float(int(sc6) - 32);
     const uint8_t m = uint8_t(1u << (4 * n + j));
     const int shift = 2 * j;
-    const uint8_t* q = b->qs + n * 32 + 16 * half + l;
-    const uint8_t* hm = b->hmask + 16 * half + l;
+    // 16-bit loads, not 8-bit. A Q3_K block is 110 bytes, so consecutive blocks
+    // land on alternating 8- and 4-byte alignments and a 64-bit load would be
+    // illegal -- but 110 is even and every field offset here is a multiple of 8,
+    // so a 16-bit load is always legal. That halves the memory instructions in
+    // the hottest part of this path: sixteen byte loads (eight of qs, eight of
+    // hmask) become eight. Q3_K was the slowest K-quant measured, and it is the
+    // instruction count rather than the bytes that made it so.
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(b->qs + n * 32 + 16 * half + l);
+    const uint16_t* h16 = reinterpret_cast<const uint16_t*>(b->hmask + 16 * half + l);
+    const uint32_t mh = uint32_t(m) << 8;
     #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = dl * (float(int8_t((q[i] >> shift) & 3)) - ((hm[i] & m) ? 0.f : 4.f));
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t qv = q16[i], hv = h16[i];
+      y[2 * i]     = dl * (float(int((qv >> shift) & 3))       - ((hv & m)  ? 0.f : 4.f));
+      y[2 * i + 1] = dl * (float(int((qv >> (8 + shift)) & 3)) - ((hv & mh) ? 0.f : 4.f));
+    }
   }
 };
 
@@ -180,11 +199,49 @@ template <> struct Deq<GgmlType::Q2_K> {
     const uint8_t sc = b->scales[2 * (4 * n + j) + half];
     const float dl = d * float(sc & 0xF), ml = dm * float(sc >> 4);
     const int shift = 2 * j;
-    const uint8_t* q = b->qs + n * 32 + 16 * half + l;
+    // 16-bit loads: a Q2_K block is 84 bytes so 64-bit is illegal, but every
+    // offset here is a multiple of 8 and 84 is even, so 16-bit always holds.
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(b->qs + n * 32 + 16 * half + l);
     #pragma unroll
-    for (int i = 0; i < 8; ++i) y[i] = dl * float((q[i] >> shift) & 3) - ml;
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t qv = q16[i];
+      y[2 * i]     = dl * float((qv >> shift) & 3) - ml;
+      y[2 * i + 1] = dl * float((qv >> (8 + shift)) & 3) - ml;
+    }
   }
 };
+
+// A 16-entry int8 lookup held in FOUR REGISTERS instead of memory.
+//
+// IQ4_XS and IQ4_NL map every 4-bit code through kvalues_iq4nl, which was eight
+// loads per lane per 256-element run. Staging that table in shared memory bought
+// nothing measurable, and the reason is bank conflicts: sixteen bytes read by
+// thirty-two lanes at thirty-two different offsets collide on almost every
+// access, so an LDS costs what the L1 hit it replaced cost. PRMT selects a byte
+// out of an eight-byte register pair in one instruction, so two PRMTs and a
+// per-byte blend replace four lookups with no memory traffic at all.
+//
+// `idx4` carries four 4-bit codes, one per byte, and the result carries the four
+// table values the same way.
+__device__ __forceinline__ uint32_t lut16_x4(uint32_t idx4) {
+  // kvalues_iq4nl, packed four signed bytes to a word.
+  constexpr uint32_t T0 = 0xBFAD9881u;   // -127 -104  -83  -65
+  constexpr uint32_t T1 = 0xF6EADDCFu;   //  -49  -35  -22  -10
+  constexpr uint32_t T2 = 0x26190D01u;   //    1   13   25   38
+  constexpr uint32_t T3 = 0x71594535u;   //   53   69   89  113
+  // PRMT's selector is four NIBBLES; the codes arrive as four bytes.
+  const uint32_t b = idx4 & 0x07070707u;
+  const uint32_t sel = (b & 0x7u) | ((b >> 4) & 0x70u) |
+                       ((b >> 8) & 0x700u) | ((b >> 12) & 0x7000u);
+  const uint32_t lo = __byte_perm(T0, T1, sel);          // codes 0-7
+  const uint32_t hi = __byte_perm(T2, T3, sel);          // codes 8-15
+  const uint32_t m  = __vcmpgeu4(idx4, 0x08080808u);     // 0xFF per byte with code >= 8
+  return (lo & ~m) | (hi & m);
+}
+
+__device__ __forceinline__ float s8(uint32_t packed, int k) {
+  return float(int(int8_t(packed >> (8 * k))));
+}
 
 template <> struct Deq<GgmlType::IQ4_XS> {
   static constexpr int RUN_BYTES = 136;
@@ -200,13 +257,31 @@ template <> struct Deq<GgmlType::IQ4_XS> {
     // bytes -- the largest single share in the file.
     const uint2 qv = *reinterpret_cast<const uint2*>(b->qs + ib * 16 + (within % 16));
     const int lsh = (within >= 16) ? 4 : 0;
+    const uint32_t p0 = lut16_x4((qv.x >> lsh) & 0x0F0F0F0Fu);
+    const uint32_t p1 = lut16_x4((qv.y >> lsh) & 0x0F0F0F0Fu);
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const uint32_t wq = (i < 4) ? qv.x : qv.y;
-      y[i] = dl * float(t.kv4nl[(wq >> (8 * (i & 3) + lsh)) & 0xF]);
+    for (int i = 0; i < 4; ++i) {
+      y[i]     = dl * s8(p0, i);
+      y[i + 4] = dl * s8(p1, i);
     }
   }
 };
+
+// The i-quants all end the same way: eight grid bytes, a sign mask, one scale.
+// Folding the sign into the INTEGER before the conversion is bit-exact -- an
+// int negation and a float negation of the same magnitude agree exactly -- and
+// it drops one multiply per element. Taking the bytes with shifts rather than
+// through a pointer into a local also keeps the grid word in a register.
+__device__ __forceinline__ void spread8(float* y, uint32_t g0, uint32_t g1,
+                                        uint32_t sg, float db) {
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int a = int((g0 >> (8 * i)) & 0xFF);
+    const int b = int((g1 >> (8 * i)) & 0xFF);
+    y[i]     = db * float((sg >> i)       & 1 ? -a : a);
+    y[i + 4] = db * float((sg >> (i + 4)) & 1 ? -b : b);
+  }
+}
 
 template <> struct Deq<GgmlType::IQ2_XS> {
   static constexpr int RUN_BYTES = 74;
@@ -217,11 +292,7 @@ template <> struct Deq<GgmlType::IQ2_XS> {
     const float db = h2f(b->d) *
         (0.5f + float((b->scales[ib32] >> (4 * (l / 2))) & 0xF)) * 0.25f;
     const uint64_t g = t.iq2xs[qi & 511];
-    const uint8_t* gp = reinterpret_cast<const uint8_t*>(&g);
-    const uint8_t sg = t.ksigns[qi >> 9];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
+    spread8(y, uint32_t(g), uint32_t(g >> 32), t.ksigns[qi >> 9], db);
   }
 };
 
@@ -236,11 +307,7 @@ template <> struct Deq<GgmlType::IQ2_XXS> {
     const uint8_t* a8 = reinterpret_cast<const uint8_t*>(&a0);
     const float db = h2f(b->d) * (0.5f + float(a1 >> 28)) * 0.25f;
     const uint64_t g = t.iq2xxs[a8[l]];
-    const uint8_t* gp = reinterpret_cast<const uint8_t*>(&g);
-    const uint8_t sg = t.ksigns[(a1 >> (7 * l)) & 127];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
+    spread8(y, uint32_t(g), uint32_t(g >> 32), t.ksigns[(a1 >> (7 * l)) & 127], db);
   }
 };
 
@@ -253,11 +320,7 @@ template <> struct Deq<GgmlType::IQ2_S> {
         (0.5f + float((b->scales[ib32] >> (4 * (l / 2))) & 0xF)) * 0.25f;
     const uint64_t g = t.iq2s[b->qs[4 * ib32 + l] |
                               ((uint32_t(b->qh[ib32]) << (8 - 2 * l)) & 0x300)];
-    const uint8_t* gp = reinterpret_cast<const uint8_t*>(&g);
-    const uint8_t sg = b->qs[32 + 4 * ib32 + l];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = db * float(gp[i]) * ((sg & (1u << i)) ? -1.f : 1.f);
+    spread8(y, uint32_t(g), uint32_t(g >> 32), b->qs[32 + 4 * ib32 + l], db);
   }
 };
 
@@ -269,15 +332,10 @@ template <> struct Deq<GgmlType::IQ3_XXS> {
     const uint32_t aux32 = le32(b->qs + 64 + 4 * ib32);
     const float db = h2f(b->d) * (0.5f + float(aux32 >> 28)) * 0.5f;
     const uint8_t sg = t.ksigns[(aux32 >> (7 * l)) & 127];
-    const uint32_t g1 = t.iq3xxs[b->qs[8 * ib32 + 2 * l + 0]];
-    const uint32_t g2 = t.iq3xxs[b->qs[8 * ib32 + 2 * l + 1]];
-    const uint8_t* p1 = reinterpret_cast<const uint8_t*>(&g1);
-    const uint8_t* p2 = reinterpret_cast<const uint8_t*>(&g2);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      y[i]     = db * float(p1[i]) * ((sg & (1u << i))     ? -1.f : 1.f);
-      y[i + 4] = db * float(p2[i]) * ((sg & (1u << (i + 4))) ? -1.f : 1.f);
-    }
+    // qs sits at offset 2 of a 98-byte block and the lane offset is even, so
+    // the two grid indices come out of one 16-bit load.
+    const uint32_t q2 = *reinterpret_cast<const uint16_t*>(b->qs + 8 * ib32 + 2 * l);
+    spread8(y, t.iq3xxs[q2 & 0xFF], t.iq3xxs[q2 >> 8], sg, db);
   }
 };
 
@@ -289,17 +347,22 @@ template <> struct Deq<GgmlType::IQ3_S> {
     const float db = h2f(b->d) *
         (1.f + 2.f * float((b->scales[s / 2] >> (4 * (s % 2))) & 0xF));
     const uint8_t qh = b->qh[s];
-    const uint32_t g1 = t.iq3s[b->qs[8 * s + 2 * l + 0] |
-                               ((uint32_t(qh) << (8 - 2 * l)) & 256)];
-    const uint32_t g2 = t.iq3s[b->qs[8 * s + 2 * l + 1] |
-                               ((uint32_t(qh) << (7 - 2 * l)) & 256)];
-    const uint8_t* p1 = reinterpret_cast<const uint8_t*>(&g1);
-    const uint8_t* p2 = reinterpret_cast<const uint8_t*>(&g2);
-    const uint8_t sg = b->signs[4 * s + l];
+    // One 16-bit load for the two grid indices instead of two byte loads. qs
+    // sits at offset 2 of a 110-byte block and the lane offset is even, so the
+    // address is 2-aligned in every block.
+    const uint32_t q2 = *reinterpret_cast<const uint16_t*>(b->qs + 8 * s + 2 * l);
+    const uint32_t g1 = t.iq3s[(q2 & 0xFF) | ((uint32_t(qh) << (8 - 2 * l)) & 256)];
+    const uint32_t g2 = t.iq3s[(q2 >> 8)   | ((uint32_t(qh) << (7 - 2 * l)) & 256)];
+    const uint32_t sg = b->signs[4 * s + l];
+    // The sign folds into the integer before the conversion: negating an int and
+    // negating the float it converts to are the same value, so this is bit-exact
+    // and drops a multiply per element.
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      y[i]     = db * float(p1[i]) * ((sg & (1u << i))     ? -1.f : 1.f);
-      y[i + 4] = db * float(p2[i]) * ((sg & (1u << (i + 4))) ? -1.f : 1.f);
+      const int v1 = int((g1 >> (8 * i)) & 0xFF);
+      const int v2 = int((g2 >> (8 * i)) & 0xFF);
+      y[i]     = db * float((sg >> i)       & 1 ? -v1 : v1);
+      y[i + 4] = db * float((sg >> (i + 4)) & 1 ? -v2 : v2);
     }
   }
 };
@@ -324,10 +387,23 @@ template <> struct Deq<GgmlType::IQ4_NL> {
     const float d = h2f(b->d);
     const int w = o0 % 32;
     const uint8_t* q = b->qs + (w % 16);
-    const bool hi = w >= 16;
+    const int lsh = (w >= 16) ? 4 : 0;
+    // An IQ4_NL block is 18 bytes, so consecutive blocks land on rotating
+    // alignments and these eight bytes cannot be one 64-bit load without a
+    // repack. The table lookups still go through PRMT.
+    uint32_t w0 = 0, w1 = 0;
     #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      y[i] = d * float(t.kv4nl[hi ? (q[i] >> 4) : (q[i] & 0xF)]);
+    for (int i = 0; i < 4; ++i) {
+      w0 |= uint32_t(q[i]) << (8 * i);
+      w1 |= uint32_t(q[i + 4]) << (8 * i);
+    }
+    const uint32_t p0 = lut16_x4((w0 >> lsh) & 0x0F0F0F0Fu);
+    const uint32_t p1 = lut16_x4((w1 >> lsh) & 0x0F0F0F0Fu);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      y[i]     = d * s8(p0, i);
+      y[i + 4] = d * s8(p1, i);
+    }
   }
 };
 
@@ -399,10 +475,7 @@ __device__ __forceinline__ void* sm_copy(uint8_t*& sp, const void* src, int n, i
   };
 
 // kvalues_iq4nl is 16 bytes; it is read eight times per lane per run.
-QWEN_STAGE(IQ4_XS, 16,
-  t.kv4nl = (const int8_t*)sm_copy(sp, t.kv4nl, 16, tid, GEMV_THREADS);)
-QWEN_STAGE(IQ4_NL, 16,
-  t.kv4nl = (const int8_t*)sm_copy(sp, t.kv4nl, 16, tid, GEMV_THREADS);)
+// IQ4_XS and IQ4_NL stage nothing: lut16_x4 keeps their table in registers.
 QWEN_STAGE(IQ3_S, 512 * 4,
   t.iq3s = (const uint32_t*)sm_copy(sp, t.iq3s, 512 * 4, tid, GEMV_THREADS);)
 QWEN_STAGE(IQ3_XXS, 256 * 4 + 128,
@@ -419,6 +492,10 @@ QWEN_STAGE(IQ2_XXS, 256 * 8 + 128,
 // where IQ3_S gained 12%. The table is big enough that the occupancy it takes
 // costs more than the loads it saves.
 #undef QWEN_STAGE
+
+// bf16 -> float is a 16-bit left shift; a packed pair is two masks.
+__device__ __forceinline__ float xlo(uint32_t u) { return __uint_as_float(u << 16); }
+__device__ __forceinline__ float xhi(uint32_t u) { return __uint_as_float(u & 0xFFFF0000u); }
 
 template <GgmlType T, int MROWS>
 __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
@@ -450,9 +527,20 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
     const int base = (i << 8) + o0;
     #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
-      const __nv_bfloat16* xp = x + size_t(m) * in_f + base;
-      #pragma unroll
-      for (int j = 0; j < 8; ++j) acc[m] = fmaf(v[j], __bfloat162float(xp[j]), acc[m]);
+      // ONE 16-byte load for the lane's eight activations, not eight 2-byte
+      // ones. `base` is a multiple of 8 and in_f a multiple of 256, so the
+      // address is always 16-byte aligned. bf16 -> float is a shift, so the
+      // halves are unpacked with bit ops rather than through a local array,
+      // which would spill the vector to local memory and undo the point.
+      const uint4 xv = *reinterpret_cast<const uint4*>(x + size_t(m) * in_f + base);
+      acc[m] = fmaf(v[0], xlo(xv.x), acc[m]);
+      acc[m] = fmaf(v[1], xhi(xv.x), acc[m]);
+      acc[m] = fmaf(v[2], xlo(xv.y), acc[m]);
+      acc[m] = fmaf(v[3], xhi(xv.y), acc[m]);
+      acc[m] = fmaf(v[4], xlo(xv.z), acc[m]);
+      acc[m] = fmaf(v[5], xhi(xv.z), acc[m]);
+      acc[m] = fmaf(v[6], xlo(xv.w), acc[m]);
+      acc[m] = fmaf(v[7], xhi(xv.w), acc[m]);
     }
   }
   #pragma unroll

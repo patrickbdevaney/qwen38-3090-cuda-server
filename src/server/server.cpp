@@ -12,6 +12,7 @@
 //   * a configurable model id matching /v1/models[0].id
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <mutex>
 #include <functional>
@@ -61,6 +62,15 @@ Tokenizer*    g_tok = nullptr;
 SamplerState  g_sampler;
 DraftModel*   g_draft = nullptr;
 PrefixCache*  g_prefix = nullptr;
+httplib::Server* g_srv_for_signal = nullptr;
+// Speculation scratch, allocated ONCE at startup rather than per request.
+// These were cudaMalloc'd and cudaFree'd inside generate() on every greedy
+// request: ~7.5 MiB of churn per request, an unchecked allocation in the hot
+// path, and at 262144 context the device is nearly full -- a transient failure
+// would have left a null pointer for the kernel to dereference.
+__nv_bfloat16* g_spec_lg = nullptr;
+__nv_bfloat16* g_spec_dlg = nullptr;
+std::vector<uint16_t> g_spec_hostlg;
 VisionTower*  g_vision = nullptr;
 }  // namespace
 std::string g_model_dir;
@@ -115,7 +125,6 @@ SpecState*    g_spec = nullptr;
 ServerConfig  g_cfg;
 Metrics       g_metrics;
 std::mutex    g_engine;
-uint64_t      g_step_counter = 0;
 
 std::string now_id(const char* prefix) {
   static std::atomic<uint64_t> n{0};
@@ -149,7 +158,19 @@ SamplingParams parse_sampling(const json& b, bool thinking) {
     p.frequency_penalty = b["frequency_penalty"].get<float>();
   if (b.contains("repetition_penalty") && !b["repetition_penalty"].is_null())
     p.repetition_penalty = b["repetition_penalty"].get<float>();
+  // Seeding is a REPRODUCIBILITY contract, and it was not being kept. The RNG is
+  // counter-based over (seed, step), and `step` used to be a global counter that
+  // ran across every request the server had ever handled -- so the same request
+  // with the same seed produced different text depending on what else the server
+  // had done first. `step` is now the token index within the request, which
+  // makes (seed, step) a function of the request alone, and a request that does
+  // NOT ask for a seed gets a fresh one here so it still varies.
   if (b.contains("seed") && !b["seed"].is_null()) p.seed = b["seed"].get<uint64_t>();
+  else {
+    static std::atomic<uint64_t> nonce{0};
+    p.seed = (uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ull)
+             ^ (++nonce * 0xBF58476D1CE4E5B9ull);
+  }
   return p;
 }
 
@@ -298,20 +319,17 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   std::deque<int32_t> pending;
   std::vector<int32_t> emitted;
   std::vector<int32_t> nids;
-  __nv_bfloat16 *lg = nullptr, *dlg = nullptr;
-  std::vector<uint16_t> hostlg;
-  if (use_spec) {
-    cudaMalloc(&lg, size_t(BS) * V * 2);
-    cudaMalloc(&dlg, size_t(BS - 1) * V * 2);
-    hostlg.resize(size_t(BS) * V);
-    nids.assign(BS, g_draft->sh.mask_token_id);
-  }
+  __nv_bfloat16* lg = g_spec_lg;
+  __nv_bfloat16* dlg = g_spec_dlg;
+  std::vector<uint16_t>& hostlg = g_spec_hostlg;
+  if (use_spec) nids.assign(BS, g_draft->sh.mask_token_id);
 
   int i = 0;
+  uint64_t step = 0;            // per REQUEST, not per server lifetime
   while (i < max_new) {
     if (pending.empty()) {
       if (!use_spec) {
-        sample(d_id, m.logits, g_sampler, sp, g_step_counter++);
+        sample(d_id, m.logits, g_sampler, sp, step++);
         int32_t tok = 0;
         cudaMemcpy(&tok, d_id, 4, cudaMemcpyDeviceToHost);
         pending.push_back(tok);
@@ -368,10 +386,7 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     // token; only the plain path steps here.
     if (!use_spec) { model_decode(m, tok, pos); ++pos; }
   }
-  if (use_spec) {
-    cudaFree(lg); cudaFree(dlg);
-    model_disable_taps(m);
-  }
+  if (use_spec) model_disable_taps(m);
 
   // THE snapshot: taken at the last token that actually went through the model,
   // which is where the next turn of this conversation resumes. Marconi's finding
@@ -429,8 +444,12 @@ json timings_json(const GenResult& r) {
 
 json tool_calls_json(const std::vector<ToolCall>& calls) {
   json arr = json::array();
+  // Ids were "call_0", "call_1" -- per RESPONSE, so every turn of a
+  // conversation reused them. A harness that matches tool results to calls by
+  // id sees the same id twice in one message list and can pair them wrongly.
+  static std::atomic<uint64_t> seq{0};
   for (size_t i = 0; i < calls.size(); ++i)
-    arr.push_back({{"id", "call_" + std::to_string(i)},
+    arr.push_back({{"id", "call_" + std::to_string(++seq)},
                    {"type", "function"},
                    {"index", int(i)},
                    {"function", {{"name", calls[i].name},
@@ -470,6 +489,15 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     po.ctx_chunk = std::max(512, model.max_batch);
     draft_load(draft, cfg.draft_dir, po);
     spec_alloc(spec, model, draft.sh.block_size);
+    const size_t V = size_t(model.shape.vocab_size), BS = size_t(draft.sh.block_size);
+    if (cudaMalloc(&g_spec_lg, BS * V * 2) != cudaSuccess ||
+        cudaMalloc(&g_spec_dlg, (BS - 1) * V * 2) != cudaSuccess) {
+      fprintf(stderr, "speculative decode: could not reserve %.1f MiB of logit scratch. "
+                      "Lower --max-context or drop --draft.\n",
+              double((2 * BS - 1) * V * 2) / (1 << 20));
+      return 2;
+    }
+    g_spec_hostlg.resize(BS * V);
     g_draft = &draft;
     g_spec = &spec;
     printf("speculative decode: DFlash2, block %d, greedy requests only\n",
@@ -478,6 +506,24 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
 
   httplib::Server srv;
   srv.set_payload_max_length(64ull << 20);
+  // Explicit, generous socket timeouts. httplib's defaults are 5 seconds, which
+  // is fine on loopback and wrong for a harness on another host pushing a
+  // repository-sized prompt or holding a long streamed response open.
+  srv.set_read_timeout(300, 0);
+  srv.set_write_timeout(600, 0);
+
+  // Shut down cleanly on SIGINT/SIGTERM so a supervisor restarting the backend
+  // does not sever an in-flight response. httplib::Server::stop() is documented
+  // as safe to call from another thread; a signal handler is the one place we
+  // get to.
+  g_srv_for_signal = &srv;
+  struct sigaction sa{};
+  sa.sa_handler = [](int) { if (g_srv_for_signal) g_srv_for_signal->stop(); };
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+  // A client that hangs up mid-stream would otherwise take the process with it.
+  signal(SIGPIPE, SIG_IGN);
 
   auto cors = [](httplib::Response& res) {
     res.set_header("Access-Control-Allow-Origin", "*");
@@ -717,6 +763,19 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     for (const char* k : {"max_tokens", "max_completion_tokens", "n_predict"})
       if (b.contains(k) && b[k].is_number()) { max_new = b[k].get<int>(); break; }
     max_new = std::min(max_new, g_cfg.max_ctx - int(ids.size()) - 1);
+    // A prompt just under the limit clamped max_new to zero and returned an
+    // empty completion with finish_reason "stop" -- which reads to a harness as
+    // "the model had nothing to say" and sends it round the loop again. Say what
+    // actually happened instead.
+    if (max_new < 1) {
+      g_metrics.errors++;
+      res.status = 400;
+      res.set_content(error_json("prompt of " + std::to_string(ids.size()) +
+                                 " tokens leaves no room to generate within --max-context " +
+                                 std::to_string(g_cfg.max_ctx),
+                                 "invalid_request_error", 400).dump(), "application/json");
+      return;
+    }
 
     std::vector<std::string> stops;
     if (b.contains("stop")) {
@@ -741,6 +800,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
       GenResult r = generate(ids, sp, max_new, stops, thinking, nullptr, mm.get(),
                              cache_key.empty() ? nullptr : &cache_key);
       g_metrics.prompt_tokens += r.prompt_tokens;
+      g_metrics.cached_prefix_tokens += uint64_t(r.cached_tokens);
       g_metrics.completion_tokens += r.completion_tokens;
       g_metrics.reasoning_tokens += r.reasoning_tokens;
       g_metrics.last_decode_tok_s = r.decode_tok_s;
@@ -808,6 +868,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
                 return alive;
               }, mm.get(), cache_key.empty() ? nullptr : &cache_key);
           g_metrics.prompt_tokens += r.prompt_tokens;
+          g_metrics.cached_prefix_tokens += uint64_t(r.cached_tokens);
           g_metrics.completion_tokens += r.completion_tokens;
           g_metrics.reasoning_tokens += r.reasoning_tokens;
           g_metrics.last_decode_tok_s = r.decode_tok_s;
@@ -844,6 +905,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     fprintf(stderr, "failed to bind %s:%d\n", cfg.host.c_str(), cfg.port);
     return 1;
   }
+  printf("shutting down\n");
   return 0;
 }
 

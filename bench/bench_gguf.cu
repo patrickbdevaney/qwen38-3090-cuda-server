@@ -22,9 +22,31 @@ int main(int argc, char** argv) {
   catch (const std::exception& e) { printf("cannot open: %s\n", e.what()); return 2; }
 
   // The widest tensors are what decode actually spends its time on.
-  std::vector<std::string> want = {
-      "blk.1.ffn_up.weight", "blk.1.ffn_down.weight", "blk.1.ffn_gate.weight",
-      "blk.0.attn_qkv.weight", "blk.3.attn_q.weight", "output.weight"};
+  // One representative tensor per type PRESENT IN THE FILE, chosen automatically.
+  // A hardcoded list left seven of the fourteen types unsampled, so the
+  // composition-weighted number below covered 84% of the model and quietly
+  // assumed the rest behaved like the average of what was measured. Picking the
+  // largest tensor of each type that still fits comfortably makes the coverage
+  // ~100% and the timing less sensitive to launch overhead.
+  std::vector<std::string> want;
+  {
+    std::vector<std::pair<qwen::GgmlType, std::pair<double, std::string>>> best;
+    for (const auto& kv : f.all()) {
+      const qwen::GgufTensor& t = kv.second;
+      if (int(t.row_len()) % 256) continue;
+      if (!qwen::gguf_gemv_supported(t.type)) continue;
+      const double nb = double(qwen::gguf_row_bytes(t.type, int(t.row_len()))) * double(t.rows());
+      if (nb > 900.0 * (1 << 20)) continue;          // must fit alongside x and y
+      bool found = false;
+      for (auto& e : best)
+        if (e.first == t.type) { found = true; if (nb > e.second.first) e.second = {nb, kv.first}; break; }
+      if (!found) best.emplace_back(t.type, std::make_pair(nb, kv.first));
+    }
+    // Stable order so two runs of the bench print the same rows.
+    std::sort(best.begin(), best.end(),
+              [](const auto& a, const auto& b) { return int(a.first) < int(b.first); });
+    for (const auto& e : best) want.push_back(e.second.second);
+  }
   printf("%-26s %-8s %10s %10s %10s %10s\n", "tensor", "type", "MiB", "ms", "GB/s",
          "%% of 914");
   double tot_bytes = 0, tot_ms = 0;

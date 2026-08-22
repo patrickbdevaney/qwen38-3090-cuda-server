@@ -218,6 +218,37 @@ C's 3.75e-04 is smaller than the 6.99e-04 the INT4 weights already cost against
 the bf16 reference. C is the only mode that reuses generated tokens and so the
 only one that reaches the 20x bar.
 
+### Two bugs the GGUF work turned up here, both on the AWQ path
+
+Recorded because both were invisible from this table and one of them killed the
+server.
+
+**A prefix hit covering the WHOLE prompt aborted speculation.** The drafter is
+primed only by taps that the prefill emits, so a hit with no prefill left to run
+left its cache empty while decode started at position N: `dflash: cache ends at
+0 but block starts at 72`, then abort. It needs an exact re-send of a prompt
+already snapshotted at its own length, which is why the two-turn measurement
+above never hit it. Speculation now falls back to plain decode for that one
+request; a partial hit is unaffected.
+
+**`usage.prompt_tokens_details.cached_tokens` was hardcoded to 0.** The standard
+OpenAI field said the cache never hit, on every request, while
+`timings.cached_n` right next to it reported the truth. Any client scoring cache
+effectiveness from the OpenAI field would have concluded the feature did not
+work. `/metrics` now also carries `qwen_prefix_hits_total`,
+`qwen_prefix_misses_total` and the restore/store time, so the cache is
+observable without reading per-request JSON.
+
+### Still open: the drafter is not part of the snapshot
+
+A partial hit restores the KV and the recurrent state but not the drafter's tap
+window, so the drafter restarts with only the newly-prefilled tokens in its
+2048-token context and acceptance ramps back up as tokens commit. Every drafted
+token is still verified, so this is a throughput effect and not a correctness
+one. Storing the tap window would cost about 105 MiB of pinned host per slot on
+top of the current 150 MiB, and the ramp has not been measured, so it is not
+worth doing until it is.
+
 Related finding, independent of the cache: **chunked prefill is not
 chunk-invariant.** 1024 tokens in one call vs two differ in 215979/248320 logit
 bits (max |d| 3.44e-01). The recurrent state is carried correctly; the cause is

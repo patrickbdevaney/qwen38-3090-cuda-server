@@ -475,6 +475,15 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.graph_splits = attn_decode_splits(m.max_ctx);
 
   CKM(cudaMemGetInfo(&free_b, &total_b));
+  {
+    const size_t lmb = m.lm_head_bits == 0 ? m.lm_head_gg.total_bytes()
+                     : m.lm_head_bits == 4 ? m.lm_head_q.total_bytes()
+                     : m.lm_head_bits == 8 ? m.lm_head_q8.total_bytes()
+                     : size_t(S.vocab_size) * S.hidden_size * 2;
+    m.weight_bytes = body_bytes + lmb;
+    m.kv_bytes_per_token = kv_per_token_total;
+    m.recurrent_bytes = (size_t(S.gdn_state_elems()) + size_t(S.gdn_conv_state_elems())) * 4;
+  }
   if (opt.verbose) {
     char b1[32];
     printf("\n=== VRAM ===\n");
