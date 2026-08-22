@@ -218,6 +218,97 @@ C's 3.75e-04 is smaller than the 6.99e-04 the INT4 weights already cost against
 the bf16 reference. C is the only mode that reuses generated tokens and so the
 only one that reaches the 20x bar.
 
+## The serving gate: 42 assertions, both weight formats
+
+```
+tools/run_serving_gates.sh          # starts the server per format, runs the gate
+./build/gate_serving --port 8099    # against an already-running instance
+```
+
+Every other gate in this repo tests a kernel or a load path in isolation.
+`tests/gate_serving.cpp` tests what a coding agent actually talks to: the
+OpenAI-shaped endpoint with the prefix cache, the drafter and the INT4 KV cache
+all live at once. `tools/run_serving_gates.sh` runs it against AWQ and GGUF in
+turn, so "production ready" means the same assertions pass on both runners rather
+than on whichever one was developed last.
+
+| | AWQ INT4 + INT4 KV + DFlash2 | GGUF UD-Q3_K_XL + INT4 KV + DFlash2 |
+|---|---|---|
+| assertions | **42 / 42** | **42 / 42** |
+
+What it covers: liveness and OpenAI response shape; greedy repeatability on a
+fixed path; prefix-cache reuse, its speedup and that the answer comes out of a
+context the model never re-read; speculation on for greedy and off for sampled,
+with the counters agreeing; seeded reproducibility; streamed text equal to
+non-streamed; tool calls; the full agent loop (call -> tool result -> answer);
+`/v1/completions`; non-ASCII transport; stop sequences; `max_tokens` edges
+including 1; malformed JSON, missing fields and over-length prompts returning 4xx
+rather than dying; four concurrent requests completing without crossing answers;
+and long-context retrieval through the INT4 KV cache. Every request is
+timeout-bounded, so a hung server fails the gate instead of hanging it.
+
+Six of the bugs it found are recorded below and in the git log. The one worth
+repeating here: **`temperature: 0` was not greedy**, because Qwen's recommended
+non-thinking defaults include `presence_penalty` 1.5 and they were applied even to
+a request that asked for greedy decoding. That changes which token is the argmax
+-- on code, where `)`, newline and the same identifiers recur constantly -- and
+because the speculative acceptance rule IS argmax equality, it also disabled
+speculation entirely. The standard coding-agent request got penalty-distorted
+output at 43 tok/s where it should have had greedy output at 146.
+
+## Autoregressive and speculative decode, measured through the server
+
+Both weight formats, INT4 KV, DFlash2 drafter, `enable_thinking: false`,
+`temperature: 0`, 192 tokens, measured on the HTTP endpoint rather than a bench
+harness -- because the bug that dominated this table lived in request parsing,
+not in a kernel.
+
+```
+./build/cuda_server --model $MODEL --draft $DRAFTER --kv-cache int4 --embed-host
+POST /v1/chat/completions  {"temperature":0,"max_tokens":192,"speculative":true|false,
+                            "chat_template_kwargs":{"enable_thinking":false}}
+```
+
+| prompt | AWQ AR | AWQ spec | acc/round | GGUF AR | GGUF spec | acc/round |
+|---|---:|---:|---:|---:|---:|---:|
+| count to 60 | 45.7 | **141.8** | 8.00 | 30.4 | **87.1** | 8.00 |
+| reverse a linked list (code) | 45.3 | **136.0** | 7.58 | 30.1 | **82.2** | 7.58 |
+| explain quicksort (prose) | 45.4 | 47.0 | 2.71 | 30.1 | **27.9** | 2.63 |
+
+Two things in that table are worth stating plainly.
+
+**Code generation is the good case, not the lucky one.** 7.58 of 8 drafted
+tokens accepted, 3.0x on AWQ and 2.7x on GGUF. DFlash2 was trained for exactly
+this and it shows; the counting prompt hitting a perfect 8.00 is a curiosity, the
+code row is the number that matters for the workload this server exists for.
+
+**On prose, speculation is a net LOSS for GGUF** -- 27.9 against 30.1 plain, 7%
+slower. At 2.6 accepted per round the drafter forward plus the block verification
+cost more than the AR steps they replace, and GGUF's slower decode moves the
+break-even the wrong way (AWQ still wins slightly at 2.71). Acceptance is not
+known before the request runs, and switching paths mid-request would mean
+reasoning about model state across the boundary, so the server does not try to be
+clever: `"speculative": false` is available per request, and a harness that knows
+it is asking for prose should use it.
+
+## The roofline, and what is left on the table
+
+Decode reads every weight, every live KV entry and the whole recurrent state once
+per token. `bench_decode` and `bench_dflash` now print that traffic and the
+ceiling it implies against the 914.2 GB/s this card was MEASURED at in Phase 0.
+
+| | bytes/token @4K | roofline | measured | of roofline |
+|---|---:|---:|---:|---:|
+| AWQ INT4 g128 | 13.424 GiB | 63.4 tok/s | 45.6 | **72%** |
+| GGUF UD-Q3_K_XL | 11.727 GiB | 72.6 tok/s | 30.6 | **42%** |
+
+**GGUF's ceiling is HIGHER than AWQ's**, because it reads 1.7 GiB fewer bytes per
+token. That is the whole case for finishing its kernel: at AWQ's 72% efficiency
+GGUF would decode at 52 tok/s, above AWQ's 45.6 and above llama.cpp's 44.63 on
+the same file; at the AWQ GEMV's 84% it would be 61. The gap is not a property of
+the format, it is unfinished work in one kernel -- see `reports/CONFIG_MATRIX.md`
+for the per-type breakdown of where the instructions still go.
+
 ### Two bugs the GGUF work turned up here, both on the AWQ path
 
 Recorded because both were invisible from this table and one of them killed the

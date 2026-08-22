@@ -269,6 +269,89 @@ cross-session comparison of two kernels can invent or hide a 12% effect. The
 per-type numbers recorded earlier in this file were taken that way and hold up;
 the discipline is now written down.
 
+### The kernel was instruction bound, and saying so cost 42%
+
+The staging experiment above answered a different question than the one that
+mattered. Types with IDENTICAL memory access shapes were differing twofold --
+Q5_K 624 GB/s, IQ3_S 329, Q3_K 246 -- and that cannot be bandwidth. Ranking the
+types by how many MEMORY INSTRUCTIONS their per-lane dequantiser issues
+reproduces the measured ranking exactly:
+
+| type | loads per lane per run | GB/s (before) |
+|---|---|---:|
+| Q5_K | ~5 (two 64-bit + scales) | 624 |
+| IQ4_XS | 4 + 8 table lookups | 426 |
+| IQ3_S | ~6 + 2 lookups | 343 |
+| Q3_K | ~19, all byte loads | 246 |
+| Q6_K | ~17, plus a branch inside the unrolled loop | 163 |
+
+Five changes, every one of them removing instructions rather than bytes, all
+bit-exact against ggml:
+
+1. **Activations were eight 2-byte loads** per lane per run. `base` is always a
+   multiple of 8 and `in_f` of 256, so it is one 16-byte load -- unpacked with
+   shifts rather than through a local array, which would spill the vector and
+   undo the point.
+2. **IQ4_XS and IQ4_NL keep their table in registers.** `kvalues_iq4nl` is
+   sixteen signed bytes; two `PRMT` and a `__vcmpgeu4` blend replace four
+   lookups with no memory traffic at all. This is also why staging it in shared
+   bought nothing: sixteen bytes read by thirty-two lanes at thirty-two offsets
+   conflicts on nearly every bank, so an LDS costs what the L1 hit cost.
+3. **IQ3_S and IQ3_XXS** take their two grid indices from one 16-bit load, and
+   the sign folds into the INTEGER before conversion -- negating an int and
+   negating the float it converts to agree exactly, so it is bit-exact and drops
+   a multiply per element. The same fold covers IQ2_XS / IQ2_XXS / IQ2_S.
+4. **Q2_K, Q3_K and Q6_K get 16-bit loads.** They were excluded from the earlier
+   64-bit work because 84, 110 and 210 are not multiples of 8 -- but they are all
+   EVEN, and every field offset in these paths is a multiple of 8, so 16-bit is
+   always legal. Sixteen byte loads become eight. The padding repack the earlier
+   note assumed was necessary is not.
+5. **Q6_K decided its sub-block offset, nibble shift and scale inside the
+   unrolled loop**, none of which depend on the element index.
+
+| type | share | before | after | |
+|---|---:|---:|---:|---:|
+| Q6_K | 2.6% | 163 | **771** | +373% |
+| IQ2_XXS | 0.4% | 186 | 313 | +68% |
+| IQ3_XXS | 6.9% | 286 | 462 | +62% |
+| Q2_K | 0.5% | 273 | 453 | +66% |
+| IQ2_XS | 0.8% | 236 | 376 | +59% |
+| IQ3_S | 26.9% | 343 | 508 | +48% |
+| IQ4_NL | 0.3% | 362 | 533 | +47% |
+| IQ2_S | 3.1% | 267 | 383 | +43% |
+| Q8_0 | 0.3% | 488 | 684 | +40% |
+| Q4_K | 4.9% | 465 | 580 | +25% |
+| IQ4_XS | 37.9% | 426 | 524 | +23% |
+| Q5_K | 8.9% | 618 | 658 | +6% |
+| **composition-weighted** | | **354.8** | **503.8** | **+42%** |
+
+End to end: 23.8 -> 30.6 tok/s of autoregressive decode at 4096 context, 42% of
+the DRAM roofline against 33%.
+
+`bench_gguf` had been measuring a hardcoded list of six tensors that left seven
+of the fourteen types unsampled, so its composition-weighted number covered 84%
+of the model and silently assumed the rest behaved like the average of what was
+measured. It now picks the largest tensor of every type present -- which is how
+Q6_K's 163 GB/s came to light at all, at 2.6% of the bytes and 13% of the time.
+
+### What is still on the table, and why it is worth taking
+
+At 504 GB/s the GEMV is at 55% of measured DRAM, against the AWQ path's 84%. The
+remaining gap is structural rather than another peephole: **AWQ is repacked at
+load so that 32 lanes read 128 contiguous bytes with each lane owning a different
+ROW**, while the GGUF kernel gives one warp one row and splits a 110-byte block
+across its 32 lanes. That means the block header -- scales, mins, the super-block
+d -- is decoded once per eight elements per lane instead of once per block, a
+32-fold redundancy no amount of load-width tuning removes.
+
+Interleaving 32 rows at load, so a lane owns a whole block and the warp's reads
+are coalesced across rows, would cut memory instructions per element by roughly
+an order of magnitude and amortise the header the same way AWQ does. It costs a
+repack pass at load, a padding of block sizes to a multiple of 4 (under 2%), and
+a rewrite of the kernel's addressing. The prize is quantified: **GGUF's roofline
+is 72.6 tok/s against AWQ's 63.4**, so a kernel at AWQ's efficiency makes the
+smaller model the faster one.
+
 This does not change the *headroom* conclusion above -- INT4 KV still frees 3.7x
 more than Q3_K_XL would. It does mean the GGUF path is no longer embarrassing,
 but "AWQ and GGUF are viable substitutes" is not yet true and should not be
