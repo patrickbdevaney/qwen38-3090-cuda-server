@@ -63,6 +63,27 @@ SamplerState  g_sampler;
 DraftModel*   g_draft = nullptr;
 PrefixCache*  g_prefix = nullptr;
 httplib::Server* g_srv_for_signal = nullptr;
+
+// Plain-decode cost per token, in milliseconds, learned from requests that
+// actually decode plainly (sampled ones, `speculative: false`, and requests that
+// switched away from speculation). Bucketed by the power of two the context sits
+// in, because a token costs 22 ms at 4K and 41 ms at 262K and comparing across
+// that would be worse than not comparing at all.
+constexpr int kArBuckets = 24;
+std::atomic<double> g_ar_ms[kArBuckets];
+int ar_bucket(int ctx) {
+  int b = 0;
+  while ((1 << (b + 1)) <= ctx && b < kArBuckets - 1) ++b;
+  return b;
+}
+void ar_observe(int ctx, double ms_per_token) {
+  if (ms_per_token <= 0 || ms_per_token > 10000) return;
+  const int b = ar_bucket(ctx);
+  const double prev = g_ar_ms[b].load(std::memory_order_relaxed);
+  g_ar_ms[b].store(prev <= 0 ? ms_per_token : 0.8 * prev + 0.2 * ms_per_token,
+                   std::memory_order_relaxed);
+}
+double ar_estimate(int ctx) { return g_ar_ms[ar_bucket(ctx)].load(std::memory_order_relaxed); }
 // Speculation scratch, allocated ONCE at startup rather than per request.
 // These were cudaMalloc'd and cudaFree'd inside generate() on every greedy
 // request: ~7.5 MiB of churn per request, an unchecked allocation in the hot
@@ -70,7 +91,6 @@ httplib::Server* g_srv_for_signal = nullptr;
 // would have left a null pointer for the kernel to dereference.
 __nv_bfloat16* g_spec_lg = nullptr;
 __nv_bfloat16* g_spec_dlg = nullptr;
-std::vector<uint16_t> g_spec_hostlg;
 VisionTower*  g_vision = nullptr;
 }  // namespace
 std::string g_model_dir;
@@ -197,6 +217,7 @@ struct GenResult {
   int prompt_tokens = 0, completion_tokens = 0, reasoning_tokens = 0;
   double ttft_s = 0, decode_tok_s = 0, prefill_tok_s = 0;
   int spec_rounds = 0, spec_committed = 0;
+  bool spec_abandoned = false;
   int cached_tokens = 0;
   std::string finish_reason = "stop";
 };
@@ -344,12 +365,31 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   std::vector<int32_t> nids;
   __nv_bfloat16* lg = g_spec_lg;
   __nv_bfloat16* dlg = g_spec_dlg;
-  std::vector<uint16_t>& hostlg = g_spec_hostlg;
   if (use_spec) nids.assign(BS, g_draft->sh.mask_token_id);
 
   int i = 0;
   uint64_t step = 0;            // per REQUEST, not per server lifetime
   bool hit_stop = false;
+
+  // Adaptive routing. A speculative round costs a fixed multiple of an
+  // autoregressive step -- one target forward at T = block_size plus a drafter
+  // forward, against one target forward at T = 1 -- so it wins exactly when the
+  // acceptance rate exceeds that multiple. On prose the drafter accepts about
+  // 2.6 of 8, and measured, that is a NET LOSS on the GGUF path: 27.9 tok/s
+  // against 30.1 plain. Rather than hardcode a threshold that would go stale the
+  // moment the round gets cheaper, both rates are measured here and compared.
+  //
+  // The switch is only safe where `pending` is empty. Everywhere else the deque
+  // holds tokens the verify forward has already fed through the model, and the
+  // plain path would feed them a second time. At an empty deque both modes share
+  // the same invariant -- m.logits holds the distribution for position `pos`, and
+  // `pos` is the number of tokens in the KV cache -- so either can take over.
+  bool spec_on = use_spec;
+  double spec_ms = 0, ar_ms_acc = 0;
+  int spec_tok = 0, ar_tok = 0;
+  bool spec_abandoned = false;
+  std::chrono::steady_clock::time_point ar_mark;
+  bool ar_marked = false;
   // Search for a stop sequence INSIDE what was just appended, not only as a
   // suffix. The reasoning splitter buffers text it cannot yet classify and
   // releases several tokens' worth at once, so a stop string landing anywhere
@@ -367,15 +407,37 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
   };
   while (i < max_new) {
     if (pending.empty()) {
-      if (!use_spec) {
+      // Decide at the one point where switching is safe. Give it eight rounds
+      // of evidence, and require the plain path to be more than 5% better before
+      // moving, so a noisy estimate cannot make this flap.
+      if (spec_on && r.spec_rounds >= 8 && spec_tok > 0) {
+        const double ar_ref = ar_estimate(pos);
+        const double spec_per_tok = spec_ms / double(spec_tok);
+        if (ar_ref > 0 && spec_per_tok > ar_ref * 1.05) {
+          spec_on = false;
+          spec_abandoned = true;
+          model_disable_taps(m);
+        }
+      }
+      if (!spec_on) {
+        if (ar_marked)
+          ar_ms_acc += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - ar_mark).count();
+        ar_mark = std::chrono::steady_clock::now();
+        ar_marked = true;
         sample(d_id, m.logits, g_sampler, sp, step++);
         int32_t tok = 0;
         cudaMemcpy(&tok, d_id, 4, cudaMemcpyDeviceToHost);
         pending.push_back(tok);
+        ++ar_tok;
       } else {
+        const auto rt = std::chrono::steady_clock::now();
         int spos = pos;
-        const int committed = spec_round(m, *g_spec, *g_draft, spos, lg, dlg, hostlg,
+        const int committed = spec_round(m, *g_spec, *g_draft, spos, lg, dlg,
                                          nids, pending);
+        spec_ms += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - rt).count();
+        spec_tok += committed;
         pos = spos;
         r.spec_rounds += 1;
         r.spec_committed += committed;
@@ -423,9 +485,14 @@ GenResult generate(const std::vector<int32_t>& ids, const SamplingParams& sp,
     if (i == max_new) { r.finish_reason = "length"; break; }
     // The speculative path already advanced the model past every committed
     // token; only the plain path steps here.
-    if (!use_spec) { model_decode(m, tok, pos); ++pos; }
+    if (!spec_on) { model_decode(m, tok, pos); ++pos; }
   }
-  if (use_spec) model_disable_taps(m);
+  if (spec_on) model_disable_taps(m);
+  // Feed the plain-decode rate back, so the next request's routing decision has
+  // something to compare against. `ar_tok - 1` because the first interval also
+  // contains the prefill's tail.
+  if (ar_tok > 2 && ar_ms_acc > 0) ar_observe(pos, ar_ms_acc / double(ar_tok - 1));
+  r.spec_abandoned = spec_abandoned;
 
   // THE snapshot: taken at the last token that actually went through the model,
   // which is where the next turn of this conversation resumes. Marconi's finding
@@ -488,6 +555,8 @@ json timings_json(const GenResult& r) {
     t["draft_n"] = r.spec_committed;
     t["draft_accepted_per_round"] = double(r.spec_committed) / double(r.spec_rounds);
     t["draft_rounds"] = r.spec_rounds;
+    // Visible so a harness can see WHY a request was slow, instead of guessing.
+    if (r.spec_abandoned) t["draft_abandoned"] = true;
   }
   return t;
 }
@@ -547,7 +616,6 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
               double((2 * BS - 1) * V * 2) / (1 << 20));
       return 2;
     }
-    g_spec_hostlg.resize(BS * V);
     g_draft = &draft;
     g_spec = &spec;
     printf("speculative decode: DFlash2, block %d, greedy requests only\n",

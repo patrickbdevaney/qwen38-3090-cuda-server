@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
       printf("%llu ", (unsigned long long)stats.per_position[i]);
     printf("\n");
   }
+  qwen::spec_profile_dump(gg.empty() ? "AWQ" : "GGUF");
   printf("\nmean AR %.1f tok/s, mean spec %.1f tok/s, %.2fx\n",
          ar_sum / prompts.size(), sp_sum / prompts.size(), sp_sum / ar_sum);
   return 0;

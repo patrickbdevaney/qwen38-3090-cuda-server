@@ -14,7 +14,13 @@ int main(int argc, char** argv) {
       : "/home/patrickd/qwen38-weights/Qwen3.8-27B-W4A16-AWQ";
   qwen::Model m; qwen::LoadOptions o;
   o.max_ctx = 8192; o.max_batch = 4096; o.lm_head_bits = 8; o.verbose = false;
+  o.kv_k = qwen::KvFmt::INT4; o.kv_v = qwen::KvFmt::INT4;
+  // argv[2]: GGUF weights. The two runners take different code paths above T=1
+  // -- AWQ switches to the tensor-core GEMM, GGUF stays on its multi-row GEMV --
+  // and this is the bench that shows what that costs.
+  if (argc > 2) { o.gguf = argv[2]; o.lm_head_bits = 0; o.embed_host = true; }
   qwen::model_load(m, md, o);
+  printf("%s\n", o.gguf.empty() ? "AWQ INT4 g128" : o.gguf.c_str());
   qwen::model_graph_capture(m);
 
   // warm a 2K context

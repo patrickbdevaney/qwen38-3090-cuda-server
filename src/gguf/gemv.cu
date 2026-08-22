@@ -437,7 +437,10 @@ template <> struct Deq<GgmlType::BF16> {
 };
 
 // ---------------------------------------------------------------- kernels
-constexpr int GEMV_WARPS = 4;
+#ifndef QWEN_GGUF_WARPS
+#define QWEN_GGUF_WARPS 2
+#endif
+constexpr int GEMV_WARPS = QWEN_GGUF_WARPS;
 constexpr int GEMV_THREADS = GEMV_WARPS * 32;
 
 // ---------------------------------------------------------------- codebooks
@@ -521,9 +524,15 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   #pragma unroll
   for (int m = 0; m < MROWS; ++m) acc[m] = 0.f;
 
-  for (int i = 0; i < runs; ++i) {
-    float v[8];
-    Deq<T>::get8(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, v, tab);
+  // TWO runs in flight. Every measurable throughput bound says this kernel
+  // should be three times faster than it is -- instruction issue, integer ALU
+  // and DRAM all have headroom, occupancy is at the 48-warp ceiling, the FMA
+  // chain is not exposed and the activations are L1-resident. What is left is
+  // LATENCY: each lane's dequantiser is a short dependent chain of loads
+  // (header, then scale, then data) and there is only one of them outstanding
+  // per lane at a time. Decoding two super-blocks per iteration gives the
+  // scheduler two independent chains to interleave.
+  auto body = [&](int i, const float* v) {
     const int base = (i << 8) + o0;
     #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
@@ -542,6 +551,32 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
       acc[m] = fmaf(v[6], xlo(xv.w), acc[m]);
       acc[m] = fmaf(v[7], xhi(xv.w), acc[m]);
     }
+  };
+
+#ifndef QWEN_GGUF_UNROLL
+#define QWEN_GGUF_UNROLL 4
+#endif
+  // Wide M already gives the scheduler independent work per row, and v[U][8]
+  // costs 8U registers -- at U=4 with MROWS=8 that spilled. Swept: U=4 is the
+  // best for the narrow shapes (2 -> 523, 3 -> 520, 4 -> 542, 6 -> 530 GB/s
+  // composition-weighted), and warps per block barely matters (2 -> 553,
+  // 4 -> 545, 8 -> 535), which is itself evidence the kernel is latency bound
+  // rather than occupancy bound.
+  constexpr int U = QWEN_GGUF_UNROLL;
+  constexpr int UU = U;
+  int i = 0;
+  for (; i + UU <= runs; i += UU) {
+    float v[UU][8];
+    #pragma unroll
+    for (int u = 0; u < UU; ++u)
+      Deq<T>::get8(wr + size_t(i + u) * Deq<T>::RUN_BYTES, o0, v[u], tab);
+    #pragma unroll
+    for (int u = 0; u < UU; ++u) body(i + u, v[u]);
+  }
+  for (; i < runs; ++i) {
+    float v[8];
+    Deq<T>::get8(wr + size_t(i) * Deq<T>::RUN_BYTES, o0, v, tab);
+    body(i, v);
   }
   #pragma unroll
   for (int m = 0; m < MROWS; ++m) {

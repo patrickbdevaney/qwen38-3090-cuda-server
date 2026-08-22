@@ -85,6 +85,10 @@ int main(int argc, char** argv) {
            1000.0 / med, 100.0 * (1000.0 / med) / base, roof,
            100.0 * (1000.0 / med) / roof);
   }
+  // With QWEN_DEBUG_SYNC=2 and --no-graph the per-stage breakdown of a decode
+  // step is what says whether the remaining gap to the roofline is in the GEMV
+  // or somewhere else entirely.
+  qwen::dbg_profile_report("decode");
   {
     // G7 is a PEAK number, not a post-load one: CUDA graph instantiation and
     // cuBLAS workspaces land after the budget print.

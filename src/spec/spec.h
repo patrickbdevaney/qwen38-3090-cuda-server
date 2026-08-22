@@ -37,6 +37,9 @@ struct SpecState {
   __nv_bfloat16* post_conv = nullptr; // [gdn_layers][block][conv_dim]
   float* g = nullptr;                 // [gdn_layers][block][v_heads]
   float* beta = nullptr;              // [gdn_layers][block][v_heads]
+  // Device scratch for the block argmax: block_size + 1 ints, so a round copies
+  // 36 bytes back instead of a 4 MiB logit tile.
+  int32_t* argmax_ids = nullptr;
   int    block = 0;
   bool   capturing = false;
   std::vector<void*> owned;
@@ -122,11 +125,10 @@ void spec_push_taps(DraftModel& d, const __nv_bfloat16* taps, int n, int pos0,
 //
 //   lg      [block][vocab]      target logits for the verified block
 //   dlg     [block-1][vocab]    target logits over the drafter's hidden rows
-//   hostlg  [block*vocab]       host mirror of lg
 //   nids    [block]             noise ids; slot 0 is overwritten each round
 int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
                __nv_bfloat16* lg, __nv_bfloat16* dlg,
-               std::vector<uint16_t>& hostlg, std::vector<int32_t>& nids,
+               std::vector<int32_t>& nids,
                std::deque<int32_t>& out);
 
 // Greedy generation with the DFlash2 drafter. Same acceptance rule as
@@ -135,5 +137,9 @@ int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
 std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
                                           const std::vector<int32_t>& prompt,
                                           int max_new, SpecStats& stats);
+
+// Print and reset the per-stage breakdown of spec_round. No-op unless
+// QWEN_SPEC_PROFILE=1, which also enables the device syncs it needs.
+void spec_profile_dump(const char* label);
 
 }  // namespace qwen

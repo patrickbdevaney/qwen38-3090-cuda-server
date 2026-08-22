@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <chrono>
 
 namespace qwen {
 namespace {
@@ -32,6 +33,8 @@ __global__ void k_conv_state_slice(float* __restrict__ state,
 }  // namespace
 
 void spec_alloc(SpecState& s, const Model& m, int max_block) {
+  CKS(cudaMalloc(&s.argmax_ids, size_t(max_block + 1) * 4));
+  s.owned.push_back(s.argmax_ids);
   s.block = max_block;
   const auto& S = m.shape;
   const int NG = S.num_gdn_layers, CD = int(m.gdn.conv_dim()), NV = S.linear_num_value_heads;
@@ -248,20 +251,75 @@ void spec_push_taps(DraftModel& d, const __nv_bfloat16* taps, int n, int pos0,
   }
 }
 
+// ---------------------------------------------------------------- profiling
+//
+// A speculative round measured 2.6x the cost of an autoregressive step, where
+// the bytes it reads say it should cost about 1.2x. That ratio IS the break-even
+// acceptance: below it speculation loses, which is why prose (2.6-2.7 accepted
+// per round) came out slower than plain decode on the GGUF path. Making the
+// round cheaper raises every workload at once and is worth more than routing
+// around the bad case, so the round is instrumented rather than guessed at.
+//
+// Off unless QWEN_SPEC_PROFILE=1, because the stage timers need a device sync
+// each and that would itself distort the thing being measured.
+struct SpecProfile {
+  double anchor = 0, draft = 0, verify = 0, pick = 0, commit = 0;
+  uint64_t rounds = 0;
+};
+static SpecProfile g_prof;
+static int g_prof_on = -1;
+
+static bool prof_on() {
+  if (g_prof_on < 0) { const char* e = getenv("QWEN_SPEC_PROFILE"); g_prof_on = e && atoi(e); }
+  return g_prof_on != 0;
+}
+static double prof_now() {
+  if (!prof_on()) return 0;
+  cudaDeviceSynchronize();
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#define PROF(field, t0) do { if (prof_on()) g_prof.field += prof_now() - (t0); } while (0)
+
+void spec_profile_dump(const char* label) {
+  if (!prof_on() || !g_prof.rounds) return;
+  const double n = double(g_prof.rounds);
+  const double tot = g_prof.anchor + g_prof.draft + g_prof.verify + g_prof.pick + g_prof.commit;
+  printf("\nspec round breakdown (%s, %llu rounds, %.2f ms/round)\n", label,
+         (unsigned long long)g_prof.rounds, tot / n);
+  auto row = [&](const char* nm, double v) {
+    printf("  %-28s %8.3f ms  %5.1f%%\n", nm, v / n, 100.0 * v / tot);
+  };
+  row("anchor logits D2H + argmax", g_prof.anchor);
+  row("draft (drafter + head + pick)", g_prof.draft);
+  row("verify forward (T=block)", g_prof.verify);
+  row("block logits D2H + argmax", g_prof.pick);
+  row("taps + rollback + commit", g_prof.commit);
+  g_prof = SpecProfile{};
+}
+
 int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
                __nv_bfloat16* lg, __nv_bfloat16* dlg,
-               std::vector<uint16_t>& hostlg, std::vector<int32_t>& nids,
+               std::vector<int32_t>& nids,
                std::deque<int32_t>& out) {
   const int V = m.shape.vocab_size;
   const int BS = d.sh.block_size, NP = BS - 1;
 
-  std::vector<uint16_t> l1(V);
-  CKS(cudaMemcpy(l1.data(), m.logits, size_t(V) * 2, cudaMemcpyDeviceToHost));
-  const int32_t t0 = argmax_host(l1, 0, V);
+  const double p_t0 = prof_now();
+  // The anchor's argmax runs on the device: this used to allocate a 497 KiB
+  // host vector, copy the whole vocabulary into it and scan it on the CPU, once
+  // per round, sitting between two GPU forwards.
+  int32_t t0 = 0;
+  argmax_rows(s.argmax_ids, m.logits, 1, V, m.stream);
+  CKS(cudaMemcpyAsync(&t0, s.argmax_ids, 4, cudaMemcpyDeviceToHost, m.stream));
+  CKS(cudaStreamSynchronize(m.stream));
   out.push_back(t0);
+  PROF(anchor, p_t0);
   if (m.shape.is_stop_token(t0)) return 1;
+  if (prof_on()) ++g_prof.rounds;
 
   // ---- draft ----
+  const double p_dr = prof_now();
   nids[0] = t0;
   CKS(cudaMemcpy(d.ids_buf, nids.data(), size_t(BS) * 4, cudaMemcpyHostToDevice));
   // The drafter has no embedding table: the noise comes from the TARGET's.
@@ -279,19 +337,29 @@ int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
 
   std::vector<int32_t> drafted(NP);
   CKS(cudaMemcpy(drafted.data(), d.path, size_t(NP) * 4, cudaMemcpyDeviceToHost));
+  PROF(draft, p_dr);
 
   // ---- verify ----
   std::vector<int32_t> block;
   block.push_back(t0);
   for (int32_t x : drafted) block.push_back(x);
 
+  const double p_vf = prof_now();
   spec_begin_block(s, m);
   model_verify_block(m, block.data(), BS, pos, lg);
   m.spec = nullptr; s.capturing = false;
-  CKS(cudaMemcpy(hostlg.data(), lg, size_t(BS) * V * 2, cudaMemcpyDeviceToHost));
+  PROF(verify, p_vf);
 
+  const double p_pk = prof_now();
+  // Likewise for the verification block: block_size argmaxes over the vocabulary,
+  // on the device, returning block_size integers rather than a 4 MiB tile.
   std::vector<int32_t> targ(BS);
-  for (int i = 0; i < BS; ++i) targ[i] = argmax_host(hostlg, size_t(i) * V, V);
+  argmax_rows(s.argmax_ids, lg, BS, V, m.stream);
+  CKS(cudaMemcpyAsync(targ.data(), s.argmax_ids, size_t(BS) * 4,
+                      cudaMemcpyDeviceToHost, m.stream));
+  CKS(cudaStreamSynchronize(m.stream));
+  PROF(pick, p_pk);
+  const double p_cm = prof_now();
 
   int32_t correction = 0;
   const int a = accept_greedy(drafted, targ, correction);
@@ -304,6 +372,7 @@ int spec_round(Model& m, SpecState& s, DraftModel& d, int& pos,
   if (a + 1 < BS) spec_rollback(s, m, a + 1);
   pos += a + 1;
   CKS(cudaMemcpy(m.logits, lg + size_t(a) * V, size_t(V) * 2, cudaMemcpyDeviceToDevice));
+  PROF(commit, p_cm);
   return a + 1;
 }
 
@@ -321,7 +390,6 @@ std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
   __nv_bfloat16 *lg = nullptr, *dlg = nullptr;
   CKS(cudaMalloc(&lg, size_t(BS) * V * 2));
   CKS(cudaMalloc(&dlg, size_t(NP) * V * 2));
-  std::vector<uint16_t> host(size_t(BS) * V);
 
   const int P = int(prompt.size());
   // Everything before this is outside the drafter's sliding window by the time
@@ -345,11 +413,16 @@ std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
   std::vector<int32_t> nids(BS, d.sh.mask_token_id);
 
   while (int(out.size()) < max_new) {
-    std::vector<uint16_t> l1(V);
-    CKS(cudaMemcpy(l1.data(), m.logits, size_t(V) * 2, cudaMemcpyDeviceToHost));
-    const int32_t t0 = argmax_host(l1, 0, V);
+    const double p_t0 = prof_now();
+    int32_t t0 = 0;
+    argmax_rows(s.argmax_ids, m.logits, 1, V, m.stream);
+    CKS(cudaMemcpyAsync(&t0, s.argmax_ids, 4, cudaMemcpyDeviceToHost, m.stream));
+    CKS(cudaStreamSynchronize(m.stream));
     out.push_back(t0);
+    PROF(anchor, p_t0);
     if (m.shape.is_stop_token(t0) || int(out.size()) >= max_new) break;
+    if (prof_on()) ++g_prof.rounds;
+    const double p_dr = prof_now();
 
     // ---- draft ----
     nids[0] = t0;
@@ -375,13 +448,21 @@ std::vector<int32_t> spec_generate_dflash(Model& m, SpecState& s, DraftModel& d,
     block.push_back(t0);
     for (int32_t x : drafted) block.push_back(x);
 
+    PROF(draft, p_dr);
+    const double p_vf = prof_now();
     spec_begin_block(s, m);
     model_verify_block(m, block.data(), BS, pos, lg);
     m.spec = nullptr; s.capturing = false;
-    CKS(cudaMemcpy(host.data(), lg, size_t(BS) * V * 2, cudaMemcpyDeviceToHost));
+    PROF(verify, p_vf);
 
+    const double p_pk = prof_now();
     std::vector<int32_t> targ(BS);
-    for (int i = 0; i < BS; ++i) targ[i] = argmax_host(host, size_t(i) * V, V);
+    argmax_rows(s.argmax_ids, lg, BS, V, m.stream);
+    CKS(cudaMemcpyAsync(targ.data(), s.argmax_ids, size_t(BS) * 4,
+                        cudaMemcpyDeviceToHost, m.stream));
+    CKS(cudaStreamSynchronize(m.stream));
+    PROF(pick, p_pk);
+    const double p_cm2 = prof_now();
 
     int32_t correction = 0;
     const int a = accept_greedy(drafted, targ, correction);

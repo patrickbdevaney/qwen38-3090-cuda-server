@@ -409,7 +409,16 @@ void gdn_scan(__nv_bfloat16* out, float* state, const __nv_bfloat16* qkv,
     opt_in(k_scan<128, VPB, THREADS, QWEN_GDN_TB>);
     cfg = true;
   }
-  if (T <= 8)
+  // The unbatched (TB=1) kernel exists for DECODE, where T is 1 and the staging
+  // buffers would only cost occupancy. It was also being used for every T up to
+  // 8 -- which is exactly the speculative verification block, and there the eight
+  // timesteps ran as eight dependent global round trips. Verification is 82% of
+  // a speculative round, so that threshold was quietly setting the break-even
+  // acceptance rate for the whole feature.
+#ifndef QWEN_GDN_SMALL_T
+#define QWEN_GDN_SMALL_T 1
+#endif
+  if (T <= QWEN_GDN_SMALL_T)
     k_scan<128, VPB, THREADS, 1><<<d.num_v_heads * v_blocks, THREADS, sm, st>>>(
         out, state, qkv, g, beta, T, d.conv_dim(), d.key_dim(), d.val_dim(),
         d.num_v_heads, d.hk_div(), d.hk_mod(), d.head_v, v_blocks);

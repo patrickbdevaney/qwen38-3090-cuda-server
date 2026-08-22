@@ -118,6 +118,37 @@ __global__ void k_argmax_partial(int32_t* __restrict__ idx, float* __restrict__ 
   if (threadIdx.x == 0) { val[chunk] = sv[0]; idx[chunk] = si[0]; }
 }
 
+// One block per ROW. Speculation needs the argmax of every row of a
+// [block, vocab] logit tile, and it used to get them by copying the whole tile
+// to the host -- 4 MiB per round over a pageable transfer -- and running
+// block_size x 248320 scalar comparisons on the CPU, in the critical path
+// between two GPU forwards. This returns block_size integers instead.
+//
+// Ties break to the LOWEST index, matching argmax_host and torch.argmax; the
+// acceptance rule is argmax equality, so the two must agree exactly.
+__global__ void k_argmax_rows(int32_t* __restrict__ out, const __nv_bfloat16* __restrict__ x,
+                              int n) {
+  const size_t base = size_t(blockIdx.x) * size_t(n);
+  float best = -FLT_MAX; int bi = 0;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = __bfloat162float(x[base + i]);
+    if (v > best) { best = v; bi = i; }      // strict >: lowest index within a lane
+  }
+  __shared__ float sv[256]; __shared__ int si[256];
+  sv[threadIdx.x] = best; si[threadIdx.x] = bi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      if (sv[threadIdx.x + s] > sv[threadIdx.x] ||
+          (sv[threadIdx.x + s] == sv[threadIdx.x] && si[threadIdx.x + s] < si[threadIdx.x])) {
+        sv[threadIdx.x] = sv[threadIdx.x + s]; si[threadIdx.x] = si[threadIdx.x + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[blockIdx.x] = si[0];
+}
+
 __global__ void k_argmax_final(int32_t* __restrict__ out, const int32_t* __restrict__ idx,
                                const float* __restrict__ val, int n) {
   float best = -FLT_MAX; int bi = 0;
@@ -150,6 +181,10 @@ void quantize_embed_int8(int8_t* q, float* sc, const __nv_bfloat16* src, int row
                          int dim, cudaStream_t st) {
   k_quant_embed<<<rows, 256, 0, st>>>(q, sc, src, dim);
 }
+void argmax_rows(int32_t* out, const __nv_bfloat16* x, int rows, int n, cudaStream_t st) {
+  k_argmax_rows<<<rows, 256, 0, st>>>(out, x, n);
+}
+
 void argmax(int32_t* out, const __nv_bfloat16* x, int n, int32_t* scratch, cudaStream_t st) {
   const int chunks = 256;
   int32_t* idx = scratch;

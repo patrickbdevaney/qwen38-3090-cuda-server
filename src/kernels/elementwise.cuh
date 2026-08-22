@@ -34,6 +34,11 @@ void quantize_embed_int8(int8_t* q, float* row_scale, const __nv_bfloat16* src,
 // Greedy argmax over the vocabulary, on device. A single host copy of the logit
 // vector would be 993 KB per token and would serialise the pipeline; only the
 // chosen id crosses the bus.
+// argmax of each of `rows` contiguous rows of `n` logits, into out[0..rows).
+// Ties break to the lowest index, matching argmax() and the host reference.
+void argmax_rows(int32_t* out, const __nv_bfloat16* x, int rows, int n,
+                 cudaStream_t stream = 0);
+
 void argmax(int32_t* out_id, const __nv_bfloat16* logits, int n,
             int32_t* scratch, cudaStream_t stream = 0);
 
