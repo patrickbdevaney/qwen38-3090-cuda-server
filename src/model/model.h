@@ -14,20 +14,47 @@
 #include "../kernels/attn.cuh"
 #include "../kernels/gemm_w4a16.cuh"
 #include "../kernels/gdn.cuh"
+#include "../gguf/gemv.cuh"
 #include "../kernels/attn.cuh"
 
 namespace qwen {
+
+// One projection, in whichever weight format the checkpoint uses.
+//
+// AWQ ships q|k|v (and GDN's qkv|z, and gate|up) already concatenated into a
+// single packed tensor, so the AWQ path gets a [T, total_out] result from one
+// call. GGUF ships them as SEPARATE tensors, each free to carry its own quant
+// type -- blk.3 of UD-Q3_K_XL has attn_q as IQ4_NL, attn_k as Q4_K and attn_v
+// as Q5_K -- so they can neither be concatenated at load nor read by one
+// kernel. This holds either shape: `awq` for the fused case, or up to three
+// GGUF pieces written into consecutive column ranges of the same output buffer
+// via the kernels' ldy stride.
+struct Linear {
+  W4A16Weights awq;              // valid when !gguf
+  GgufWeight   part[3];          // valid when gguf, in output order
+  int          n_part = 0;
+  bool         gguf = false;
+  int          in_f = 0, out_f = 0;   // total, summed over parts
+
+  bool valid() const { return gguf ? n_part > 0 : awq.qweight != nullptr; }
+  size_t total_bytes() const {
+    if (!gguf) return awq.total_bytes();
+    size_t b = 0;
+    for (int i = 0; i < n_part; ++i) b += part[i].bytes;
+    return b;
+  }
+};
 
 struct LayerWeights {
   bool is_attn = false;
   // shared
   const __nv_bfloat16* input_ln = nullptr;
   const __nv_bfloat16* post_ln  = nullptr;
-  W4A16Weights mlp_gate_up;      // [2*inter, hidden], gate|up concatenated
-  W4A16Weights mlp_down;         // [hidden, inter]
+  Linear mlp_gate_up;      // [2*inter, hidden], gate|up concatenated
+  Linear mlp_down;         // [hidden, inter]
   // gated delta net
-  W4A16Weights gdn_in_qkvz;      // [conv_dim + val_dim, hidden], qkv|z concatenated
-  W4A16Weights gdn_out;          // [hidden, val_dim]
+  Linear gdn_in_qkvz;      // [conv_dim + val_dim, hidden], qkv|z concatenated
+  Linear gdn_out;          // [hidden, val_dim]
   const __nv_bfloat16* gdn_a = nullptr;      // [num_v_heads, hidden] bf16
   const __nv_bfloat16* gdn_b = nullptr;
   const __nv_bfloat16* gdn_conv_w = nullptr; // [conv_dim, conv_k]
@@ -35,8 +62,8 @@ struct LayerWeights {
   const __nv_bfloat16* gdn_dt_bias = nullptr;
   const __nv_bfloat16* gdn_norm = nullptr;   // [head_v]
   // attention
-  W4A16Weights attn_qkv;         // [q_proj_out + 2*kv_proj_out, hidden]
-  W4A16Weights attn_o;           // [hidden, num_q_heads*head_dim]
+  Linear attn_qkv;         // [q_proj_out + 2*kv_proj_out, hidden]
+  Linear attn_o;           // [hidden, num_q_heads*head_dim]
   const __nv_bfloat16* q_norm = nullptr;
   const __nv_bfloat16* k_norm = nullptr;
   int attn_slot = -1;            // index into the KV cache, -1 for GDN layers
@@ -64,6 +91,7 @@ struct Model {
   __nv_bfloat16* lm_head_bf16 = nullptr;   // used when --lm-head bf16
   W4A16Weights   lm_head_q;                // --lm-head int4
   W8A16Weights   lm_head_q8;               // --lm-head int8
+  Linear         lm_head_gg;               // GGUF checkpoint: output.weight, in blocks
 
   // state
   uint8_t* k_cache = nullptr;        // [attn_layers][max_ctx][kv_heads][bytes/head]
@@ -108,7 +136,7 @@ struct Model {
   int n_taps = 0;
   bool tap_enable = false;
   int max_batch = 0;
-  int lm_head_bits = 16;   // 16 = bf16, 8 = INT8 g128, 4 = INT4
+  int lm_head_bits = 16;   // 16 = bf16, 8 = INT8 g128, 4 = INT4, 0 = GGUF blocks
   // Debug: when set, the residual stream after every layer (plus the embedding
   // output at index 0) is captured here, matching the reference dump's
   // hidden_states list so a divergence localises to one layer.
@@ -151,6 +179,12 @@ struct Model {
 };
 
 struct LoadOptions {
+  // Load the WEIGHTS from this GGUF file instead of the directory's
+  // safetensors. The directory is still read, for config.json and
+  // tokenizer.json -- a GGUF carries equivalent metadata but this server's
+  // shape parser and tokenizer are gated against the HF files, and reusing them
+  // keeps one source of truth for the shape.
+  std::string gguf;
   int  max_ctx = 131072;
   int  max_batch = 4096;         // chunked-prefill chunk
   // lm_head precision. INT4 measured a KL of 1.1e-2 (g32) to 1.8e-2 (g128)
@@ -177,6 +211,14 @@ struct LoadOptions {
 // Loads the checkpoint, repacks, allocates state, and REFUSES TO START if the
 // requested context does not fit with a 512 MB margin.
 void model_load(Model& m, const std::string& model_dir, const LoadOptions& opt);
+
+// Fill an already-shaped Model's per-layer weights from a GGUF file, returning
+// the body's device bytes. Defined in load_gguf.cu; see that file for how the
+// two formats' fusing and naming differ.
+class GgufFile;
+struct GgufTensor;
+size_t model_load_gguf_weights(Model& m, GgufFile& f, bool verbose);
+GgufWeight gguf_upload_weight(Model& m, const GgufTensor& t);
 
 // One decode step: token id in, logits out. Advances ctx_len by 1.
 void model_decode(Model& m, int32_t token_id, int position);

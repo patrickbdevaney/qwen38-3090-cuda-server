@@ -75,6 +75,16 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (a == "--model") model_dir = next();
+    // Weights from a GGUF file; --model still supplies config.json and
+    // tokenizer.json, which this server's gated parsers already read.
+    else if (a == "--gguf") {
+      opt.gguf = next();
+      fprintf(stderr,
+        "WARNING: --gguf is INCOMPLETE. The weights load and the model runs, but\n"
+        "         llama.cpp's Qwen3.5 conversion permutes v-heads, stores ssm_a as\n"
+        "         -exp(A_log), and uses a norm convention this loader does not yet\n"
+        "         undo, so the output is nonsense. See reports/GGUF_LOADER.md.\n");
+    }
     else if (a == "--host") cfg.host = next();
     else if (a == "--port") cfg.port = atoi(next());
     else if (a == "--alias") cfg.model_alias = next();

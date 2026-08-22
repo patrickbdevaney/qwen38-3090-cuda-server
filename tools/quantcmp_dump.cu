@@ -43,11 +43,13 @@ __global__ void bf16_to_fp16_k(__half* dst, const __nv_bfloat16* src, size_t n) 
 int main(int argc, char** argv) {
   if (argc < 4) {
     printf("usage: %s <model_dir> <prompts.json> <out_dir> "
-           "[lm_head_bits=8] [kv=0] [chunk=1024]\n", argv[0]);
+           "[lm_head_bits=8] [kv=0] [chunk=1024] [weights.gguf]\n", argv[0]);
     return 1;
   }
   const std::string md = argv[1], pj = argv[2], out = argv[3];
   const int lm_bits = argc > 4 ? atoi(argv[4]) : 8;
+  // argv[7]: optional GGUF weights; md still supplies config + tokenizer.
+  const std::string gguf = argc > 7 ? argv[7] : "";
   const int kvmode  = argc > 5 ? atoi(argv[5]) : 0;
   const int chunk   = argc > 6 ? atoi(argv[6]) : 1024;
 
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
   o.max_ctx = longest + 64;
   o.max_batch = chunk;
   o.lm_head_bits = lm_bits;
+  o.gguf = gguf;
   o.embed_host = true;
   o.verbose = true;
   if (kvmode == 1) { o.kv_k = qwen::KvFmt::FP8;  o.kv_v = qwen::KvFmt::INT4; }
@@ -91,6 +94,7 @@ int main(int argc, char** argv) {
   manifest["model"] = md;
   manifest["lm_head_bits"] = lm_bits;
   manifest["kv"] = kvmode;
+  if (!gguf.empty()) manifest["gguf"] = gguf;
   manifest["dtype"] = "float16";
 
   for (auto& [name, ids] : work) {

@@ -367,7 +367,7 @@ constexpr int GEMV_THREADS = GEMV_WARPS * 32;
 template <GgmlType T, int MROWS>
 __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
     __nv_bfloat16* __restrict__ y, const uint8_t* __restrict__ w,
-    const __nv_bfloat16* __restrict__ x, int out_f, int in_f, Tab tab) {
+    const __nv_bfloat16* __restrict__ x, int out_f, int in_f, int ldy, Tab tab) {
   const int warp = (blockIdx.x * GEMV_WARPS) + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   if (warp >= out_f) return;
@@ -394,7 +394,7 @@ __global__ __launch_bounds__(GEMV_THREADS) void k_gemv(
   for (int m = 0; m < MROWS; ++m) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], o);
-    if (lane == 0) y[size_t(m) * out_f + warp] = __float2bfloat16(acc[m]);
+    if (lane == 0) y[size_t(m) * ldy + warp] = __float2bfloat16(acc[m]);
   }
 }
 
@@ -449,15 +449,16 @@ void launch_dump(float* dst, const void* src, int64_t n, cudaStream_t st) {
 
 template <GgmlType T>
 void launch(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x, int M,
-            cudaStream_t st) {
+            int ldy, cudaStream_t st) {
   const int blocks = (w.out_f + GEMV_WARPS - 1) / GEMV_WARPS;
   const Tab tb = tables();
   const uint8_t* p = static_cast<const uint8_t*>(w.data);
+  if (ldy <= 0) ldy = w.out_f;
   switch (M) {
-    case 1: k_gemv<T, 1><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, tb); break;
-    case 2: k_gemv<T, 2><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, tb); break;
-    case 4: k_gemv<T, 4><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, tb); break;
-    case 8: k_gemv<T, 8><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, tb); break;
+    case 1: k_gemv<T, 1><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+    case 2: k_gemv<T, 2><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+    case 4: k_gemv<T, 4><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
+    case 8: k_gemv<T, 8><<<blocks, GEMV_THREADS, 0, st>>>(y, p, x, w.out_f, w.in_f, ldy, tb); break;
     default:
       fprintf(stderr, "gguf gemv: unsupported M %d\n", M);
       abort();
@@ -526,19 +527,19 @@ static void check_align(const GgufWeight& w, const char* who) {
 }
 
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-               cudaStream_t st) {
+               cudaStream_t st, int ldy) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemv: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
   check_align(w, "gguf_gemv");
-  DISPATCH(launch, y, w, x, 1, st);
+  DISPATCH(launch, y, w, x, 1, ldy, st);
 }
 
 void gguf_gemm_small(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-                     int M, cudaStream_t st) {
+                     int M, cudaStream_t st, int ldy) {
   if (w.in_f % 256) { fprintf(stderr, "gguf gemm: in_f %d is not a multiple of 256\n",
                               w.in_f); abort(); }
   check_align(w, "gguf_gemm_small");
-  DISPATCH(launch, y, w, x, M, st);
+  DISPATCH(launch, y, w, x, M, ldy, st);
 }
 
 }  // namespace qwen

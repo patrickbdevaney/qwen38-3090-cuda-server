@@ -1,4 +1,6 @@
 #include "model.h"
+#include "../gguf/gguf.h"
+#include "../gguf/dequant.cuh"
 #include "../loader/safetensors.h"
 #include "../kernels/elementwise.cuh"
 #include "../spec/spec.h"
@@ -96,10 +98,15 @@ const __nv_bfloat16* upload(Model& m, const SafeTensors& st, const std::string& 
 }
 
 // Repack one or more on-disk quantized tensors into a single fused W4A16.
-void fuse(Model& m, const SafeTensors& st, W4A16Weights& dst,
+// AWQ: concatenate the named projections into one packed tensor. GGUF cannot do
+// this (per-tensor quant types), which is why Linear also has a multi-part form.
+void fuse(Model& m, const SafeTensors& st, Linear& L,
           const std::vector<std::string>& parts, int in_f, int group) {
+  W4A16Weights& dst = L.awq;
+  L.gguf = false;
   int total = 0;
   for (const auto& b : parts) total += int(st.get(b + ".weight_scale").shape[0]);
+  L.in_f = in_f; L.out_f = total;
   awq_alloc_fused(dst, total, in_f, group);
   m.owned.push_back(dst.qweight); m.owned.push_back(dst.scale); m.owned.push_back(dst.zp);
   int off = 0;
@@ -233,7 +240,11 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
     printf("VRAM: %.2f GiB free of %.2f GiB\n", free_b / 1073741824.0, total_b / 1073741824.0);
 
   SafeTensors st;
-  st.open_dir(dir);
+  GgufFile gf;
+  const bool from_gguf = !opt.gguf.empty();
+  // The shape and tokenizer still come from `dir`; only the weights move.
+  if (from_gguf) gf.open(opt.gguf);
+  else           st.open_dir(dir);
   cublasCreate(&m.cublas);
 
   const int GROUP = S.quant_group_size;
@@ -241,6 +252,8 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   m.layers.resize(S.num_hidden_layers);
 
   size_t body_bytes = 0;
+  if (from_gguf) body_bytes = model_load_gguf_weights(m, gf, opt.verbose);
+  else {
   for (int i = 0; i < S.num_hidden_layers; ++i) {
     LayerWeights& L = m.layers[i];
     const std::string p = LP + std::to_string(i) + ".";
@@ -274,8 +287,55 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
     if (opt.verbose && (i + 1) % 16 == 0) { printf("  loaded %d/%d layers\n", i + 1, S.num_hidden_layers); fflush(stdout); }
   }
   m.final_norm = upload(m, st, "model.language_model.norm.weight");
+  }
 
   // ---- embeddings and lm_head ------------------------------------------
+  if (from_gguf) {
+    // token_embd is quantised in the file. The embedding is a row gather, not a
+    // matmul, so it is dequantised once to bf16 in HOST memory and stays there:
+    // 2.42 GiB of host RAM against 2.42 GiB of VRAM that the KV cache wants
+    // more, and no accuracy cost because bf16 is the arithmetic anyway.
+    const GgufTensor& emb = gf.get("token_embd.weight");
+    const int64_t n = int64_t(emb.numel());
+    m.embed_host_bf = static_cast<__nv_bfloat16*>(malloc(size_t(n) * 2));
+    if (!m.embed_host_bf) {
+      fprintf(stderr, "gguf embed: malloc of %zu bytes failed\n", size_t(n) * 2);
+      abort();
+    }
+    // Dequantise on the device in chunks so a 2.4 GiB staging buffer never has
+    // to coexist with the body.
+    const int64_t rows_at_a_time = 8192;
+    const int64_t row = int64_t(emb.row_len());
+    const int bb = ggml_block_bytes(emb.type), be = ggml_block_elems(emb.type);
+    void* d_src = nullptr; __nv_bfloat16* d_dst = nullptr;
+    CKM(cudaMalloc(&d_src, size_t(rows_at_a_time * row / be) * bb));
+    CKM(cudaMalloc(&d_dst, size_t(rows_at_a_time * row) * 2));
+    for (int64_t r0 = 0; r0 < emb.rows(); r0 += rows_at_a_time) {
+      const int64_t nr = std::min<int64_t>(rows_at_a_time, int64_t(emb.rows()) - r0);
+      const size_t src_bytes = size_t(nr * row / be) * bb;
+      CKM(cudaMemcpy(d_src, emb.data + size_t(r0 * row / be) * bb, src_bytes,
+                     cudaMemcpyHostToDevice));
+      gguf_dequant_bf16(d_dst, d_src, emb.type, nr * row);
+      CKM(cudaDeviceSynchronize());
+      CKM(cudaMemcpy(m.embed_host_bf + r0 * row, d_dst, size_t(nr * row) * 2,
+                     cudaMemcpyDeviceToHost));
+    }
+    cudaFree(d_src); cudaFree(d_dst);
+    CKM(cudaHostAlloc(reinterpret_cast<void**>(&m.embed_stage),
+                      size_t(m.max_batch) * S.hidden_size * 2, cudaHostAllocDefault));
+    m.embed_on_host = true;
+    m.embed_quantized = false;
+
+    // The head stays in its GGUF blocks and goes through the fused GEMV, which
+    // is the whole point: re-quantising it to our INT8 would be a second lossy
+    // step on top of the file's own.
+    m.lm_head_bits = 0;
+    m.lm_head_gg.gguf = true;
+    m.lm_head_gg.n_part = 1;
+    m.lm_head_gg.part[0] = gguf_upload_weight(m, gf.get("output.weight"));
+    m.lm_head_gg.in_f = m.lm_head_gg.part[0].in_f;
+    m.lm_head_gg.out_f = m.lm_head_gg.part[0].out_f;
+  } else {
   const auto& emb = st.get("model.language_model.embed_tokens.weight");
   if (opt.embed_host) {
     // Straight off the mapping into our own host buffer, in bf16. The embedding
@@ -328,6 +388,7 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
       m.lm_head_bf16 = static_cast<__nv_bfloat16*>(tmp);
       m.owned.push_back(tmp);
     }
+  }
   }
 
   // ---- state ------------------------------------------------------------
@@ -417,11 +478,14 @@ void model_load(Model& m, const std::string& dir, const LoadOptions& opt) {
   if (opt.verbose) {
     char b1[32];
     printf("\n=== VRAM ===\n");
-    printf("  body (int4 fused)     %s\n", human(body_bytes, b1));
-    const size_t lmb = opt.lm_head_bits == 4 ? m.lm_head_q.total_bytes()
-                     : opt.lm_head_bits == 8 ? m.lm_head_q8.total_bytes()
+    printf("  body (%s) %s\n", from_gguf ? "gguf blocks" : "int4 fused ",
+           human(body_bytes, b1));
+    const size_t lmb = m.lm_head_bits == 0 ? m.lm_head_gg.total_bytes()
+                     : m.lm_head_bits == 4 ? m.lm_head_q.total_bytes()
+                     : m.lm_head_bits == 8 ? m.lm_head_q8.total_bytes()
                      : size_t(S.vocab_size) * S.hidden_size * 2;
-    printf("  lm_head               %s (%d-bit)\n", human(lmb, b1), opt.lm_head_bits);
+    if (m.lm_head_bits == 0) printf("  lm_head               %s (gguf blocks)\n", human(lmb, b1));
+    else printf("  lm_head               %s (%d-bit)\n", human(lmb, b1), m.lm_head_bits);
     printf("  embed_tokens          %s %s\n",
            human(opt.quantize_embed ? size_t(S.vocab_size) * (S.hidden_size + 4)
                                     : size_t(S.vocab_size) * S.hidden_size * 2, b1),
@@ -472,8 +536,32 @@ static LinPath lin_path(int T) {
   return LinPath::Cublas;
 }
 
-static void linear(Model& m, __nv_bfloat16* out, const W4A16Weights& w,
+// GGUF projection. The fused kernels take M in {1,2,4,8}, so T is walked in
+// descending power-of-two chunks; each of the (up to three) GGUF tensors writes
+// its own column range of the [T, out_f] output through the ldy stride.
+static void linear_gguf(Model& m, __nv_bfloat16* out, const Linear& L,
+                        const __nv_bfloat16* in, int T) {
+  int col = 0;
+  for (int p = 0; p < L.n_part; ++p) {
+    const GgufWeight& w = L.part[p];
+    int done = 0;
+    while (done < T) {
+      int chunk = 8;
+      while (chunk > 1 && done + chunk > T) chunk >>= 1;
+      __nv_bfloat16* y = out + size_t(done) * L.out_f + col;
+      const __nv_bfloat16* x = in + size_t(done) * L.in_f;
+      if (chunk == 1) gguf_gemv(y, w, x, m.stream, L.out_f);
+      else            gguf_gemm_small(y, w, x, chunk, m.stream, L.out_f);
+      done += chunk;
+    }
+    col += w.out_f;
+  }
+}
+
+static void linear(Model& m, __nv_bfloat16* out, const Linear& L,
                    const __nv_bfloat16* in, int T) {
+  if (L.gguf) { linear_gguf(m, out, L, in, T); return; }
+  const W4A16Weights& w = L.awq;
   { static int on = -1;
     if (on < 0) { const char* e = getenv("QWEN_DEBUG_SYNC"); on = e && atoi(e); }
     if (on) fprintf(stderr, "  linear T=%d in=%d out=%d group=%d path=%d\n",
@@ -630,7 +718,9 @@ void head(Model& m, int T) {
   // logits only for the last position
   __nv_bfloat16* last = m.h + size_t(T - 1) * S.hidden_size;
   rmsnorm(m.h2, last, m.final_norm, 1, S.hidden_size, S.rms_norm_eps, m.stream);
-  if (m.lm_head_bits == 4) {
+  if (m.lm_head_bits == 0) {
+    gguf_gemv(m.logits, m.lm_head_gg.part[0], m.h2, m.stream);
+  } else if (m.lm_head_bits == 4) {
     gemv_w4a16(m.logits, m.lm_head_q, m.h2, m.gemv, m.stream);
   } else if (m.lm_head_bits == 8) {
     gemv_w8a16(m.logits, m.lm_head_q8, m.h2, m.gemv, m.stream);
@@ -838,6 +928,21 @@ void quantize_w4a16(W4A16Weights& dst, const __nv_bfloat16* src, int rows, int c
 
 void model_apply_head(Model& m, __nv_bfloat16* out, const __nv_bfloat16* x, int T) {
   const ModelShape& S = m.shape;
+  if (m.lm_head_bits == 0) {
+    // GGUF head: same chunking rule as the quantised AWQ heads, but the fused
+    // kernel's ceiling is 8 rows rather than gemv.max_m.
+    int done = 0;
+    while (done < T) {
+      int chunk = 8;
+      while (chunk > 1 && done + chunk > T) chunk >>= 1;
+      __nv_bfloat16* o = out + size_t(done) * size_t(S.vocab_size);
+      const __nv_bfloat16* xi = x + size_t(done) * size_t(S.hidden_size);
+      if (chunk == 1) gguf_gemv(o, m.lm_head_gg.part[0], xi, m.stream);
+      else            gguf_gemm_small(o, m.lm_head_gg.part[0], xi, chunk, m.stream);
+      done += chunk;
+    }
+    return;
+  }
   if (m.lm_head_bits != 4 && m.lm_head_bits != 8) {
     const float one = 1.f, zero = 0.f;
     cublasSetStream(m.cublas, m.stream);

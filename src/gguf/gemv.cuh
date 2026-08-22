@@ -39,13 +39,18 @@ struct GgufWeight {
 // pointer and aborts rather than issuing a misaligned load.
 //
 // y[out_f] = W @ x[in_f]. x and y are bf16.
+// `ldy` is the row stride of y in elements; 0 means "tightly packed", i.e.
+// w.out_f. A non-default stride lets a projection that GGUF ships as several
+// separate tensors (q/k/v, or GDN's qkv and z) be written into consecutive
+// column ranges of one [T, total_out] buffer, which is the layout the AWQ path
+// gets for free from its single fused tensor.
 void gguf_gemv(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-               cudaStream_t stream = 0);
+               cudaStream_t stream = 0, int ldy = 0);
 
 // Y[M, out_f] = X[M, in_f] @ W^T for small M, same kernel with M accumulators
 // so the weight stream is read once rather than M times.
 void gguf_gemm_small(__nv_bfloat16* y, const GgufWeight& w, const __nv_bfloat16* x,
-                     int M, cudaStream_t stream = 0);
+                     int M, cudaStream_t stream = 0, int ldy = 0);
 
 // True if the fused path implements this type.
 bool gguf_gemv_supported(GgmlType t);

@@ -118,8 +118,16 @@ target_link_libraries(bench_decode_gemv PRIVATE qwen_core qwen_kernels)
 add_test(NAME gemv_bandwidth COMMAND bench_decode_gemv ${QWEN38_MODEL_DIR})
 
 # ---------------------------------------------------------------- model
-add_library(qwen_model STATIC src/model/model.cu)
-target_link_libraries(qwen_model PUBLIC qwen_core qwen_kernels)
+add_library(qwen_gguf STATIC src/gguf/gguf.cpp)
+target_include_directories(qwen_gguf PUBLIC src third_party)
+
+add_library(qwen_gguf_dequant STATIC src/gguf/dequant.cu src/gguf/gemv.cu)
+target_link_libraries(qwen_gguf_dequant PUBLIC qwen_gguf)
+
+# The model links the GGUF kernels: a checkpoint can be AWQ or GGUF, and
+# Linear dispatches per projection.
+add_library(qwen_model STATIC src/model/model.cu src/model/load_gguf.cu)
+target_link_libraries(qwen_model PUBLIC qwen_core qwen_kernels qwen_gguf_dequant)
 
 add_executable(gate_forward tests/gate_forward.cu)
 target_link_libraries(gate_forward PRIVATE qwen_model)
@@ -137,14 +145,10 @@ add_executable(debug_layers tests/debug_layers.cu)
 target_link_libraries(debug_layers PRIVATE qwen_model)
 
 # ---------------------------------------------------------------- gguf
-add_library(qwen_gguf STATIC src/gguf/gguf.cpp)
-target_include_directories(qwen_gguf PUBLIC src third_party)
 
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
 target_link_libraries(gguf_inspect PRIVATE qwen_gguf)
 
-add_library(qwen_gguf_dequant STATIC src/gguf/dequant.cu src/gguf/gemv.cu)
-target_link_libraries(qwen_gguf_dequant PUBLIC qwen_gguf)
 
 # Oracle: links llama.cpp's own ggml so the goldens are ggml's, not a
 # reimplementation of ggml. Only built when LLAMA_CPP_DIR points at a build.
@@ -167,6 +171,9 @@ set(QWEN38_GGUF_Q3 "${QWEN38_GGUF_Q3}" CACHE FILEPATH "UD-Q3_K_XL GGUF checkpoin
 if(QWEN38_GGUF_Q3)
   add_test(NAME gguf_gemv COMMAND gate_gguf_gemv ${QWEN38_GGUF_Q3} 256)
 endif()
+
+add_executable(gate_gguf_model tests/gate_gguf_model.cu)
+target_link_libraries(gate_gguf_model PRIVATE qwen_model qwen_tokenizer)
 
 add_executable(gate_gguf tests/gate_gguf.cu)
 target_link_libraries(gate_gguf PRIVATE qwen_gguf_dequant)
