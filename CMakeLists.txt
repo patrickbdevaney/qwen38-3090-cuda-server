@@ -56,6 +56,10 @@ target_include_directories(qwen_core PUBLIC src third_party)
 # all; each also runs on its own for debugging.
 enable_testing()
 
+add_executable(gate_utf8_stream tests/gate_utf8_stream.cpp)
+target_include_directories(gate_utf8_stream PRIVATE src third_party)
+add_test(NAME utf8_stream COMMAND gate_utf8_stream)
+
 add_executable(gate_nfc tests/gate_nfc.cpp)
 target_include_directories(gate_nfc PRIVATE src third_party)
 add_test(NAME nfc COMMAND gate_nfc ${CMAKE_SOURCE_DIR}/tests/fixtures/nfc_cases.jsonl)

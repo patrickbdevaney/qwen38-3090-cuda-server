@@ -25,6 +25,7 @@
 #include <functional>
 #include <cuda_runtime.h>
 
+#include "utf8_stream.h"
 #include "../../third_party/httplib.h"
 #include "../../third_party/json.hpp"
 #include "../model/model.h"
@@ -876,13 +877,13 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
     } catch (const UnsupportedContent& e) {
       g_metrics.errors++;
       res.status = 400;
-      res.set_content(error_json(e.what(), "invalid_request_error", 400).dump(),
+      res.set_content(json_dump_safe(error_json(e.what(), "invalid_request_error", 400)),
                       "application/json");
       return;
     } catch (const std::exception& e) {
       g_metrics.errors++;
       res.status = 400;
-      res.set_content(error_json(e.what(), "invalid_request_error", 400).dump(),
+      res.set_content(json_dump_safe(error_json(e.what(), "invalid_request_error", 400)),
                       "application/json");
       return;
     }
@@ -965,7 +966,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
       }
       out["usage"] = usage_json(r, r.cached_tokens);
       out["timings"] = timings_json(r);
-      res.set_content(out.dump(), "application/json");
+      res.set_content(json_dump_safe(out), "application/json");
       return;
     }
 
@@ -978,7 +979,7 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
         [id, created, ids, sp, max_new, stops, chat, want_usage, thinking, mm, cache_key]
         (size_t, httplib::DataSink& sink) {
           auto emit = [&](const json& j) {
-            const std::string s = "data: " + j.dump() + "\n\n";
+            const std::string s = "data: " + json_dump_safe(j) + "\n\n";
             return sink.write(s.data(), s.size());
           };
           auto chunk = [&](json delta, const json& finish) {
@@ -996,15 +997,31 @@ int run_server(Model& model, Tokenizer& tok, const ServerConfig& cfg) {
           if (chat) emit(chunk(json{{"role", "assistant"}}, nullptr));
 
           bool alive = true;
+          // A token may end mid-character; hold those bytes back until the next
+          // one completes it. Content and reasoning are independent streams and
+          // therefore need independent carries.
+          std::string carry_c, carry_th;
           GenResult r = generate(ids, sp, max_new, stops, thinking,
               [&](const std::string& c, const std::string& th) {
                 json d = json::object();
-                if (!c.empty())  d["content"] = c;
-                if (!th.empty()) d["reasoning_content"] = th;
+                const std::string sc  = c.empty()  ? std::string() : utf8_flush(carry_c, c);
+                const std::string sth = th.empty() ? std::string() : utf8_flush(carry_th, th);
+                if (!sc.empty())  d["content"] = sc;
+                if (!sth.empty()) d["reasoning_content"] = sth;
+                // Everything was held back this round: nothing to send yet.
                 if (d.empty()) return true;
                 alive = emit(chunk(d, nullptr));
                 return alive;
               }, mm.get(), cache_key.empty() ? nullptr : &cache_key);
+          // Generation ended with bytes still held: they can never complete.
+          if (alive && (!carry_c.empty() || !carry_th.empty())) {
+            json d = json::object();
+            const std::string tc  = utf8_flush_tail(carry_c);
+            const std::string tth = utf8_flush_tail(carry_th);
+            if (!tc.empty())  d["content"] = tc;
+            if (!tth.empty()) d["reasoning_content"] = tth;
+            if (!d.empty()) alive = emit(chunk(d, nullptr));
+          }
           g_metrics.prompt_tokens += r.prompt_tokens;
           g_metrics.cached_prefix_tokens += uint64_t(r.cached_tokens);
           g_metrics.completion_tokens += r.completion_tokens;
